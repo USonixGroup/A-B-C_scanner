@@ -1,7 +1,7 @@
 import time
 from pymeasure.instruments.agilent import Agilent33500
 from Signal_function import Continuous_generate, Trigger_generate, Burst_generate, stop_output
-from cc import read_oscilloscope_and_save, send_burst, create_scan_folder
+from Code.oscilloscope import read_oscilloscope_and_save, send_burst, create_scan_folder
 import socket
 from rig_function import send_command, enable_axis, wait_until_stopped, b_scan
 

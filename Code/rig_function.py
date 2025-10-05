@@ -12,7 +12,7 @@ def send_command(sock, command):
     command += '\x00'  # Null terminator
     sock.sendall(command.encode())
     response = sock.recv(1024).decode().strip('\x00')
-    print(f"Command: {command.strip()}, Response: {response}")
+    # print(f"Command: {command.strip()}, Response: {response}")
     return response
 
 # Read encoder (PE) and pulse position (PP)

@@ -1,4 +1,5 @@
 # Signal Generator Configuration
+import time
 
 def Continuous_generate(
     sg, 
@@ -109,6 +110,7 @@ def Burst_generate(
     burst_period = burst_ncycles / frequency if frequency and burst_ncycles else 1
 
     sg.output = True
+    # time.sleep(1)
 
     if not number_of_burst:
         number_of_burst = 1  # Default to one trigger if not specified
