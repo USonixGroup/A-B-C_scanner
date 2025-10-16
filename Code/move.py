@@ -1,8 +1,6 @@
-# ✅ Imports
+# Standard imports
 import time
 import socket
-from pymeasure.instruments.agilent import Agilent33500
-from pyvisa import ResourceManager
 
 # === Custom modules ===
 from rig_function import send_command, enable_axis, wait_until_stopped
@@ -17,21 +15,45 @@ PORT = 5001
 def mm_to_pulse(mm):
     return int(mm * 700)
 
-# ✅ Main program
-def main():
-    # 单位转换
-    A_SCAN_PARAMS["X"] = mm_to_pulse(A_SCAN_PARAMS["X"])
-    A_SCAN_PARAMS["Y"] = mm_to_pulse(A_SCAN_PARAMS["Y"])
-    A_SCAN_PARAMS["Z"] = mm_to_pulse(A_SCAN_PARAMS["Z"])
 
-    # 建立 TCP 连接
+def main():
+    """Perform the A-scan movement. This function defers heavy/hardware
+    imports until runtime so the module is safe to import from a GUI.
+    """
+    # defer imports that touch instruments
+    try:
+        import importlib
+        pm = importlib.import_module('pymeasure.instruments.agilent')
+        Agilent33500 = getattr(pm, 'Agilent33500', None)
+        try:
+            ResourceManager = getattr(importlib.import_module('pyvisa'), 'ResourceManager', None)
+        except Exception:
+            ResourceManager = None
+        # If drivers are missing we continue — move still uses rig_function.
+    except Exception:
+        Agilent33500 = None
+        ResourceManager = None
+
+    # Convert configured mm values to pulses (in-place)
+    try:
+        if "X" in A_SCAN_PARAMS:
+            A_SCAN_PARAMS["X"] = mm_to_pulse(A_SCAN_PARAMS["X"])
+        if "Y" in A_SCAN_PARAMS:
+            A_SCAN_PARAMS["Y"] = mm_to_pulse(A_SCAN_PARAMS["Y"])
+        if "Z" in A_SCAN_PARAMS:
+            A_SCAN_PARAMS["Z"] = mm_to_pulse(A_SCAN_PARAMS["Z"])
+    except Exception:
+        # guard against missing keys or bad values
+        pass
+
+    # Establish TCP connection and move axes
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.connect((HOST, PORT))
 
-        # 设置为增量或绝对模式
-        send_command(sock, "INC")  # 一般是 INC
+        # Set incremental mode
+        send_command(sock, "INC")
 
-        # 依次启用并移动 X, Y, Z
+        # Move X/Y/Z if provided
         for axis in ["X", "Y", "Z"]:
             distance = A_SCAN_PARAMS.get(axis)
             if distance:
@@ -40,6 +62,7 @@ def main():
                 wait_until_stopped(sock, axis)
 
     print("✅ A Scan movement complete.")
+
 
 if __name__ == "__main__":
     main()

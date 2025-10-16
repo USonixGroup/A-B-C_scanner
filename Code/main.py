@@ -1,7 +1,16 @@
 import time
-from pymeasure.instruments.agilent import Agilent33500
+import importlib
+
+# Import Agilent driver dynamically so script can still be analyzed/edited
+try:
+    pm = importlib.import_module('pymeasure.instruments.agilent')
+    Agilent33500 = getattr(pm, 'Agilent33500', None)
+    if Agilent33500 is None:
+        raise ImportError('Agilent33500 not found in pymeasure')
+except Exception as e:
+    raise SystemExit(f"Required instrument driver not available: {e}")
 from Signal_function import Continuous_generate, Trigger_generate, Burst_generate, stop_output
-from Code.oscilloscope import read_oscilloscope_and_save, send_burst, create_scan_folder
+from Oscilloscope import read_oscilloscope_and_save, send_burst, create_scan_folder
 import socket
 from rig_function import send_command, enable_axis, wait_until_stopped, b_scan
 

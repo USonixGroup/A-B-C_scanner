@@ -1,12 +1,12 @@
 import socket
-from pymeasure.instruments.agilent import Agilent33500
 from rig_function import send_command, enable_axis, wait_until_stopped
 # ✅ Configuration import
-from Setup import A_SCAN_PARAMS, HOST, PORT, SG_ADDRESS, SIGNAL_PARAMS
+from Setup import A_SCAN_PARAMS, HOST, PORT
 
-# ✅ Connect to signal generator
-sg = Agilent33500(SG_ADDRESS)
-print("✅ Signal generator connected:", sg.id)
+# Note: we avoid creating instrument connections at import time so this
+# module is safe to import. The signal generator is not required by
+# the a_scan() function below and should be constructed by callers if
+# needed.
 
 # ✅ mm → pulse conversion function
 def mm_to_pulse(mm):
@@ -30,13 +30,13 @@ def a_scan(sock, x, y, z, mode):
 
 def main():
     # ✅ Convert mm units to pulse
-    x_pulse = mm_to_pulse(A_SCAN_PARAMS["x"])
-    y_pulse = mm_to_pulse(A_SCAN_PARAMS["y"])
-    z_pulse = mm_to_pulse(A_SCAN_PARAMS["z"])
+    x_pulse = mm_to_pulse(A_SCAN_PARAMS.get("x", 0))
+    y_pulse = mm_to_pulse(A_SCAN_PARAMS.get("y", 0))
+    z_pulse = mm_to_pulse(A_SCAN_PARAMS.get("z", 0))
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.connect((HOST, PORT))
-        a_scan(sock, x=x_pulse, y=y_pulse, z=z_pulse, mode=A_SCAN_PARAMS["mode"])
+        a_scan(sock, x=x_pulse, y=y_pulse, z=z_pulse, mode=A_SCAN_PARAMS.get("mode", "INC"))
 
 if __name__ == "__main__":
     main()
