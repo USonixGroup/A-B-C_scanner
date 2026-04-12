@@ -3,13 +3,18 @@ import importlib
 
 # Import Agilent driver dynamically so script can still be analyzed/edited
 try:
-    pm = importlib.import_module('pymeasure.instruments.agilent')
-    Agilent33500 = getattr(pm, 'Agilent33500', None)
+    pm = importlib.import_module("pymeasure.instruments.agilent")
+    Agilent33500 = getattr(pm, "Agilent33500", None)
     if Agilent33500 is None:
-        raise ImportError('Agilent33500 not found in pymeasure')
+        raise ImportError("Agilent33500 not found in pymeasure")
 except Exception as e:
     raise SystemExit(f"Required instrument driver not available: {e}")
-from Signal_function import Continuous_generate, Trigger_generate, Burst_generate, stop_output
+from Signal_function import (
+    Continuous_generate,
+    Trigger_generate,
+    Burst_generate,
+    stop_output,
+)
 from Oscilloscope import read_oscilloscope_and_save, send_burst, create_scan_folder
 import socket
 from rig_function import send_command, enable_axis, wait_until_stopped, b_scan
@@ -24,7 +29,7 @@ HOST = "192.168.1.250"
 PORT = 5001
 
 
-def main():     
+def main():
     # Create a new folder for saving scan data
     scan_folder = create_scan_folder()
 
@@ -39,12 +44,12 @@ def main():
         shape="SIN",
         frequency=100,
         amplitude=1,
-        burst_ncycles=60,
+        no_of_cycles_per_pulse=60,
     )
     print("trigger_count")
-    time.sleep(1)  
+    time.sleep(1)
     read_oscilloscope_and_save(cross, s, scan_folder)
-    time.sleep(0.5) 
+    time.sleep(0.5)
     print(f"📡 Captured data for row {cross+1}, column {s}...")
 
     # Establish socket connection to the rig
@@ -58,7 +63,7 @@ def main():
         scan_step = 10000
         cross_length = 10000
         cross_step = 10000
-        
+
         scan_steps = int(scan_length / scan_step)
         cross_steps = int(cross_length / cross_step) + 1
 
@@ -66,19 +71,21 @@ def main():
         enable_axis(sock, scan_axis)
         enable_axis(sock, cross_axis)
 
-        print(f"🔄 Starting B Scan: {scan_axis}-axis {scan_steps} steps, step size {scan_step}, {cross_axis}-axis {cross_steps} rows, step size {cross_step}")
+        print(
+            f"🔄 Starting B Scan: {scan_axis}-axis {scan_steps} steps, step size {scan_step}, {cross_axis}-axis {cross_steps} rows, step size {cross_step}"
+        )
 
-        for cross in range(cross_steps):  
+        for cross in range(cross_steps):
             print(f"📏 Scanning row {cross+1}/{cross_steps}")
 
             # Determine scan direction (zig-zag pattern)
-            scan_direction = -scan_step if (cross + 1) % 2 == 0 else scan_step 
+            scan_direction = -scan_step if (cross + 1) % 2 == 0 else scan_step
 
             for scan in range(scan_steps):
                 if cross == 0:
                     s = scan + start_col
                 else:
-                    s = scan_steps - scan if (cross + 1) % 2 == 0 else scan + start_col 
+                    s = scan_steps - scan if (cross + 1) % 2 == 0 else scan + start_col
 
                 # Move scan axis
                 send_command(sock, f"{scan_axis}{scan_direction}")
@@ -90,12 +97,12 @@ def main():
                     shape="SIN",
                     frequency=100,
                     amplitude=1,
-                    burst_ncycles=60,
+                    no_of_cycles_per_pulse=60,
                 )
                 print("trigger_count")
-                time.sleep(1)  
+                time.sleep(1)
                 read_oscilloscope_and_save(cross, s, scan_folder)
-                time.sleep(0.5) 
+                time.sleep(0.5)
                 print(f"📡 Captured data for row {cross+1}, column {s}...")
 
             # Move to next row if not the last one
@@ -113,14 +120,16 @@ def main():
                     shape="SIN",
                     frequency=100,
                     amplitude=1,
-                    burst_ncycles=60,
+                    no_of_cycles_per_pulse=60,
                 )
                 print("trigger_count")
-                time.sleep(1)  
+                time.sleep(1)
                 read_oscilloscope_and_save(cross, s, scan_folder)
-                time.sleep(0.5) 
-                print(f"📡 Captured data for row {cross+1}, column {s} after row move...")
-            
+                time.sleep(0.5)
+                print(
+                    f"📡 Captured data for row {cross+1}, column {s} after row move..."
+                )
+
             print(f"🔄")
 
         print("✅ B Scan complete")

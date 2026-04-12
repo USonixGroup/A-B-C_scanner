@@ -1,8 +1,10 @@
-A/B/C-Scanner GUI (Code/gui_main.py)
+A/B-Scanner GUI (Code/gui_main.py)
 ===================================
 
-This file implements a simple Tkinter GUI (A/B/C-Scanner) to collect pulse
-generator arguments and scanning parameters and then run an A/B/C scan.
+Legacy scripts have been moved to `Code/legacy files/`.
+
+This file implements a simple Tkinter GUI (A/B-Scanner) to collect pulse
+generator arguments and scanning parameters and then run an A/B scan.
 
 How to run
 ----------

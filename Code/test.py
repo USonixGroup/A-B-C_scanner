@@ -12,6 +12,7 @@ import pandas as pd
 sg = Agilent33500(SG_ADDRESS)
 print("✅ Signal generator connected:", sg.id)
 
+
 def configure_oscilloscope_for_burst(osc):
     def vbs(osc, cmd):
         osc.write(f"VBS '{cmd}'")
@@ -19,7 +20,7 @@ def configure_oscilloscope_for_burst(osc):
 
     # freq = SIGNAL_PARAMS["frequency"]
     # amp = SIGNAL_PARAMS["amplitude"]
-    # n_cycles = SIGNAL_PARAMS["burst_ncycles"]
+    # n_cycles = SIGNAL_PARAMS["no_of_cycles_per_pulse"]
 
     # burst_duration = n_cycles / freq
     # y = 4
@@ -31,11 +32,11 @@ def configure_oscilloscope_for_burst(osc):
 
     freq = SIGNAL_PARAMS["frequency"]
     amp = SIGNAL_PARAMS["amplitude"]
-    n_cycles = SIGNAL_PARAMS["burst_ncycles"]
+    n_cycles = SIGNAL_PARAMS["no_of_cycles_per_pulse"]
 
     burst_duration = n_cycles / freq
     hor_scale = burst_duration
-    ver_scale = amp/4
+    ver_scale = amp / 4
     Sampling_Rate = freq * 100
 
     vbs(osc, f"app.Acquisition.Horizontal.HorScale = {hor_scale}")
@@ -43,10 +44,11 @@ def configure_oscilloscope_for_burst(osc):
     vbs(osc, f"app.Acquisition.Horizontal.SampleRate = {Sampling_Rate}")
     vbs(osc, "app.Acquisition.C1.Offset = 0")
     vbs(osc, "app.Acquisition.C1.View = true")
-    vbs(osc, "app.Acquisition.Trigger.Source = \"C1\"")
+    vbs(osc, 'app.Acquisition.Trigger.Source = "C1"')
     osc.write("TRIG_MODE NORM")
 
     # osc.write("SINGLE")
+
 
 if __name__ == "__main__":
     rm = ResourceManager()
@@ -83,6 +85,6 @@ if __name__ == "__main__":
     except Exception as e:
         print("❌ Error:", e)
     finally:
-        if 'osc' in locals():
+        if "osc" in locals():
             osc.close()
             print("✅ Connection closed.")

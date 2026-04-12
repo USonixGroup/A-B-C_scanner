@@ -5,18 +5,20 @@ import pandas as pd
 # ⚙️ 信号参数定义
 SIGNAL_PARAMS = {
     "shape": "SIN",
-    "frequency": 10_000_000,   # 10 MHz
-    "amplitude": 1.0,          # 1 V (peak to peak)
-    "burst_ncycles": 10
+    "frequency": 10_000_000,  # 10 MHz
+    "amplitude": 1.0,  # 1 V (peak to peak)
+    "no_of_cycles_per_pulse": 10,
 }
 
+
 def standardize_waveform_data(
-    input_folder="data/scan_013/filtered",
-    output_folder="data/scan_013/filtered1"
+    input_folder="data/scan_013/filtered", output_folder="data/scan_013/filtered1"
 ):
     os.makedirs(output_folder, exist_ok=True)
 
-    file_list = [f for f in os.listdir(input_folder) if re.match(r"row_\d+_col_\d+\.csv", f)]
+    file_list = [
+        f for f in os.listdir(input_folder) if re.match(r"row_\d+_col_\d+\.csv", f)
+    ]
 
     for f in file_list:
         file_path = os.path.join(input_folder, f)
@@ -38,13 +40,10 @@ def standardize_waveform_data(
             v_min = raw_voltage.min()
             v_max = raw_voltage.max()
             scale = SIGNAL_PARAMS["amplitude"] / (v_max - v_min)
-            voltage = (raw_voltage - (v_max + v_min)/2) * scale
+            voltage = (raw_voltage - (v_max + v_min) / 2) * scale
 
             # ⚡ 组织输出 DataFrame
-            df_out = pd.DataFrame({
-                "Time (µs)": time_us,
-                "Voltage (V)": voltage
-            })
+            df_out = pd.DataFrame({"Time (µs)": time_us, "Voltage (V)": voltage})
 
             # 💾 保存
             output_path = os.path.join(output_folder, f)
@@ -53,6 +52,7 @@ def standardize_waveform_data(
 
         except Exception as e:
             print(f"❌ 错误处理文件 {f}: {e}")
+
 
 if __name__ == "__main__":
     standardize_waveform_data()
