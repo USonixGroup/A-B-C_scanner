@@ -33,7 +33,7 @@
     "depth_axis": "X",
     "scan_axis": "Z",
     "scan_length": 20.0,
-    "scan_points": 5000,
+    "scan_points": 500,
     "sound_speed_mps": 0.0,
     "dry_run": true,
     "live_preview": true
