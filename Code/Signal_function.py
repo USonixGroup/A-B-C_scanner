@@ -33,7 +33,13 @@ def _flat_top_window(n):
 
 def _window_array(window_type, n):
     wtype = (window_type or "Hanning").strip().lower()
-    if wtype in {"none", "no window", "no windowing", "none (rectangular)", "rectangular"}:
+    if wtype in {
+        "none",
+        "no window",
+        "no windowing",
+        "none (rectangular)",
+        "rectangular",
+    }:
         return np.ones(n)
     if wtype == "hamming":
         return np.hamming(n)

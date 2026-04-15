@@ -16,8 +16,7 @@ PORT = 5001
 A_SCAN_PARAMS = {"X": 0, "Y": 0, "Z": 0, "mode": "INC"}
 SETTINGS_PATH = Path(__file__).resolve().parent.parent / "data" / "gui_settings.json"
 
-# Test-mode switch for GUI development.
-USE_DUMMY_SIGNAL_GENERATOR = True
+# Noise level for generated dummy echoes when test mode is requested by caller.
 DUMMY_NOISE_STD = 0.1
 
 # Note: we avoid creating instrument connections at import time so this
@@ -164,9 +163,6 @@ def main(a_scan_params=None, host=None, port=None):
     x_pulse = mm_to_pulse(params.get("X", 0))
     y_pulse = mm_to_pulse(params.get("Y", 0))
     z_pulse = mm_to_pulse(params.get("Z", 0))
-
-    if USE_DUMMY_SIGNAL_GENERATOR:
-        return a_scan(test=True)
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.connect((host, port))

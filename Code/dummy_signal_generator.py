@@ -45,7 +45,7 @@ def generate_dummy_echo(
 ):
     """Generate synthetic A-scan echo from excitation settings.
 
-    Echo model: -(a random coefficient in [0.3, 0.7]) * excitation + N(0, noise_std).
+    Echo model: -0.5 * excitation + N(0, noise_std).
     If parameters are omitted, values are loaded from gui_settings.json.
     """
     cfg = get_excitation_settings(settings_path=settings_path)
@@ -84,5 +84,5 @@ def generate_dummy_echo(
     excitation = amplitude * carrier * window
 
     noise = np.random.normal(0.0, float(noise_std), size=n)
-    echo = -np.random.uniform(0.3, 0.7) * excitation + noise
+    echo = -0.5 * excitation + noise
     return t, echo

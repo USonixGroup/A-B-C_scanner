@@ -6,16 +6,17 @@
     "osc_address": "",
     "host": "192.168.1.250",
     "port": "5001",
-    "sampling_rate": 10000000.0
+    "sampling_rate": 1000000.0
   },
   "excitation": {
     "shape": "SIN",
-    "window_type": "Hanning",
+    "window_type": "Flat-Top",
     "frequency": 1000000.0,
-    "amplitude": 10.0,
-    "no_of_cycles_per_pulse": 5.0,
-    "no_of_pulses": 2,
-    "prf": 99999.1,
+    "amplitude": 2.0,
+    "no_of_cycles_per_pulse": 11,
+    "no_of_pulses": 5,
+    "prf": 10000.8,
+    "start_delay_s": 0.0,
     "timing_tolerance_pct": 10.0,
     "auto_preview": true
   },
@@ -23,18 +24,20 @@
     "X": 0.0,
     "Y": 0.0,
     "Z": 0.0,
-    "highpass_cutoff_hz": 10000.0,
-    "filter_order": 2,
+    "highpass_cutoff_hz": 100000.0,
+    "filter_order": 4,
+    "sound_speed_mps": 0.0,
     "mode": "INC",
+    "dry_run": true,
     "live_preview": true,
-    "average_echoes": 2
+    "average_echoes": 5
   },
   "line_b_mode": {
     "depth_axis": "X",
     "scan_axis": "Z",
     "scan_length": 20.0,
-    "scan_points": 500,
-    "sound_speed_mps": 0.0,
+    "scan_points": 10,
+    "sound_speed_mps": 1500.0,
     "dry_run": true,
     "live_preview": true
   },
@@ -52,6 +55,19 @@
     "cross_length": 20.0,
     "cross_points": 2,
     "dry_run": true,
-    "live_update": true
+    "live_update": true,
+    "scan_type": "pressure_field",
+    "c_mode_gate_start_us": 4.0,
+    "c_mode_gate_width_us": 1.4000000000000001,
+    "c_mode_metric": "Kurtosis",
+    "c_mode_colormap": "Gray (16-bit)",
+    "a_mode_metric": "Energy",
+    "pressure_field_colormap": "viridis",
+    "pressure_field_extra": "Yes",
+    "pressure_field_filter_type": "High-pass",
+    "pressure_field_filter_order": 4,
+    "pressure_field_highpass_cutoff_khz": 50.0,
+    "pressure_field_bandpass_low_cutoff_khz": 50.0,
+    "pressure_field_bandpass_high_cutoff_khz": 500.0
   }
 }

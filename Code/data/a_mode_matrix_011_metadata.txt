@@ -1,0 +1,8 @@
+A-Mode Matrix Data
+Shape: (16, 600) (acquisitions × samples)
+Total Acquisitions: 16
+Scan Points (Axis 1): 4
+Cross Points (Axis 2): 4
+Frequency: 1000000.0 Hz
+Amplitude: 1.0 V
+Dry Run: True

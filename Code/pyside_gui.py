@@ -21,10 +21,20 @@ from pathlib import Path
 
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
 from matplotlib.figure import Figure
-from PySide6.QtCore import QObject, Qt, Signal, QTimer
+from PySide6.QtCore import (
+    QEasingCurve,
+    QEvent,
+    QObject,
+    QPropertyAnimation,
+    QRect,
+    Qt,
+    Signal,
+    QTimer,
+)
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QApplication,
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
@@ -41,9 +51,11 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QSpinBox,
     QSplitter,
+    QStackedWidget,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -54,6 +66,7 @@ from scan_utils import compute_step
 MM_TO_PULSE = 700
 MODE_LEFT_PANEL_WIDTH = 430
 B_MODE_LEFT_PANEL_WIDTH = 540
+PANEL_GAP = 14
 BASE_DIR = Path(__file__).resolve().parent
 SETTINGS_PATH = BASE_DIR.parent / "data" / "gui_settings.json"
 
@@ -65,6 +78,8 @@ class PlotCanvas(FigureCanvasQTAgg):
         super().__init__(self.figure)
         self._title = title
         self.setMinimumHeight(260)
+        # Reduce figure margins to prevent overlay on left panel when squeezed
+        self.figure.subplots_adjust(left=0.08, right=0.95, top=0.95, bottom=0.12)
         self.draw_placeholder(title)
 
     def _style_axes(self) -> None:
@@ -113,6 +128,7 @@ class PlotCanvas(FigureCanvasQTAgg):
         except Exception as exc:
             self.draw_placeholder(f"Plot failed: {exc}")
 
+
 class UiBridge(QObject):
     cfg_log = Signal(str)
     move_log = Signal(str)
@@ -122,6 +138,8 @@ class UiBridge(QObject):
     bc_log = Signal(str)
     a_preview = Signal(object)
     b_preview = Signal(object)
+    bc_preview = Signal(object)
+    bc_pf_auto_apply = Signal()
     bc_plot_csv = Signal(str)
     test_busy = Signal(bool)
     scan_busy = Signal(bool)
@@ -135,6 +153,17 @@ class ScannerMainWindow(QMainWindow):
         self.bridge = UiBridge()
         self._a_mode_last_results = None
         self._b_mode_last_results = None
+        self._b_mode_image_artist = None
+        self._b_mode_colorbar = None
+        self._b_mode_show_normalized = False
+        self._bc_colorbar = None
+        self._bc_pressure_field_payload = None
+        self._bc_pressure_field_cache = None
+        self._bc_pressure_field_source = None
+        self._bc_c_mode_cache = None
+        self._bc_c_mode_source = None
+        self._bc_c_mode_scanned = False
+        self._bc_apply_unlocked = False
         self._last_bc_csv_path = None
         self._is_loading_settings = False
         self._settings_save_timer = QTimer(self)
@@ -167,14 +196,16 @@ class ScannerMainWindow(QMainWindow):
         )
         self.bridge.b_preview.connect(self._render_b_mode_preview)
         self.bridge.bc_log.connect(lambda text: self._append_log(self.bc_output, text))
+        self.bridge.bc_preview.connect(self._render_bc_live_preview)
+        self.bridge.bc_pf_auto_apply.connect(self._apply_pressure_field_postprocessing_from_saved_data)
         self.bridge.bc_plot_csv.connect(self._on_bc_plot_csv)
         self.bridge.test_busy.connect(self._set_test_busy)
         self.bridge.scan_busy.connect(self._set_scan_busy)
         self.bridge.error.connect(self._show_error)
 
     def _build_ui(self) -> None:
-        self.setWindowTitle("A/B Scanner")
-        about_action = QAction("About A/B-Scanner", self)
+        self.setWindowTitle("A/B/C/Field Scanner")
+        about_action = QAction("About A/B/C/Field Scanner", self)
         about_action.triggered.connect(self.show_about)
         self.menuBar().addMenu("About").addAction(about_action)
 
@@ -203,10 +234,14 @@ class ScannerMainWindow(QMainWindow):
     def _build_config_tab(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
+        controls_panel = QWidget()
+        controls_panel_layout = QVBoxLayout(controls_panel)
+        controls_panel_layout.setContentsMargins(0, 0, 0, 0)
+        controls_panel_layout.setSpacing(14)
         top = QGridLayout()
         top.setHorizontalSpacing(14)
         top.setVerticalSpacing(14)
-        layout.addLayout(top)
+        controls_panel_layout.addLayout(top)
 
         sg_box = QGroupBox("Signal Generator")
         sg_form = QFormLayout(sg_box)
@@ -236,6 +271,7 @@ class ScannerMainWindow(QMainWindow):
         osc_form.addRow("Sampling Rate (kHz)", self.sampling_rate_edit)
         top.addWidget(osc_box, 1, 0, 1, 2)
 
+        connection_box = QGroupBox("Connection Test")
         controls = QHBoxLayout()
         self._normalize_control_row(controls)
         self.test_button = QPushButton("Test Connections")
@@ -258,10 +294,35 @@ class ScannerMainWindow(QMainWindow):
         controls.addWidget(self.test_timeout)
         controls.addStretch(1)
         controls.addWidget(self.test_progress)
-        layout.addLayout(controls)
+        connection_box.setLayout(controls)
+        top.addWidget(connection_box, 2, 0, 1, 2)
 
+        log_box = QGroupBox("Config Log")
+        log_layout = QVBoxLayout(log_box)
         self.cfg_output = self._make_log()
-        layout.addWidget(self.cfg_output, 1)
+        log_layout.addWidget(self.cfg_output)
+        self.cfg_export_logs_button = QPushButton("Export Logs")
+        self.cfg_export_logs_button.clicked.connect(self.export_config_logs)
+        self.cfg_export_logs_button.setStyleSheet(
+            "QPushButton { min-height: 34px; padding: 6px 12px; "
+            "background-color: #c9b1f7; color: #2d1b69; border: none; border-radius: 14px; font-weight: 600; }"
+            "QPushButton:hover { background-color: #b89ef0; }"
+            "QPushButton:pressed { background-color: #a98ae9; }"
+            "QPushButton:disabled { background-color: #e4d9fb; color: #9b8abf; }"
+        )
+        self.cfg_export_logs_button.setSizePolicy(
+            QSizePolicy.Expanding, QSizePolicy.Fixed
+        )
+        log_layout.addWidget(self.cfg_export_logs_button)
+
+        left_panel = QWidget()
+        left_panel_layout = QVBoxLayout(left_panel)
+        left_panel_layout.setContentsMargins(0, 0, 0, 0)
+        left_panel_layout.setSpacing(10)
+        left_panel_layout.addWidget(controls_panel, 1)
+        left_panel_layout.addWidget(log_box, 2)
+
+        layout.addWidget(self._make_vscroll_panel(left_panel))
         return page
 
     def _build_move_tab(self) -> QWidget:
@@ -298,7 +359,7 @@ class ScannerMainWindow(QMainWindow):
         self.move_output = self._make_log()
         log_layout.addWidget(self.move_output)
 
-        layout.addWidget(left_col, 1)
+        layout.addWidget(self._make_vscroll_panel(left_col), 1)
         layout.addWidget(log_box, 1)
         return page
 
@@ -312,11 +373,17 @@ class ScannerMainWindow(QMainWindow):
         top_row.addStretch(1)
         layout.addLayout(top_row)
 
-        main_top = QHBoxLayout()
-        main_top.setSpacing(14)
+        # Two-column layout: left side holds parameters + log, right side holds preview.
+        content_row = QHBoxLayout()
+        content_row.setSpacing(0)
 
-        left_col = QWidget()
-        left_layout = QVBoxLayout(left_col)
+        left_side = QWidget()
+        left_side_layout = QVBoxLayout(left_side)
+        left_side_layout.setContentsMargins(0, 0, 0, 0)
+        left_side_layout.setSpacing(10)
+
+        params_col = QWidget()
+        left_layout = QVBoxLayout(params_col)
         left_layout.setContentsMargins(0, 0, 0, 0)
 
         pg_box = QGroupBox("Pulse Generator")
@@ -327,9 +394,10 @@ class ScannerMainWindow(QMainWindow):
         )
         self.tx_freq = self._make_double_spin(0.001, 100_000.0, 1000.0, decimals=3)
         self.tx_amp = self._make_double_spin(0.01, 100, 1.0)
-        self.tx_cycles = self._make_double_spin(1, 10_000, 60, decimals=0)
+        self.tx_cycles = self._make_spin(1, 10_000, 60)
         self.tx_pulses = self._make_spin(1, 100000, 1)
         self.tx_prf = self._make_double_spin(0.1, 1_000_000, 1000.0, decimals=2)
+        self.tx_start_delay_us = self._make_double_spin(0.0, 10_000_000.0, 0.0)
         pg_form.addRow("Waveform Shape", QLabel("SIN"))
         pg_form.addRow("Windowing Function", self.tx_windowing_combo)
         pg_form.addRow("Frequency (kHz)", self.tx_freq)
@@ -337,6 +405,7 @@ class ScannerMainWindow(QMainWindow):
         pg_form.addRow("No. Of Cycles Per Pulse", self.tx_cycles)
         pg_form.addRow("No. Of Pulses", self.tx_pulses)
         pg_form.addRow("Pulse Repetition Frequency (Hz)", self.tx_prf)
+        pg_form.addRow("Start Delay (\u03bcs)", self.tx_start_delay_us)
         left_layout.addWidget(pg_box)
 
         self.transmit_start_button = QPushButton("Start Transmit")
@@ -399,12 +468,14 @@ class ScannerMainWindow(QMainWindow):
         button_row.addWidget(self.tx_auto_preview_check)
         button_row.addStretch(1)
         left_layout.addLayout(button_row)
-        left_layout.addStretch(1)
 
         log_box = QGroupBox("Excitation Log")
+        log_box.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        log_box.setMinimumHeight(0)
         log_layout = QVBoxLayout(log_box)
         self.transmit_output = self._make_log()
-        log_layout.addWidget(self.transmit_output)
+        self.transmit_output.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        log_layout.addWidget(self.transmit_output, 1)
         self.transmit_export_logs_button = QPushButton("Export Logs")
         self.transmit_export_logs_button.clicked.connect(self.export_transmit_logs)
         self.transmit_export_logs_button.setStyleSheet(
@@ -414,22 +485,39 @@ class ScannerMainWindow(QMainWindow):
             "QPushButton:pressed { background-color: #a98ae9; }"
             "QPushButton:disabled { background-color: #e4d9fb; color: #9b8abf; }"
         )
-        self.transmit_export_logs_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        log_layout.addWidget(self.transmit_export_logs_button)
+        self.transmit_export_logs_button.setSizePolicy(
+            QSizePolicy.Expanding, QSizePolicy.Fixed
+        )
+        log_layout.addWidget(self.transmit_export_logs_button, 0)
 
-        main_top.addWidget(left_col, 1)
-        main_top.addWidget(log_box, 1)
-        layout.addLayout(main_top)
+        left_layout.addStretch(1)
+        left_side_layout.addWidget(params_col, 0)
+        left_side_layout.addWidget(log_box, 1)
 
+        preview_col = QWidget()
+        preview_layout = QVBoxLayout(preview_col)
+        preview_layout.setContentsMargins(12, 0, 12, 0)
+        preview_layout.setSpacing(8)
         self.tx_preview_canvas = PlotCanvas("Preview waveform will appear here")
         self.tx_preview_toolbar = NavigationToolbar2QT(self.tx_preview_canvas, page)
-        layout.addWidget(self.tx_preview_toolbar)
-        layout.addWidget(self.tx_preview_canvas, 3)
-        tx_preview_actions = QHBoxLayout()
-        self._normalize_button_row(tx_preview_actions, [self.transmit_export_button])
-        tx_preview_actions.addWidget(self.transmit_export_button)
-        tx_preview_actions.addStretch(1)
-        layout.addLayout(tx_preview_actions)
+        preview_layout.addWidget(self.tx_preview_toolbar)
+        tx_preview_controls = QWidget()
+        tx_preview_controls_layout = QHBoxLayout(tx_preview_controls)
+        tx_preview_controls_layout.setContentsMargins(0, 0, 0, 0)
+        tx_preview_controls_layout.setSpacing(8)
+        tx_preview_controls_layout.addStretch(1)
+        tx_preview_controls_layout.addWidget(self.transmit_export_button)
+        preview_layout.addWidget(tx_preview_controls)
+        preview_layout.addWidget(self.tx_preview_canvas, 1)
+
+        left_side.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        preview_col.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        preview_col.setMinimumWidth(0)
+        tx_left_scroll = self._make_vscroll_panel(left_side, B_MODE_LEFT_PANEL_WIDTH)
+        content_row.addWidget(tx_left_scroll, 0)
+        content_row.addSpacing(PANEL_GAP)
+        content_row.addWidget(preview_col, 1)
+        layout.addLayout(content_row, 1)
 
         self.tx_windowing_combo.currentIndexChanged.connect(
             self._on_transmit_preview_inputs_changed
@@ -439,6 +527,9 @@ class ScannerMainWindow(QMainWindow):
         self.tx_cycles.valueChanged.connect(self._on_transmit_preview_inputs_changed)
         self.tx_pulses.valueChanged.connect(self._on_transmit_preview_inputs_changed)
         self.tx_prf.valueChanged.connect(self._on_transmit_preview_inputs_changed)
+        self.tx_start_delay_us.valueChanged.connect(
+            self._on_transmit_preview_inputs_changed
+        )
         self.tx_auto_preview_check.stateChanged.connect(
             self._on_transmit_auto_preview_toggled
         )
@@ -470,11 +561,20 @@ class ScannerMainWindow(QMainWindow):
         self.a_mode_x = self._make_double_spin(-5000, 5000, 0.0)
         self.a_mode_y = self._make_double_spin(-5000, 5000, 0.0)
         self.a_mode_z = self._make_double_spin(-5000, 5000, 0.0)
-        self.a_mode_highpass_cutoff = self._make_double_spin(0.0, 100_000.0, 50.0, decimals=1)
+        self.a_mode_highpass_cutoff = self._make_double_spin(
+            0.0, 100_000.0, 50.0, decimals=1
+        )
         self.a_mode_filter_order = self._make_spin(1, 12, 4)
+        self.a_mode_sound_speed = self._make_double_spin(0.0, 20000.0, 1500.0)
+        self.a_mode_sound_speed.setSingleStep(1.0)
+        self.a_mode_sound_speed.setDecimals(0)
         pos_form.addRow("ΔX (mm)", self.a_mode_x)
         pos_form.addRow("ΔY (mm)", self.a_mode_y)
         pos_form.addRow("ΔZ (mm)", self.a_mode_z)
+        a_speed_label = QLabel(
+            'Speed of Sound (m/s)<br><span style="color:#c23b3b; font-size:9pt;">0 = use time in \\mu s</span>'
+        )
+        pos_form.addRow(a_speed_label, self.a_mode_sound_speed)
         pos_form.addRow("High-pass Cutoff (kHz)", self.a_mode_highpass_cutoff)
         pos_form.addRow("Filter Order", self.a_mode_filter_order)
         left_layout.addWidget(pos_box)
@@ -500,18 +600,28 @@ class ScannerMainWindow(QMainWindow):
             "QPushButton:pressed { background-color: #a98ae9; }"
             "QPushButton:disabled { background-color: #e4d9fb; color: #9b8abf; }"
         )
+        self.a_dry_run_check = QCheckBox("Dry Run")
+        self.a_dry_run_check.setChecked(True)
         self.a_live_preview_check = QCheckBox("Live Preview")
         self.a_live_preview_check.setChecked(True)
+        self.a_source_label = QLabel("Signal source: Dummy")
+        self.a_source_label.setStyleSheet("color: #415368; font-size: 9pt;")
+        self.a_dry_run_check.stateChanged.connect(self._update_a_mode_source_label)
         self.a_mode_highpass_cutoff.valueChanged.connect(
             self._on_a_mode_filter_params_changed
         )
         self.a_mode_filter_order.valueChanged.connect(
             self._on_a_mode_filter_params_changed
         )
+        self.a_mode_sound_speed.valueChanged.connect(
+            self._on_a_mode_filter_params_changed
+        )
         action_row = QHBoxLayout()
         self._normalize_button_row(action_row, [self.a_start_button])
         action_row.addWidget(self.a_start_button)
+        action_row.addWidget(self.a_dry_run_check)
         action_row.addWidget(self.a_live_preview_check)
+        action_row.addWidget(self.a_source_label)
         action_row.addStretch(1)
         left_layout.addLayout(action_row)
         left_layout.addStretch(1)
@@ -529,10 +639,12 @@ class ScannerMainWindow(QMainWindow):
             "QPushButton:pressed { background-color: #a98ae9; }"
             "QPushButton:disabled { background-color: #e4d9fb; color: #9b8abf; }"
         )
-        self.a_export_logs_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.a_export_logs_button.setSizePolicy(
+            QSizePolicy.Expanding, QSizePolicy.Fixed
+        )
         log_layout.addWidget(self.a_export_logs_button)
 
-        top_row.addWidget(left_col, 1)
+        top_row.addWidget(self._make_vscroll_panel(left_col), 1)
         top_row.addWidget(log_box, 1)
         layout.addLayout(top_row)
 
@@ -547,7 +659,7 @@ class ScannerMainWindow(QMainWindow):
     def _build_bc_tab(self) -> QWidget:
         page = QWidget()
         layout = QHBoxLayout(page)
-        layout.setSpacing(14)
+        layout.setSpacing(0)
 
         controls = QWidget()
         controls_layout = QVBoxLayout(controls)
@@ -589,27 +701,369 @@ class ScannerMainWindow(QMainWindow):
         self.depth_axis.setEnabled(False)
         self._sync_depth_axis_from_scan_axes()
         self.scan_axis.currentIndexChanged.connect(self._sync_depth_axis_from_scan_axes)
-        self.cross_axis.currentIndexChanged.connect(self._sync_depth_axis_from_scan_axes)
+        self.cross_axis.currentIndexChanged.connect(
+            self._sync_depth_axis_from_scan_axes
+        )
         controls_layout.addWidget(scan_box)
 
         options_row = QHBoxLayout()
         self._normalize_control_row(options_row)
         self.dry_run_check = QCheckBox("Dry Run")
         self.live_update_check = QCheckBox("Live Preview")
+        self.bc_source_label = QLabel("Signal source: Hardware")
+        self.bc_source_label.setStyleSheet("color: #415368; font-size: 9pt;")
+        self.dry_run_check.stateChanged.connect(self._update_bc_mode_source_label)
         options_row.addWidget(self.live_update_check)
         options_row.addWidget(self.dry_run_check)
+        options_row.addWidget(self.bc_source_label)
         controls_layout.addLayout(options_row)
 
-        button_row = QHBoxLayout()
-        preview_button = QPushButton("Preview")
-        preview_button.clicked.connect(self.preview_scan)
-        preview_button.setStyleSheet(
-            "QPushButton { min-width: 92px; min-height: 34px; max-width: 110px; padding: 6px 12px; "
-            "background-color: #c9b1f7; color: #2d1b69; border: none; border-radius: 14px; font-weight: 600; }"
-            "QPushButton:hover { background-color: #b89ef0; }"
-            "QPushButton:pressed { background-color: #a98ae9; }"
-            "QPushButton:disabled { background-color: #e4d9fb; color: #9b8abf; }"
+        scan_type_box = QGroupBox("Post-processing and Preview")
+        scan_type_layout = QVBoxLayout(scan_type_box)
+        scan_type_layout.setContentsMargins(10, 10, 10, 10)
+        scan_type_layout.setSpacing(8)
+
+        mode_row = QHBoxLayout()
+        self._normalize_control_row(mode_row, spacing=8)
+        self.bc_scan_type_group = QButtonGroup(self)
+        self.bc_scan_type_group.setExclusive(True)
+
+        self.bc_scan_type_segment = QFrame()
+        self.bc_scan_type_segment.setObjectName("bcScanTypeSegment")
+        self.bc_scan_type_segment.setFixedHeight(52)
+        self.bc_scan_type_segment.setStyleSheet(
+            "QFrame#bcScanTypeSegment { background: #f4f7fb; border: 1px solid #d7c8f7; border-radius: 26px; }"
         )
+        segment_layout = QHBoxLayout(self.bc_scan_type_segment)
+        segment_layout.setContentsMargins(6, 6, 6, 6)
+        segment_layout.setSpacing(2)
+
+        self.bc_scan_type_indicator = QFrame(self.bc_scan_type_segment)
+        self.bc_scan_type_indicator.setObjectName("bcScanTypeIndicator")
+        self.bc_scan_type_indicator.setStyleSheet(
+            "QFrame#bcScanTypeIndicator { background: #d9c2ff; border: 1px solid #c9b1f7; border-radius: 15px; }"
+        )
+        self.bc_scan_type_indicator.lower()
+        self.bc_scan_type_indicator.hide()
+
+        self.bc_scan_type_standard_btn = QPushButton("A-Mode")
+        self.bc_scan_type_standard_btn.setCheckable(True)
+        self.bc_scan_type_standard_btn.setChecked(True)
+        self.bc_scan_type_c_btn = QPushButton("C-Mode")
+        self.bc_scan_type_c_btn.setCheckable(True)
+        self.bc_scan_type_pf_btn = QPushButton("Pressure Field Mode")
+        self.bc_scan_type_pf_btn.setCheckable(True)
+
+        for btn in [
+            self.bc_scan_type_standard_btn,
+            self.bc_scan_type_c_btn,
+            self.bc_scan_type_pf_btn,
+        ]:
+            btn.setFixedHeight(30)
+            btn.setFlat(True)
+            btn.setStyleSheet(
+                "QPushButton { min-height: 0px; max-height: 30px; height: 30px; "
+                "padding: 0px 10px; border: none; border-radius: 15px; "
+                "background: transparent; color: #415368; font-weight: 600; "
+                "font-size: 9pt; qproperty-iconSize: 0px 0px; }"
+                "QPushButton:checked { color: #2d1b69; font-weight: 700; }"
+            )
+            segment_layout.addWidget(
+                btn, 1
+            )  # equal stretch → equal width for all buttons
+
+        self.bc_scan_type_group.addButton(self.bc_scan_type_standard_btn)
+        self.bc_scan_type_group.addButton(self.bc_scan_type_c_btn)
+        self.bc_scan_type_group.addButton(self.bc_scan_type_pf_btn)
+        self.bc_scan_type_group.buttonClicked.connect(self._on_bc_scan_type_changed)
+        mode_row.addWidget(self.bc_scan_type_segment, 1)
+        scan_type_layout.addLayout(mode_row)
+
+        # Apply buttons — created early so they can be embedded in their respective pages.
+        _apply_style = (
+            "QPushButton { min-width: 78px; padding: 0px 10px; text-align: center; "
+            "border: none; border-radius: 13px; color: #ffffff; font-weight: 700; "
+            "background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #6a1fb5, stop:1 #9b59d0); }"
+            "QPushButton:hover { background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #7d2dc8, stop:1 #ae72df); }"
+            "QPushButton:pressed { background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #521890, stop:1 #7a3fad); }"
+            "QPushButton:disabled { background: #e8edf4; color: #95a3b5; }"
+        )
+        self.bc_post_apply_button = QPushButton("Apply")
+        self.bc_post_apply_button.setFixedHeight(28)
+        self.bc_post_apply_button.setStyleSheet(_apply_style)
+        self.bc_post_apply_button.setEnabled(False)
+        self.bc_post_apply_button.clicked.connect(self._on_bc_post_apply_clicked)
+        self.bc_apply_cmode_button = QPushButton("Apply")
+        self.bc_apply_cmode_button.setFixedHeight(28)
+        self.bc_apply_cmode_button.setStyleSheet(_apply_style)
+        self.bc_apply_cmode_button.setEnabled(False)
+        self.bc_apply_cmode_button.clicked.connect(self._on_bc_post_apply_clicked)
+
+        # Fixed-height stacked options area — keeps panel size constant across modes.
+        self.bc_options_stack = QStackedWidget()
+        self.bc_options_stack.setFixedHeight(42)
+
+        # Page 0: A-Mode — blank placeholder
+        self.bc_options_stack.addWidget(QWidget())
+
+        # Page 1: C-Mode — top controls (metric only)
+        c_page = QWidget()
+        c_row1 = QHBoxLayout(c_page)
+        c_row1.setContentsMargins(12, 0, 0, 0)
+        c_row1.setSpacing(8)
+        self.bc_c_mode_metric_label = QLabel("Metric")
+        self.bc_c_mode_metric_combo = QComboBox()
+        self.bc_c_mode_metric_combo.addItems(
+            [
+                "Max",
+                "Mean",
+                "RMS",
+                "Kurtosis",
+                "Energy",
+            ]
+        )
+        self.bc_c_mode_cmap_label = QLabel("Colormap")
+        self.bc_c_mode_cmap_combo = QComboBox()
+        self.bc_c_mode_cmap_combo.addItems(
+            [
+                "Gray (16-bit)",
+                "viridis",
+                "plasma",
+                "inferno",
+                "magma",
+                "cividis",
+                "turbo",
+                "jet",
+            ]
+        )
+        self.bc_c_mode_metric_combo.setStyleSheet(
+            "QComboBox { padding-right: 26px; }"
+            "QComboBox::drop-down { width: 22px; border-left: 1px solid #cfd9e6; }"
+            "QComboBox::down-arrow {"
+            "image: none; width: 0px; height: 0px;"
+            "border-left: 5px solid transparent;"
+            "border-right: 5px solid transparent;"
+            "border-top: 7px solid #7b63b5;"
+            "margin-right: 6px;"
+            "}"
+        )
+        self.bc_c_mode_cmap_combo.setStyleSheet(
+            "QComboBox { padding-right: 26px; }"
+            "QComboBox::drop-down { width: 22px; border-left: 1px solid #cfd9e6; }"
+            "QComboBox::down-arrow {"
+            "image: none; width: 0px; height: 0px;"
+            "border-left: 5px solid transparent;"
+            "border-right: 5px solid transparent;"
+            "border-top: 7px solid #7b63b5;"
+            "margin-right: 6px;"
+            "}"
+        )
+        c_row1.addWidget(self.bc_c_mode_metric_label)
+        c_row1.addWidget(self.bc_c_mode_metric_combo)
+        c_row1.addSpacing(8)
+        c_row1.addWidget(self.bc_c_mode_cmap_label)
+        c_row1.addWidget(self.bc_c_mode_cmap_combo)
+        c_row1.addStretch(1)
+        self.bc_c_mode_metric_combo.currentIndexChanged.connect(
+            self._on_bc_c_mode_metric_changed
+        )
+        self.bc_c_mode_cmap_combo.currentIndexChanged.connect(
+            self._on_bc_c_mode_colormap_changed
+        )
+        self.bc_options_stack.addWidget(c_page)
+
+        # Page 2: Pressure Field Mode — metric selector
+        pf_page = QWidget()
+        pf_row = QHBoxLayout(pf_page)
+        pf_row.setContentsMargins(12, 0, 0, 0)
+        pf_row.setSpacing(8)
+        self.bc_pf_mode_filtering_label = QLabel("Filter")
+        self.bc_pf_mode_extra_combo = QComboBox()
+        self.bc_pf_mode_extra_combo.addItems(["No", "Yes"])
+        self.bc_pf_mode_metric_label = QLabel("Metric")
+        self.bc_pf_mode_metric_combo = QComboBox()
+        self.bc_pf_mode_metric_combo.addItems(
+            [
+                "Max",
+                "Min",
+                "Mode",
+                "Median",
+                "Mean",
+                "RMS",
+                "Variance",
+                "Kurtosis",
+                "Skewness",
+                "Entropy",
+                "Energy",
+            ]
+        )
+        self.bc_pf_mode_cmap_label = QLabel("Colormap")
+        self.bc_pf_mode_cmap_combo = QComboBox()
+        self.bc_pf_mode_cmap_combo.addItems(
+            [
+                "Gray (16-bit)",
+                "viridis",
+                "plasma",
+                "inferno",
+                "magma",
+                "cividis",
+                "turbo",
+                "jet",
+            ]
+        )
+        self.bc_pf_mode_metric_combo.setStyleSheet(
+            "QComboBox { padding-right: 26px; }"
+            "QComboBox::drop-down { width: 22px; border-left: 1px solid #cfd9e6; }"
+            "QComboBox::down-arrow {"
+            "image: none; width: 0px; height: 0px;"
+            "border-left: 5px solid transparent;"
+            "border-right: 5px solid transparent;"
+            "border-top: 7px solid #7b63b5;"
+            "margin-right: 6px;"
+            "}"
+        )
+        self.bc_pf_mode_cmap_combo.setStyleSheet(
+            "QComboBox { padding-right: 26px; }"
+            "QComboBox::drop-down { width: 22px; border-left: 1px solid #cfd9e6; }"
+            "QComboBox::down-arrow {"
+            "image: none; width: 0px; height: 0px;"
+            "border-left: 5px solid transparent;"
+            "border-right: 5px solid transparent;"
+            "border-top: 7px solid #7b63b5;"
+            "margin-right: 6px;"
+            "}"
+        )
+        self.bc_pf_mode_extra_combo.setStyleSheet(
+            "QComboBox { padding-right: 26px; }"
+            "QComboBox::drop-down { width: 22px; border-left: 1px solid #cfd9e6; }"
+            "QComboBox::down-arrow {"
+            "image: none; width: 0px; height: 0px;"
+            "border-left: 5px solid transparent;"
+            "border-right: 5px solid transparent;"
+            "border-top: 7px solid #7b63b5;"
+            "margin-right: 6px;"
+            "}"
+        )
+        pf_row.addWidget(self.bc_pf_mode_filtering_label)
+        pf_row.addWidget(self.bc_pf_mode_extra_combo)
+        pf_row.addSpacing(8)
+        pf_row.addWidget(self.bc_pf_mode_metric_label)
+        pf_row.addWidget(self.bc_pf_mode_metric_combo)
+        pf_row.addSpacing(8)
+        pf_row.addWidget(self.bc_pf_mode_cmap_label)
+        pf_row.addWidget(self.bc_pf_mode_cmap_combo)
+        pf_row.addStretch(1)
+        self.bc_pf_mode_cmap_combo.currentIndexChanged.connect(
+            self._on_bc_pf_colormap_changed
+        )
+        self.bc_pf_mode_metric_combo.currentIndexChanged.connect(
+            self._on_bc_pf_metric_changed
+        )
+        self.bc_options_stack.addWidget(pf_page)
+
+        scan_type_layout.addWidget(self.bc_options_stack)
+
+        self.bc_filter_options_stack = QStackedWidget()
+        self.bc_filter_options_stack.setFixedHeight(96)
+        self.bc_filter_options_stack.addWidget(QWidget())
+
+        # Page 1: C-Mode lower panel — gate controls
+        c_filter_page = QWidget()
+        c_filter_layout = QVBoxLayout(c_filter_page)
+        c_filter_layout.setContentsMargins(12, 2, 0, 2)
+        c_filter_layout.setSpacing(6)
+
+        c_filter_row1 = QHBoxLayout()
+        c_filter_row1.setContentsMargins(0, 0, 0, 0)
+        c_filter_row1.setSpacing(8)
+        self.bc_c_mode_gate_start_label = QLabel("Gate Start (μs)")
+        self.bc_c_mode_gate_start = self._make_double_spin(0.0, 20000.0, 1000.0)
+        self.bc_c_mode_gate_start.setSingleStep(0.1)
+        self.bc_c_mode_gate_start.setDecimals(1)
+        c_filter_row1.addWidget(self.bc_c_mode_gate_start_label)
+        c_filter_row1.addWidget(self.bc_c_mode_gate_start)
+        c_filter_row1.addStretch(1)
+
+        c_filter_row2 = QHBoxLayout()
+        c_filter_row2.setContentsMargins(0, 0, 0, 0)
+        c_filter_row2.setSpacing(8)
+        self.bc_c_mode_gate_width_label = QLabel("Gate Width (μs)")
+        self.bc_c_mode_gate_width = self._make_double_spin(0.0, 20000.0, 0.1)
+        self.bc_c_mode_gate_width.setSingleStep(0.1)
+        self.bc_c_mode_gate_width.setDecimals(1)
+        c_filter_row2.addWidget(self.bc_c_mode_gate_width_label)
+        c_filter_row2.addWidget(self.bc_c_mode_gate_width)
+        c_filter_row2.addStretch(1)
+        c_filter_row2.addWidget(self.bc_apply_cmode_button)
+
+        c_filter_layout.addLayout(c_filter_row1)
+        c_filter_layout.addLayout(c_filter_row2)
+        self.bc_filter_options_stack.addWidget(c_filter_page)
+
+        pf_filter_page = QWidget()
+        pf_filter_layout = QVBoxLayout(pf_filter_page)
+        pf_filter_layout.setContentsMargins(12, 2, 0, 2)
+        pf_filter_layout.setSpacing(6)
+
+        pf_filter_top_row = QHBoxLayout()
+        pf_filter_top_row.setContentsMargins(0, 0, 0, 0)
+        pf_filter_top_row.setSpacing(8)
+        self.bc_pf_filter_type_label = QLabel("Type")
+        self.bc_pf_filter_type_combo = QComboBox()
+        self.bc_pf_filter_type_combo.addItems(["High-pass", "Band-pass"])
+        self.bc_pf_filter_order_label = QLabel("Order")
+        self.bc_pf_filter_order_spin = QLineEdit("4")
+        self.bc_pf_filter_order_spin.setFixedWidth(70)
+        self.bc_pf_filter_order_spin.setPlaceholderText("n")
+
+        pf_filter_bottom_row = QHBoxLayout()
+        pf_filter_bottom_row.setContentsMargins(0, 0, 0, 0)
+        pf_filter_bottom_row.setSpacing(6)
+        self.bc_pf_filter_cutoff_label = QLabel("Cutoff (kHz)")
+        # high_cutoff_spin: single value for high-pass OR low edge for band-pass
+        self.bc_pf_filter_high_cutoff_spin = QLineEdit("50.0")
+        self.bc_pf_filter_high_cutoff_spin.setFixedWidth(90)
+        self.bc_pf_filter_high_cutoff_spin.setPlaceholderText("kHz")
+        self.bc_pf_filter_cutoff_dash = QLabel("–")
+        # band_cutoff_spin: high edge for band-pass only
+        self.bc_pf_filter_band_cutoff_spin = QLineEdit("500.0")
+        self.bc_pf_filter_band_cutoff_spin.setFixedWidth(90)
+        self.bc_pf_filter_band_cutoff_spin.setPlaceholderText("kHz")
+        # keep low_cutoff_spin as alias so backend references stay valid
+        self.bc_pf_filter_low_cutoff_spin = self.bc_pf_filter_high_cutoff_spin
+        pf_filter_top_row.addWidget(self.bc_pf_filter_type_label)
+        pf_filter_top_row.addWidget(self.bc_pf_filter_type_combo)
+        pf_filter_top_row.addSpacing(8)
+        pf_filter_top_row.addWidget(self.bc_pf_filter_order_label)
+        pf_filter_top_row.addWidget(self.bc_pf_filter_order_spin)
+        pf_filter_top_row.addStretch(1)
+        pf_filter_bottom_row.addWidget(self.bc_pf_filter_cutoff_label)
+        pf_filter_bottom_row.addWidget(self.bc_pf_filter_high_cutoff_spin)
+        pf_filter_bottom_row.addWidget(self.bc_pf_filter_cutoff_dash)
+        pf_filter_bottom_row.addWidget(self.bc_pf_filter_band_cutoff_spin)
+        pf_filter_bottom_row.addStretch(1)
+        pf_filter_bottom_row.addWidget(self.bc_post_apply_button)
+        self.bc_pf_filter_bottom_widget = QWidget()
+        self.bc_pf_filter_bottom_widget.setLayout(pf_filter_bottom_row)
+        pf_filter_layout.addLayout(pf_filter_top_row)
+        pf_filter_layout.addWidget(self.bc_pf_filter_bottom_widget)
+        self.bc_filter_options_stack.addWidget(pf_filter_page)
+        self.bc_pf_mode_extra_combo.currentIndexChanged.connect(
+            self._update_bc_pf_filter_controls
+        )
+        self.bc_pf_filter_type_combo.currentIndexChanged.connect(
+            self._update_bc_pf_filter_controls
+        )
+
+        scan_type_layout.addWidget(self.bc_filter_options_stack)
+
+        self._set_bc_scan_type("standard")
+        self._update_bc_pf_filter_controls()
+        self._bc_indicator_ready = False
+        self.bc_scan_type_segment.installEventFilter(self)
+        controls_layout.addWidget(scan_type_box)
+
+        button_row = QHBoxLayout()
         self.start_button = QPushButton("Start Scan")
         self.start_button.setProperty("role", "primary")
         self.start_button.clicked.connect(self.start_scan)
@@ -622,9 +1076,10 @@ class ScannerMainWindow(QMainWindow):
             "QPushButton:pressed { background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #1756ad, stop:1 #2f80ed); }"
             "QPushButton:disabled { background: #e8edf4; color: #95a3b5; }"
         )
-        self.stop_button = QPushButton("Stop")
+        self.stop_button = QPushButton("Stop Scan")
         self.stop_button.clicked.connect(self.stop_scan)
         self.stop_button.setEnabled(False)
+        self.stop_button.setFixedHeight(34)
         self.stop_button.setStyleSheet(
             "QPushButton { min-width: 84px; min-height: 34px; max-width: 96px; padding: 6px 12px; "
             "border: none; border-radius: 14px; background: qlineargradient(x1:0, y1:0, x2:1, y2:0, "
@@ -633,9 +1088,9 @@ class ScannerMainWindow(QMainWindow):
             "QPushButton:pressed { background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #b91f2f, stop:1 #de4a58); }"
             "QPushButton:disabled { background: #e8edf4; color: #95a3b5; border-color: #dde5ee; }"
         )
-        self._normalize_button_row(button_row, [preview_button, self.start_button, self.stop_button])
+        self._normalize_button_row(button_row, [self.start_button, self.stop_button])
+        button_row.setSpacing(8)
         for widget in [
-            preview_button,
             self.start_button,
             self.stop_button,
         ]:
@@ -655,17 +1110,17 @@ class ScannerMainWindow(QMainWindow):
             "QPushButton:pressed { background-color: #a98ae9; }"
             "QPushButton:disabled { background-color: #e4d9fb; color: #9b8abf; }"
         )
-        self.bc_export_logs_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.bc_export_logs_button.setSizePolicy(
+            QSizePolicy.Expanding, QSizePolicy.Fixed
+        )
         log_layout.addWidget(self.bc_export_logs_button)
         controls_layout.addWidget(log_box, 1)
-        controls_layout.addStretch(1)
 
-        controls.setFixedWidth(B_MODE_LEFT_PANEL_WIDTH)
-        layout.addWidget(controls, 0)
+        controls.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
 
         preview_col = QWidget()
         preview_layout = QVBoxLayout(preview_col)
-        preview_layout.setContentsMargins(0, 0, 0, 0)
+        preview_layout.setContentsMargins(12, 0, 12, 0)
         self.bc_canvas = PlotCanvas("Waveform preview will appear here")
         self.bc_preview_toolbar = NavigationToolbar2QT(self.bc_canvas, page)
         self.bc_export_button = QPushButton("Export Data")
@@ -677,17 +1132,29 @@ class ScannerMainWindow(QMainWindow):
             "QPushButton:pressed { background-color: #a98ae9; }"
             "QPushButton:disabled { background-color: #e4d9fb; color: #9b8abf; }"
         )
-        self.bc_preview_toolbar.addSeparator()
-        self.bc_preview_toolbar.addWidget(self.bc_export_button)
         preview_layout.addWidget(self.bc_preview_toolbar)
+
+        bc_preview_controls = QWidget()
+        bc_preview_controls_layout = QHBoxLayout(bc_preview_controls)
+        bc_preview_controls_layout.setContentsMargins(0, 0, 0, 0)
+        bc_preview_controls_layout.setSpacing(8)
+        bc_preview_controls_layout.addStretch(1)
+        bc_preview_controls_layout.addWidget(self.bc_export_button)
+        preview_layout.addWidget(bc_preview_controls)
+
         preview_layout.addWidget(self.bc_canvas, 1)
+        preview_col.setMinimumWidth(0)
+        preview_col.setMaximumWidth(2000)
+        bc_left_scroll = self._make_vscroll_panel(controls, B_MODE_LEFT_PANEL_WIDTH)
+        layout.addWidget(bc_left_scroll, 0)
+        layout.addSpacing(PANEL_GAP)
         layout.addWidget(preview_col, 1)
         return page
 
     def _build_b_mode_tab(self) -> QWidget:
         page = QWidget()
         layout = QHBoxLayout(page)
-        layout.setSpacing(14)
+        layout.setSpacing(0)
 
         left_col = QWidget()
         left_layout = QVBoxLayout(left_col)
@@ -711,6 +1178,8 @@ class ScannerMainWindow(QMainWindow):
         self.b_scan_length = self._make_double_spin(0.1, 10000, 20.0)
         self.b_scan_points = self._make_spin(1, 10000, 5)
         self.b_sound_speed = self._make_double_spin(0.0, 20000.0, 1500.0)
+        self.b_sound_speed.setSingleStep(1.0)
+        self.b_sound_speed.setDecimals(0)
         scan_form.addRow("Depth Axis", self.b_depth_axis)
         scan_form.addRow("Scan Axis", self.b_scan_axis)
         scan_form.addRow("Scan Length (mm)", self.b_scan_length)
@@ -721,26 +1190,6 @@ class ScannerMainWindow(QMainWindow):
         scan_form.addRow(speed_label, self.b_sound_speed)
         left_layout.addWidget(scan_box)
 
-        options_row = QHBoxLayout()
-        self._normalize_control_row(options_row)
-        self.b_live_preview_check = QCheckBox("Live Preview")
-        self.b_live_preview_check.setChecked(True)
-        self.b_dry_run_check = QCheckBox("Dry Run")
-        options_row.addWidget(self.b_live_preview_check)
-        options_row.addWidget(self.b_dry_run_check)
-        options_row.addStretch(1)
-        left_layout.addLayout(options_row)
-
-        button_row = QHBoxLayout()
-        self.b_preview_button = QPushButton("Preview")
-        self.b_preview_button.clicked.connect(self.preview_b_mode)
-        self.b_preview_button.setStyleSheet(
-            "QPushButton { min-width: 92px; min-height: 34px; max-width: 110px; padding: 6px 12px; "
-            "background-color: #c9b1f7; color: #2d1b69; border: none; border-radius: 14px; font-weight: 600; }"
-            "QPushButton:hover { background-color: #b89ef0; }"
-            "QPushButton:pressed { background-color: #a98ae9; }"
-            "QPushButton:disabled { background-color: #e4d9fb; color: #9b8abf; }"
-        )
         self.b_export_button = QPushButton("Export Data")
         self.b_export_button.clicked.connect(self.export_b_mode_matrix)
         self.b_export_button.setStyleSheet(
@@ -773,18 +1222,27 @@ class ScannerMainWindow(QMainWindow):
             "QPushButton:pressed { background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #b91f2f, stop:1 #de4a58); }"
             "QPushButton:disabled { background: #e8edf4; color: #95a3b5; border-color: #dde5ee; }"
         )
+        self.b_dry_run_check = QCheckBox("Dry Run")
+        self.b_dry_run_check.setChecked(True)
+        self.b_live_preview_check = QCheckBox("Live Preview")
+        self.b_live_preview_check.setChecked(True)
+        self.b_source_label = QLabel("Signal source: Dummy")
+        self.b_source_label.setStyleSheet("color: #415368; font-size: 9pt;")
+        self.b_dry_run_check.stateChanged.connect(self._update_b_mode_source_label)
+        button_row = QHBoxLayout()
         self._normalize_button_row(
             button_row,
             [
-                self.b_preview_button,
                 self.b_start_button,
                 self.b_stop_button,
             ],
         )
-        button_row.setSpacing(14)
-        button_row.addWidget(self.b_preview_button)
+        button_row.setSpacing(8)
         button_row.addWidget(self.b_start_button)
         button_row.addWidget(self.b_stop_button)
+        button_row.addWidget(self.b_dry_run_check)
+        button_row.addWidget(self.b_live_preview_check)
+        button_row.addWidget(self.b_source_label)
         button_row.addStretch(1)
         left_layout.addLayout(button_row)
 
@@ -801,24 +1259,47 @@ class ScannerMainWindow(QMainWindow):
             "QPushButton:pressed { background-color: #a98ae9; }"
             "QPushButton:disabled { background-color: #e4d9fb; color: #9b8abf; }"
         )
-        self.b_export_logs_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.b_export_logs_button.setSizePolicy(
+            QSizePolicy.Expanding, QSizePolicy.Fixed
+        )
         log_layout.addWidget(self.b_export_logs_button)
         left_layout.addWidget(log_box, 1)
 
         right_col = QWidget()
         right_layout = QVBoxLayout(right_col)
-        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setContentsMargins(12, 0, 12, 0)
         self.b_preview_canvas = PlotCanvas("B-mode preview will appear here")
+        self.b_preview_canvas.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
         self.b_preview_toolbar = NavigationToolbar2QT(self.b_preview_canvas, page)
+        self.b_preview_toolbar.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         self.b_preview_toolbar.addSeparator()
-        self.b_preview_toolbar.addWidget(self.b_export_button)
+        self.b_normalize_check = QCheckBox("Normalize")
+        self.b_normalize_check.setEnabled(False)
+        self.b_normalize_check.setChecked(False)
+        self.b_normalize_check.setFixedHeight(34)
+        self.b_normalize_check.stateChanged.connect(self._on_b_mode_normalize_toggled)
         right_layout.addWidget(self.b_preview_toolbar)
+
+        b_preview_controls = QWidget()
+        b_preview_controls_layout = QHBoxLayout(b_preview_controls)
+        b_preview_controls_layout.setContentsMargins(0, 0, 0, 0)
+        b_preview_controls_layout.setSpacing(8)
+        b_preview_controls_layout.addStretch(1)
+        b_preview_controls_layout.addWidget(self.b_normalize_check)
+        b_preview_controls_layout.addWidget(self.b_export_button)
+        b_preview_controls.setMinimumWidth(0)
+        b_preview_controls.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        right_layout.addWidget(b_preview_controls)
+
         right_layout.addWidget(self.b_preview_canvas, 1)
 
-        left_col.setFixedWidth(B_MODE_LEFT_PANEL_WIDTH)
         left_col.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
-        right_col.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        layout.addWidget(left_col, 0)
+        right_col.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
+        right_col.setMinimumWidth(0)
+        right_col.setMaximumWidth(2000)
+        b_left_scroll = self._make_vscroll_panel(left_col, B_MODE_LEFT_PANEL_WIDTH)
+        layout.addWidget(b_left_scroll, 0)
+        layout.addSpacing(PANEL_GAP)
         layout.addWidget(right_col, 1)
         return page
 
@@ -1011,6 +1492,18 @@ class ScannerMainWindow(QMainWindow):
     def _port_value(self) -> int:
         return int(self.port_edit.text().strip())
 
+    def _line_edit_float(self, widget: QLineEdit, default: float) -> float:
+        try:
+            return float((widget.text() or "").strip())
+        except Exception:
+            return float(default)
+
+    def _line_edit_int(self, widget: QLineEdit, default: int) -> int:
+        try:
+            return int((widget.text() or "").strip())
+        except Exception:
+            return int(default)
+
     def _make_spin(self, minimum: int, maximum: int, value: int) -> QSpinBox:
         spin = QSpinBox()
         spin.setRange(minimum, maximum)
@@ -1037,7 +1530,9 @@ class ScannerMainWindow(QMainWindow):
         combo.setCurrentText(default)
         return combo
 
-    def _normalize_button_row(self, row: QHBoxLayout, buttons: list[QPushButton]) -> None:
+    def _normalize_button_row(
+        self, row: QHBoxLayout, buttons: list[QPushButton]
+    ) -> None:
         row.setSpacing(10)
         row.setContentsMargins(0, 0, 0, 0)
         row.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
@@ -1049,6 +1544,21 @@ class ScannerMainWindow(QMainWindow):
         row.setSpacing(spacing)
         row.setContentsMargins(0, 0, 0, 0)
         row.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+
+    def _make_vscroll_panel(
+        self, content: QWidget, width: int | None = None
+    ) -> QScrollArea:
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        scroll.setWidget(content)
+        if width is not None:
+            scroll.setFixedWidth(width + 18)
+            content.setMinimumWidth(width)
+        return scroll
 
     def _unused_axis(self, axis1: str, axis2: str) -> str:
         used = {str(axis1).strip().upper(), str(axis2).strip().upper()}
@@ -1082,6 +1592,347 @@ class ScannerMainWindow(QMainWindow):
         self._last_bc_csv_path = csv_path
         self.bc_canvas.plot_waveform(csv_path)
 
+    def _compute_pressure_field_metric(
+        self, signal: np.ndarray, metric_name: str
+    ) -> float:
+        import numpy as np
+
+        y = np.asarray(signal, dtype=float)
+        y = y[np.isfinite(y)]
+        if y.size == 0:
+            return float("nan")
+
+        key = str(metric_name).strip().lower()
+        if key == "max":
+            return float(np.max(y))
+        if key == "mean":
+            return float(np.mean(y))
+        if key == "min":
+            return float(np.min(y))
+        if key == "median":
+            return float(np.median(y))
+        if key == "rms":
+            return float(np.sqrt(np.mean(y * y)))
+        if key == "variance":
+            return float(np.var(y))
+        if key == "energy":
+            return float(np.sum(y * y))
+        if key == "mode":
+            bins = min(256, max(16, int(np.sqrt(y.size))))
+            hist, edges = np.histogram(y, bins=bins)
+            idx = int(np.argmax(hist))
+            return float(0.5 * (edges[idx] + edges[idx + 1]))
+        if key == "skewness":
+            mu = float(np.mean(y))
+            c = y - mu
+            m2 = float(np.mean(c * c))
+            if m2 <= 0.0:
+                return 0.0
+            m3 = float(np.mean(c * c * c))
+            return float(m3 / (m2**1.5))
+        if key == "kurtosis":
+            mu = float(np.mean(y))
+            c = y - mu
+            m2 = float(np.mean(c * c))
+            if m2 <= 0.0:
+                return 0.0
+            m4 = float(np.mean(c * c * c * c))
+            return float(m4 / (m2 * m2))
+        if key == "entropy":
+            bins = min(256, max(16, int(np.sqrt(y.size))))
+            hist, _ = np.histogram(y, bins=bins)
+            p = hist.astype(float)
+            s = float(np.sum(p))
+            if s <= 0.0:
+                return 0.0
+            p /= s
+            p = p[p > 0.0]
+            return float(-np.sum(p * np.log2(p)))
+        return float(np.max(y))
+
+    def _detrend_signal(self, signal: np.ndarray) -> np.ndarray:
+        import numpy as np
+
+        y = np.asarray(signal, dtype=float)
+        if y.size < 2:
+            return y.copy()
+        x = np.arange(y.size, dtype=float)
+        try:
+            coeff = np.polyfit(x, y, 1)
+            trend = np.polyval(coeff, x)
+            return y - trend
+        except Exception:
+            # Fallback to DC detrend if linear fit is numerically unstable.
+            return y - float(np.mean(y))
+
+    def _apply_pressure_field_filter(
+        self,
+        signal: np.ndarray,
+        *,
+        sampling_rate_hz: float,
+        filter_type: str,
+        order: int,
+        highpass_cutoff_hz: float,
+        bandpass_low_cutoff_hz: float,
+        bandpass_high_cutoff_hz: float,
+    ) -> np.ndarray:
+        import numpy as np
+
+        y = np.asarray(signal, dtype=float)
+        n = y.size
+        if n == 0:
+            return y.copy()
+
+        fs = float(sampling_rate_hz)
+        if fs <= 0.0:
+            return y.copy()
+
+        filt_type = str(filter_type).strip().lower()
+        ord_n = max(1, int(order))
+
+        # Frequency-domain Butterworth-like response with zero-phase reconstruction.
+        f = np.fft.rfftfreq(n, d=1.0 / fs)
+        h = np.ones_like(f, dtype=float)
+
+        if filt_type == "high-pass":
+            fc = max(0.0, float(highpass_cutoff_hz))
+            if fc <= 0.0:
+                return y.copy()
+            h = 1.0 / np.sqrt(1.0 + np.power(fc / np.maximum(f, 1e-12), 2 * ord_n))
+            h[0] = 0.0
+        elif filt_type == "band-pass":
+            fl = max(0.0, float(bandpass_low_cutoff_hz))
+            fh = max(0.0, float(bandpass_high_cutoff_hz))
+            nyq = 0.5 * fs
+            if fl <= 0.0 or fh <= 0.0 or fl >= fh or fh >= nyq:
+                return y.copy()
+            h_hp = 1.0 / np.sqrt(1.0 + np.power(fl / np.maximum(f, 1e-12), 2 * ord_n))
+            h_hp[0] = 0.0
+            h_lp = 1.0 / np.sqrt(1.0 + np.power(np.maximum(f, 1e-12) / fh, 2 * ord_n))
+            h = h_hp * h_lp
+        else:
+            return y.copy()
+
+        spec = np.fft.rfft(y)
+        y_f = np.fft.irfft(spec * h, n=n)
+        return np.asarray(y_f, dtype=float)
+
+    def _render_bc_live_preview(self, payload: dict) -> None:
+        import importlib.util
+        import numpy as np
+
+        mode = str(payload.get("mode", "a_mode_live")).strip().lower()
+        if mode == "c_mode_map":
+            axis1_mm = np.asarray(payload.get("axis1_mm", []), dtype=float)
+            axis2_mm = np.asarray(payload.get("axis2_mm", []), dtype=float)
+            metric_map = np.asarray(payload.get("metric_map", []), dtype=float)
+            metric_name = str(payload.get("metric_name", "Metric"))
+            cmap_label = str(payload.get("colormap", "Gray (16-bit)"))
+            cmap_name = "gray"
+            if cmap_label.lower() not in {"gray (16-bit)", "gray", "grey"}:
+                cmap_name = cmap_label
+
+            if axis1_mm.size == 0 or axis2_mm.size == 0 or metric_map.size == 0:
+                self.bc_canvas.draw_placeholder("C-Mode preview unavailable")
+                return
+
+            self.bc_canvas.figure.clear()
+            self.bc_canvas.axes = self.bc_canvas.figure.add_subplot(111)
+            self.bc_canvas._style_axes()
+            plot_map = np.array(metric_map, dtype=float)
+            plot_map[~np.isfinite(plot_map)] = np.nan
+            extent = [
+                float(np.min(axis1_mm)),
+                float(np.max(axis1_mm)),
+                float(np.min(axis2_mm)),
+                float(np.max(axis2_mm)),
+            ]
+            im = self.bc_canvas.axes.imshow(
+                plot_map,
+                cmap=cmap_name,
+                aspect="auto",
+                interpolation="nearest",
+                origin="lower",
+                extent=extent,
+            )
+            if getattr(self, "_bc_colorbar", None) is not None:
+                try:
+                    self._bc_colorbar.remove()
+                except Exception:
+                    pass
+                self._bc_colorbar = None
+            self._bc_colorbar = self.bc_canvas.figure.colorbar(
+                im, ax=self.bc_canvas.axes
+            )
+            self._bc_colorbar.set_label(metric_name)
+            self.bc_canvas.axes.set_title(
+                f"C-Mode Map ({metric_name})", color="#1f2a37", fontsize=10
+            )
+            self.bc_canvas.axes.set_xlabel(
+                f"{payload.get('axis1_name', 'Axis 1')} (mm)", color="#415368"
+            )
+            self.bc_canvas.axes.set_ylabel(
+                f"{payload.get('axis2_name', 'Axis 2')} (mm)", color="#415368"
+            )
+            self.bc_canvas.draw_idle()
+            return
+
+        if mode == "pressure_field_map":
+            axis1_mm = np.asarray(payload.get("axis1_mm", []), dtype=float)
+            axis2_mm = np.asarray(payload.get("axis2_mm", []), dtype=float)
+            metric_map = np.asarray(payload.get("metric_map", []), dtype=float)
+            metric_name = str(payload.get("metric_name", "Metric"))
+            cmap_label = str(payload.get("colormap", "Gray (16-bit)"))
+            cmap_name = "gray"
+            if cmap_label.lower() not in {"gray (16-bit)", "gray", "grey"}:
+                cmap_name = cmap_label
+
+            if axis1_mm.size == 0 or axis2_mm.size == 0 or metric_map.size == 0:
+                self.bc_canvas.draw_placeholder("Pressure field preview unavailable")
+                return
+
+            self._bc_pressure_field_payload = {
+                "mode": "pressure_field_map",
+                "axis1_name": str(payload.get("axis1_name", "Axis 1")),
+                "axis2_name": str(payload.get("axis2_name", "Axis 2")),
+                "axis1_mm": np.array(axis1_mm, copy=True),
+                "axis2_mm": np.array(axis2_mm, copy=True),
+                "metric_map": np.array(metric_map, copy=True),
+                "metric_name": metric_name,
+                "colormap": cmap_label,
+            }
+
+            self.bc_canvas.figure.clear()
+            self.bc_canvas.axes = self.bc_canvas.figure.add_subplot(111)
+            self.bc_canvas._style_axes()
+            plot_map = np.array(metric_map, dtype=float)
+            plot_map[~np.isfinite(plot_map)] = np.nan
+            extent = [
+                float(np.min(axis1_mm)),
+                float(np.max(axis1_mm)),
+                float(np.min(axis2_mm)),
+                float(np.max(axis2_mm)),
+            ]
+            im = self.bc_canvas.axes.imshow(
+                plot_map,
+                cmap=cmap_name,
+                aspect="auto",
+                interpolation="nearest",
+                origin="lower",
+                extent=extent,
+            )
+            if getattr(self, "_bc_colorbar", None) is not None:
+                try:
+                    self._bc_colorbar.remove()
+                except Exception:
+                    pass
+                self._bc_colorbar = None
+            self._bc_colorbar = self.bc_canvas.figure.colorbar(
+                im, ax=self.bc_canvas.axes
+            )
+            self._bc_colorbar.set_label(metric_name)
+            self.bc_canvas.axes.set_title(
+                f"Pressure Field Map ({metric_name})", color="#1f2a37", fontsize=10
+            )
+            self.bc_canvas.axes.set_xlabel(
+                f"{payload.get('axis1_name', 'Axis 1')} (mm)", color="#415368"
+            )
+            self.bc_canvas.axes.set_ylabel(
+                f"{payload.get('axis2_name', 'Axis 2')} (mm)", color="#415368"
+            )
+            self.bc_canvas.draw_idle()
+            return
+
+        t = np.asarray(payload.get("t", []), dtype=float)
+        raw = np.asarray(payload.get("raw", []), dtype=float)
+        scan_type = str(payload.get("scan_type", "standard")).strip().lower()
+        scan_idx = int(payload.get("scan_idx", 1))
+        total_scans = int(payload.get("total_scans", 1))
+        axis1_name = str(payload.get("axis1_name", "Axis1"))
+        axis2_name = str(payload.get("axis2_name", "Axis2"))
+        axis1_idx = int(payload.get("axis1_idx", 1))
+        axis2_idx = int(payload.get("axis2_idx", 1))
+        axis1_total = int(payload.get("axis1_total", 1))
+        axis2_total = int(payload.get("axis2_total", 1))
+
+        # Compute envelope using the exact same routine and parameters as the A-Mode tab
+        envelope = np.empty(0)
+        if t.size > 0 and raw.size > 0:
+            try:
+                script_path = BASE_DIR / "A scan.py"
+                spec = importlib.util.spec_from_file_location("a_scan", script_path)
+                if spec is not None and spec.loader is not None:
+                    _mod = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(_mod)
+                    envelope = np.asarray(
+                        _mod.estimate_a_mode_signal(
+                            t,
+                            raw,
+                            highpass_cutoff_hz=float(
+                                self.a_mode_highpass_cutoff.value()
+                            )
+                            * 1000.0,
+                            filter_order=int(self.a_mode_filter_order.value()),
+                            sampling_rate_hz=self._extract_last_float(
+                                self.sampling_rate_edit.text().strip(), 0.0
+                            )
+                            * 1000.0,
+                        ),
+                        dtype=float,
+                    )
+            except Exception as _env_exc:
+                self.bridge.bc_log.emit(f"[Live preview] Envelope error: {_env_exc}")
+
+        # Convert time axis using speed of sound from A-mode control (same as A-Mode tab)
+        sound_speed_mps = float(self.a_mode_sound_speed.value())
+        if sound_speed_mps > 0.0:
+            x = t * sound_speed_mps * 1000.0
+            x_label = "Distance (mm)"
+        else:
+            x = t * 1_000_000.0
+            x_label = r"Time ($\mu$s)"
+
+        # A-Mode in 3D preview: keep the current behavior (raw echo + A-mode envelope).
+        # Other modes will be wired to their dedicated visualizations in follow-up steps.
+        if scan_type not in {"", "standard", "a_mode"}:
+            scan_type = "standard"
+
+        title = (
+            f"{axis1_name} pt {axis1_idx}/{axis1_total}  |  "
+            f"{axis2_name} row {axis2_idx}/{axis2_total}  —  "
+            f"Scan {scan_idx}/{total_scans}"
+        )
+
+        self.bc_canvas.figure.clear()
+        self.bc_canvas.axes = self.bc_canvas.figure.add_subplot(111)
+        self.bc_canvas._style_axes()
+
+        n = min(x.size, raw.size)
+        if n > 0:
+            self.bc_canvas.axes.plot(
+                x[:n],
+                raw[:n],
+                color="#2f80ed",
+                linewidth=1.0,
+                alpha=0.55,
+                label="Raw echo",
+            )
+        ne = min(x.size, envelope.size)
+        if ne > 0:
+            self.bc_canvas.axes.plot(
+                x[:ne],
+                envelope[:ne],
+                color="#8a3ffc",
+                linewidth=1.8,
+                linestyle="--",
+                label="A-mode envelope",
+            )
+        self.bc_canvas.axes.legend(loc="best", fontsize=8)
+        self.bc_canvas.axes.set_title(title, color="#1f2a37", fontsize=9)
+        self.bc_canvas.axes.set_xlabel(x_label, color="#415368")
+        self.bc_canvas.axes.set_ylabel("Amplitude (V)", color="#415368")
+        self.bc_canvas.draw_idle()
+
     def _show_error(self, title: str, message: str) -> None:
         QMessageBox.critical(self, title, message)
 
@@ -1092,6 +1943,16 @@ class ScannerMainWindow(QMainWindow):
     def _set_scan_busy(self, busy: bool) -> None:
         self.start_button.setEnabled(not busy)
         self.stop_button.setEnabled(busy)
+        if busy:
+            for _btn_name in ("bc_post_apply_button", "bc_apply_cmode_button"):
+                if hasattr(self, _btn_name):
+                    getattr(self, _btn_name).setEnabled(False)
+        else:
+            if self._bc_apply_unlocked:
+                if hasattr(self, "bc_post_apply_button"):
+                    self.bc_post_apply_button.setEnabled(True)
+                if hasattr(self, "bc_apply_cmode_button"):
+                    self.bc_apply_cmode_button.setEnabled(True)
 
     def show_about(self) -> None:
         QMessageBox.information(
@@ -1126,9 +1987,7 @@ class ScannerMainWindow(QMainWindow):
             self.sg_address_edit.setText(
                 str(cfg.get("sg_address", self.sg_address_edit.text()))
             )
-            self.sg_name_edit.setText(
-                str(cfg.get("sg_name", self.sg_name_edit.text()))
-            )
+            self.sg_name_edit.setText(str(cfg.get("sg_name", self.sg_name_edit.text())))
             self.osc_name_edit.setText(
                 str(cfg.get("osc_name", self.osc_name_edit.text()))
             )
@@ -1139,7 +1998,8 @@ class ScannerMainWindow(QMainWindow):
             self.port_edit.setText(str(cfg.get("port", self.port_edit.text())))
             sampling_rate_hz = self._extract_last_float(
                 str(cfg.get("sampling_rate", self.sampling_rate_edit.text())),
-                self._extract_last_float(self.sampling_rate_edit.text(), 1000.0) * 1000.0,
+                self._extract_last_float(self.sampling_rate_edit.text(), 1000.0)
+                * 1000.0,
             )
             self.sampling_rate_edit.setText(f"{sampling_rate_hz / 1000.0:g}")
 
@@ -1151,10 +2011,25 @@ class ScannerMainWindow(QMainWindow):
             )
             self.tx_amp.setValue(float(tx.get("amplitude", self.tx_amp.value())))
             self.tx_cycles.setValue(
-                float(tx.get("no_of_cycles_per_pulse", self.tx_cycles.value()))
+                max(
+                    1,
+                    int(
+                        round(
+                            float(
+                                tx.get(
+                                    "no_of_cycles_per_pulse",
+                                    self.tx_cycles.value(),
+                                )
+                            )
+                        )
+                    ),
+                )
             )
             self.tx_pulses.setValue(int(tx.get("no_of_pulses", self.tx_pulses.value())))
             self.tx_prf.setValue(float(tx.get("prf", self.tx_prf.value())))
+            self.tx_start_delay_us.setValue(
+                float(tx.get("start_delay_s", 0.0)) * 1_000_000.0
+            )
             self.tx_auto_preview_check.setChecked(
                 bool(tx.get("auto_preview", self.tx_auto_preview_check.isChecked()))
             )
@@ -1168,6 +2043,13 @@ class ScannerMainWindow(QMainWindow):
             self.a_mode_filter_order.setValue(
                 int(a_mode.get("filter_order", self.a_mode_filter_order.value()))
             )
+            self.a_mode_sound_speed.setValue(
+                float(a_mode.get("sound_speed_mps", self.a_mode_sound_speed.value()))
+            )
+            self.a_dry_run_check.setChecked(
+                bool(a_mode.get("dry_run", self.a_dry_run_check.isChecked()))
+            )
+            self._update_a_mode_source_label()
             self.a_live_preview_check.setChecked(
                 bool(a_mode.get("live_preview", self.a_live_preview_check.isChecked()))
             )
@@ -1190,10 +2072,10 @@ class ScannerMainWindow(QMainWindow):
             self.b_dry_run_check.setChecked(
                 bool(b_line.get("dry_run", self.b_dry_run_check.isChecked()))
             )
+            self._update_b_mode_source_label()
             self.b_live_preview_check.setChecked(
                 bool(b_line.get("live_preview", self.b_live_preview_check.isChecked()))
             )
-
             self.shape_edit.setText(str(bc.get("shape", self.shape_edit.text())))
             self.freq_spin.setValue(float(bc.get("frequency", self.freq_spin.value())))
             self.amp_spin.setValue(float(bc.get("amplitude", self.amp_spin.value())))
@@ -1235,9 +2117,89 @@ class ScannerMainWindow(QMainWindow):
             self.dry_run_check.setChecked(
                 bool(bc.get("dry_run", self.dry_run_check.isChecked()))
             )
+            self._update_bc_mode_source_label()
             self.live_update_check.setChecked(
                 bool(bc.get("live_update", self.live_update_check.isChecked()))
             )
+            # Always launch with A-Mode selected in the 3D-mode scan-type group.
+            self._set_bc_scan_type("standard")
+            self.bc_c_mode_gate_start.setValue(
+                float(
+                    bc.get(
+                        "c_mode_gate_start_us",
+                        bc.get(
+                            "c_mode_gate_time_us",
+                            bc.get(
+                                "c_mode_sound_speed_mps",
+                                self.bc_c_mode_gate_start.value(),
+                            ),
+                        ),
+                    )
+                )
+            )
+            self.bc_c_mode_gate_width.setValue(
+                float(bc.get("c_mode_gate_width_us", self.bc_c_mode_gate_width.value()))
+            )
+            self.bc_c_mode_metric_combo.setCurrentText(
+                str(
+                    bc.get(
+                        "c_mode_metric",
+                        self.bc_c_mode_metric_combo.currentText(),
+                    )
+                )
+            )
+            self.bc_c_mode_cmap_combo.setCurrentText(
+                str(
+                    bc.get(
+                        "c_mode_colormap",
+                        self.bc_c_mode_cmap_combo.currentText(),
+                    )
+                )
+            )
+            self.bc_pf_mode_metric_combo.setCurrentText(
+                str(
+                    bc.get(
+                        "a_mode_metric",
+                        self.bc_pf_mode_metric_combo.currentText(),
+                    )
+                )
+            )
+            self.bc_pf_mode_cmap_combo.setCurrentText(
+                str(
+                    bc.get(
+                        "pressure_field_colormap",
+                        self.bc_pf_mode_cmap_combo.currentText(),
+                    )
+                )
+            )
+            pf_extra_value = str(
+                bc.get(
+                    "pressure_field_extra",
+                    self.bc_pf_mode_extra_combo.currentText(),
+                )
+            ).strip()
+            if pf_extra_value.lower() in {"filtering", "yes", "true", "1"}:
+                self.bc_pf_mode_extra_combo.setCurrentText("Yes")
+            else:
+                self.bc_pf_mode_extra_combo.setCurrentText("No")
+            self.bc_pf_filter_type_combo.setCurrentText(
+                str(
+                    bc.get(
+                        "pressure_field_filter_type",
+                        self.bc_pf_filter_type_combo.currentText(),
+                    )
+                )
+            )
+            self.bc_pf_filter_order_spin.setText(
+                str(bc.get("pressure_field_filter_order", "4"))
+            )
+            self.bc_pf_filter_high_cutoff_spin.setText(
+                str(bc.get("pressure_field_highpass_cutoff_khz", "50.0"))
+            )
+            self.bc_pf_filter_band_cutoff_spin.setText(
+                str(bc.get("pressure_field_bandpass_high_cutoff_khz", "500.0"))
+            )
+            self._update_bc_pf_filter_controls()
         except Exception:
             pass
         finally:
@@ -1262,9 +2224,10 @@ class ScannerMainWindow(QMainWindow):
                 "window_type": self.tx_windowing_combo.currentText(),
                 "frequency": float(self.tx_freq.value()) * 1000.0,
                 "amplitude": float(self.tx_amp.value()),
-                "no_of_cycles_per_pulse": float(self.tx_cycles.value()),
+                "no_of_cycles_per_pulse": int(self.tx_cycles.value()),
                 "no_of_pulses": int(self.tx_pulses.value()),
                 "prf": float(self.tx_prf.value()),
+                "start_delay_s": float(self.tx_start_delay_us.value()) * 1e-6,
                 "timing_tolerance_pct": 10.0,
                 "auto_preview": bool(self.tx_auto_preview_check.isChecked()),
             },
@@ -1275,7 +2238,9 @@ class ScannerMainWindow(QMainWindow):
                 "highpass_cutoff_hz": float(self.a_mode_highpass_cutoff.value())
                 * 1000.0,
                 "filter_order": int(self.a_mode_filter_order.value()),
+                "sound_speed_mps": float(self.a_mode_sound_speed.value()),
                 "mode": "INC",
+                "dry_run": bool(self.a_dry_run_check.isChecked()),
                 "live_preview": bool(self.a_live_preview_check.isChecked()),
                 "average_echoes": int(self.tx_pulses.value()),
             },
@@ -1303,6 +2268,19 @@ class ScannerMainWindow(QMainWindow):
                 "cross_points": int(self.cross_points.value()),
                 "dry_run": bool(self.dry_run_check.isChecked()),
                 "live_update": bool(self.live_update_check.isChecked()),
+                "scan_type": self._current_bc_scan_type(),
+                "c_mode_gate_start_us": float(self.bc_c_mode_gate_start.value()),
+                "c_mode_gate_width_us": float(self.bc_c_mode_gate_width.value()),
+                "c_mode_metric": self.bc_c_mode_metric_combo.currentText(),
+                "c_mode_colormap": self.bc_c_mode_cmap_combo.currentText(),
+                "a_mode_metric": self.bc_pf_mode_metric_combo.currentText(),
+                "pressure_field_colormap": self.bc_pf_mode_cmap_combo.currentText(),
+                "pressure_field_extra": self.bc_pf_mode_extra_combo.currentText(),
+                "pressure_field_filter_type": self.bc_pf_filter_type_combo.currentText(),
+                "pressure_field_filter_order": self._line_edit_int(self.bc_pf_filter_order_spin, 4),
+                "pressure_field_highpass_cutoff_khz": self._line_edit_float(self.bc_pf_filter_high_cutoff_spin, 50.0),
+                "pressure_field_bandpass_low_cutoff_khz": self._line_edit_float(self.bc_pf_filter_high_cutoff_spin, 50.0),
+                "pressure_field_bandpass_high_cutoff_khz": self._line_edit_float(self.bc_pf_filter_band_cutoff_spin, 500.0),
             },
         }
 
@@ -1344,14 +2322,18 @@ class ScannerMainWindow(QMainWindow):
             self.tx_cycles,
             self.tx_pulses,
             self.tx_prf,
+            self.tx_start_delay_us,
             self.a_mode_x,
             self.a_mode_y,
             self.a_mode_z,
             self.a_mode_highpass_cutoff,
             self.a_mode_filter_order,
+            self.a_mode_sound_speed,
             self.b_scan_length,
             self.b_scan_points,
             self.b_sound_speed,
+            self.bc_c_mode_gate_start,
+            self.bc_c_mode_gate_width,
             self.freq_spin,
             self.amp_spin,
             self.burst_cycles_spin,
@@ -1363,6 +2345,12 @@ class ScannerMainWindow(QMainWindow):
         ]
         for widget in spin_boxes:
             widget.valueChanged.connect(self._schedule_settings_save)
+        for line_edit in (
+            self.bc_pf_filter_order_spin,
+            self.bc_pf_filter_high_cutoff_spin,
+            self.bc_pf_filter_band_cutoff_spin,
+        ):
+            line_edit.textChanged.connect(self._schedule_settings_save)
 
         combos = [
             self.tx_windowing_combo,
@@ -1371,12 +2359,19 @@ class ScannerMainWindow(QMainWindow):
             self.scan_axis,
             self.cross_axis,
             self.depth_axis,
+            self.bc_c_mode_cmap_combo,
+            self.bc_pf_mode_metric_combo,
+            self.bc_pf_mode_cmap_combo,
+            self.bc_pf_mode_extra_combo,
+            self.bc_pf_filter_type_combo,
+            self.bc_c_mode_metric_combo,
         ]
         for widget in combos:
             widget.currentIndexChanged.connect(self._schedule_settings_save)
 
         checks = [
             self.tx_auto_preview_check,
+            self.a_dry_run_check,
             self.a_live_preview_check,
             self.b_live_preview_check,
             self.b_dry_run_check,
@@ -1385,6 +2380,9 @@ class ScannerMainWindow(QMainWindow):
         ]
         for widget in checks:
             widget.stateChanged.connect(self._schedule_settings_save)
+        self.bc_scan_type_standard_btn.toggled.connect(self._schedule_settings_save)
+        self.bc_scan_type_c_btn.toggled.connect(self._schedule_settings_save)
+        self.bc_scan_type_pf_btn.toggled.connect(self._schedule_settings_save)
 
     def _extract_last_float(self, text: str, fallback: float) -> float:
         for token in reversed(str(text).replace(",", " ").split()):
@@ -1394,7 +2392,604 @@ class ScannerMainWindow(QMainWindow):
                 continue
         return fallback
 
-    def _capture_a_mode_waveform(self, osc, frequency: float, amplitude: float, cycles: float):
+    def _update_a_mode_source_label(self, *_args) -> None:
+        if self.a_dry_run_check.isChecked():
+            self.a_source_label.setText("Signal source: Dummy")
+        else:
+            self.a_source_label.setText("Signal source: Hardware")
+
+    def _update_b_mode_source_label(self, *_args) -> None:
+        if self.b_dry_run_check.isChecked():
+            self.b_source_label.setText("Signal source: Dummy")
+        else:
+            self.b_source_label.setText("Signal source: Hardware")
+
+    def _update_bc_mode_source_label(self, *_args) -> None:
+        if self.dry_run_check.isChecked():
+            self.bc_source_label.setText("Signal source: Dummy")
+        else:
+            self.bc_source_label.setText("Signal source: Hardware")
+
+    def _current_bc_scan_type(self) -> str:
+        if self.bc_scan_type_c_btn.isChecked():
+            return "c_mode"
+        if self.bc_scan_type_pf_btn.isChecked():
+            return "pressure_field"
+        return "standard"
+
+    def _validate_pressure_field_filter_settings(self, pg: dict) -> tuple[bool, str]:
+        mode = self._current_bc_scan_type()
+        if mode != "pressure_field":
+            return True, ""
+
+        filtering_enabled = (
+            self.bc_pf_mode_extra_combo.currentText().strip().lower() == "yes"
+        )
+        if not filtering_enabled:
+            return True, ""
+
+        sampling_rate_hz = (
+            self._extract_last_float(
+                self.sampling_rate_edit.text().strip(),
+                max(float(pg.get("frequency", 1.0)) * 100.0, 1e6) / 1000.0,
+            )
+            * 1000.0
+        )
+        if sampling_rate_hz <= 0.0:
+            return False, "Sampling rate must be > 0 Hz for pressure field filtering."
+
+        nyquist_hz = 0.5 * sampling_rate_hz
+        filt_type = self.bc_pf_filter_type_combo.currentText().strip().lower()
+        order = self._line_edit_int(self.bc_pf_filter_order_spin, 0)
+        if order < 1:
+            return False, "Filter order must be >= 1."
+
+        if filt_type == "high-pass":
+            cutoff_hz = float(self.bc_pf_filter_high_cutoff_spin.text() or 0.0) * 1000.0
+            if cutoff_hz <= 0.0:
+                return False, "High-pass cutoff must be > 0 kHz."
+            if cutoff_hz >= nyquist_hz:
+                return (
+                    False,
+                    "High-pass cutoff must be below Nyquist frequency "
+                    f"({nyquist_hz / 1000.0:.3f} kHz).",
+                )
+            return True, ""
+
+        if filt_type == "band-pass":
+            low_hz = float(self.bc_pf_filter_high_cutoff_spin.text() or 0.0) * 1000.0
+            high_hz = float(self.bc_pf_filter_band_cutoff_spin.text() or 0.0) * 1000.0
+            if low_hz <= 0.0 or high_hz <= 0.0:
+                return False, "Band-pass low/high cutoffs must both be > 0 kHz."
+            if low_hz >= high_hz:
+                return False, "Band-pass low cutoff must be lower than high cutoff."
+            if high_hz >= nyquist_hz:
+                return (
+                    False,
+                    "Band-pass high cutoff must be below Nyquist frequency "
+                    f"({nyquist_hz / 1000.0:.3f} kHz).",
+                )
+            return True, ""
+
+        return False, f"Unsupported filter type: {self.bc_pf_filter_type_combo.currentText()}"
+
+    def _set_bc_scan_type(self, scan_type: str) -> None:
+        key = str(scan_type).strip().lower()
+        if key == "c_mode":
+            self.bc_scan_type_c_btn.setChecked(True)
+        elif key == "pressure_field":
+            self.bc_scan_type_pf_btn.setChecked(True)
+        else:
+            self.bc_scan_type_standard_btn.setChecked(True)
+        self._on_bc_scan_type_changed()
+
+    def _on_bc_scan_type_changed(self, *_args) -> None:
+        mode = self._current_bc_scan_type()
+        if mode == "c_mode":
+            self.bc_options_stack.setCurrentIndex(1)
+        elif mode == "pressure_field":
+            self.bc_options_stack.setCurrentIndex(2)
+        else:
+            self.bc_options_stack.setCurrentIndex(0)
+        if hasattr(self, "bc_post_apply_button"):
+            self.bc_post_apply_button.setEnabled(self._bc_apply_unlocked)
+        if hasattr(self, "bc_apply_cmode_button"):
+            self.bc_apply_cmode_button.setEnabled(self._bc_apply_unlocked)
+        self._update_bc_pf_filter_controls()
+        self._animate_bc_scan_type_indicator(animate=True)
+
+    def _update_bc_pf_filter_controls(self, *_args) -> None:
+        if not hasattr(self, "bc_filter_options_stack"):
+            return
+
+        mode = self._current_bc_scan_type()
+        if mode == "c_mode":
+            # C-Mode: show depth/apply controls in lower panel
+            self.bc_filter_options_stack.setCurrentIndex(1)
+            return
+        if mode != "pressure_field":
+            # A-Mode: lower panel remains blank
+            self.bc_filter_options_stack.setCurrentIndex(0)
+            return
+
+        # PF: show the pressure-field filter/apply page
+        self.bc_filter_options_stack.setCurrentIndex(2)
+
+        show_filter = (
+            self.bc_pf_mode_extra_combo.currentText().strip().lower()
+            in {"yes", "filtering"}
+        )
+        for _w in [
+            self.bc_pf_filter_type_label,
+            self.bc_pf_filter_type_combo,
+            self.bc_pf_filter_order_label,
+            self.bc_pf_filter_order_spin,
+        ]:
+            _w.setVisible(show_filter)
+        if hasattr(self, "bc_pf_filter_bottom_widget"):
+            self.bc_pf_filter_bottom_widget.setVisible(show_filter)
+        if show_filter:
+            is_bandpass = (
+                self.bc_pf_filter_type_combo.currentText().strip().lower() == "band-pass"
+            )
+            self.bc_pf_filter_cutoff_dash.setVisible(is_bandpass)
+            self.bc_pf_filter_band_cutoff_spin.setVisible(is_bandpass)
+
+    def _on_bc_post_apply_clicked(self) -> None:
+        mode = self._current_bc_scan_type()
+        if mode == "pressure_field":
+            self._apply_pressure_field_postprocessing_from_saved_data()
+            return
+        if mode == "c_mode":
+            self._apply_c_mode_postprocessing_from_saved_data()
+            return
+
+    def _apply_pressure_field_postprocessing_from_saved_data(self) -> None:
+        import numpy as np
+
+        source = getattr(self, "_bc_pressure_field_source", None)
+        if not source:
+            self.bridge.bc_log.emit(
+                "Apply ignored: no pressure-field scan data is available yet. Run one pressure-field scan first."
+            )
+            return
+
+        ok, msg = self._validate_pressure_field_filter_settings(
+            {"frequency": float(self.freq_spin.value())}
+        )
+        if not ok:
+            self._show_error("Invalid Pressure Field Filter Settings", msg)
+            self.bridge.bc_log.emit(f"Pressure field filter settings invalid: {msg}")
+            return
+
+        scan_folder = str(source.get("scan_folder", "")).strip()
+        scan_steps = int(source.get("scan_steps", 0))
+        cross_steps = int(source.get("cross_steps", 0))
+        axis1_mm = np.asarray(source.get("axis1_mm", []), dtype=float)
+        axis2_mm = np.asarray(source.get("axis2_mm", []), dtype=float)
+        axis1_name = str(source.get("axis1_name", "Axis 1"))
+        axis2_name = str(source.get("axis2_name", "Axis 2"))
+
+        if not scan_folder or scan_steps <= 0 or cross_steps <= 0:
+            self.bridge.bc_log.emit(
+                "Apply ignored: saved pressure-field metadata is incomplete. Run a pressure-field scan again."
+            )
+            return
+
+        sampling_rate_hz = (
+            self._extract_last_float(
+                self.sampling_rate_edit.text().strip(),
+                max(float(self.freq_spin.value()) * 100.0, 1e6) / 1000.0,
+            )
+            * 1000.0
+        )
+        filtering_enabled = (
+            self.bc_pf_mode_extra_combo.currentText().strip().lower() == "yes"
+        )
+        filter_type = self.bc_pf_filter_type_combo.currentText().strip()
+        filter_order = self._line_edit_int(self.bc_pf_filter_order_spin, 4)
+        hp_cutoff_hz = self._line_edit_float(self.bc_pf_filter_high_cutoff_spin, 50.0) * 1000.0
+        bp_low_hz = self._line_edit_float(self.bc_pf_filter_high_cutoff_spin, 50.0) * 1000.0
+        bp_high_hz = self._line_edit_float(self.bc_pf_filter_band_cutoff_spin, 500.0) * 1000.0
+        metric_name = self.bc_pf_mode_metric_combo.currentText().strip()
+        colormap = self.bc_pf_mode_cmap_combo.currentText().strip()
+
+        signal_map = np.empty((cross_steps, scan_steps), dtype=object)
+        signal_map[:, :] = None
+        metric_map = np.full((cross_steps, scan_steps), np.nan, dtype=float)
+        loaded_points = 0
+        missing_points = 0
+
+        for axis2_idx in range(1, cross_steps + 1):
+            for axis1_idx in range(1, scan_steps + 1):
+                csv_path = os.path.join(
+                    scan_folder, f"row_{axis1_idx}_col_{axis2_idx}.csv"
+                )
+                if not os.path.exists(csv_path):
+                    missing_points += 1
+                    continue
+                try:
+                    y = np.loadtxt(csv_path, delimiter=",", skiprows=1, usecols=1)
+                except Exception:
+                    missing_points += 1
+                    continue
+
+                arr = np.asarray(np.atleast_1d(y), dtype=float)
+                if arr.size == 0:
+                    missing_points += 1
+                    continue
+
+                processed = self._detrend_signal(arr)
+                if filtering_enabled:
+                    processed = self._apply_pressure_field_filter(
+                        processed,
+                        sampling_rate_hz=sampling_rate_hz,
+                        filter_type=filter_type,
+                        order=filter_order,
+                        highpass_cutoff_hz=hp_cutoff_hz,
+                        bandpass_low_cutoff_hz=bp_low_hz,
+                        bandpass_high_cutoff_hz=bp_high_hz,
+                    )
+
+                r = axis2_idx - 1
+                c = axis1_idx - 1
+                signal_map[r, c] = np.array(processed, copy=True)
+                metric_map[r, c] = self._compute_pressure_field_metric(processed, metric_name)
+                loaded_points += 1
+
+        if loaded_points == 0:
+            self.bridge.bc_log.emit(
+                "Apply ignored: no saved pressure-field A-scan CSV files were found for post-processing."
+            )
+            return
+
+        self._bc_pressure_field_cache = {
+            "axis1_name": axis1_name,
+            "axis2_name": axis2_name,
+            "axis1_mm": np.array(axis1_mm, copy=True),
+            "axis2_mm": np.array(axis2_mm, copy=True),
+            "signal_map": np.array(signal_map, copy=True),
+        }
+
+        self._render_bc_live_preview(
+            {
+                "mode": "pressure_field_map",
+                "axis1_name": axis1_name,
+                "axis2_name": axis2_name,
+                "axis1_mm": axis1_mm,
+                "axis2_mm": axis2_mm,
+                "metric_map": metric_map,
+                "metric_name": metric_name,
+                "colormap": colormap,
+            }
+        )
+
+        self.bridge.bc_log.emit(
+            f"Applied pressure-field post-processing from saved A-scans: loaded={loaded_points}, missing={missing_points}, "
+            f"filter={'on' if filtering_enabled else 'off'}, metric={metric_name}."
+        )
+        if hasattr(self, "bc_post_apply_button"):
+            self.bc_post_apply_button.setEnabled(self._bc_apply_unlocked)
+
+    def _apply_c_mode_postprocessing_from_saved_data(self) -> None:
+        import importlib.util
+        import numpy as np
+
+        source = getattr(self, "_bc_c_mode_source", None)
+        if not source:
+            self.bridge.bc_log.emit(
+                "Apply ignored: no C-Mode scan data is available yet. Run one C-Mode scan first."
+            )
+            return
+
+        scan_folder = str(source.get("scan_folder", "")).strip()
+        scan_steps = int(source.get("scan_steps", 0))
+        cross_steps = int(source.get("cross_steps", 0))
+        axis1_mm = np.asarray(source.get("axis1_mm", []), dtype=float)
+        axis2_mm = np.asarray(source.get("axis2_mm", []), dtype=float)
+        axis1_name = str(source.get("axis1_name", "Axis 1"))
+        axis2_name = str(source.get("axis2_name", "Axis 2"))
+
+        if not scan_folder or scan_steps <= 0 or cross_steps <= 0:
+            self.bridge.bc_log.emit(
+                "Apply ignored: saved C-Mode metadata is incomplete. Run a C-Mode scan again."
+            )
+            return
+
+        script_path = BASE_DIR / "A scan.py"
+        spec = importlib.util.spec_from_file_location("a_scan", script_path)
+        if spec is None or spec.loader is None:
+            self.bridge.bc_log.emit(
+                "Apply ignored: could not load A scan.py for envelope estimation."
+            )
+            return
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        sampling_rate_hz = (
+            self._extract_last_float(
+                self.sampling_rate_edit.text().strip(),
+                max(float(self.freq_spin.value()) * 100.0, 1e6) / 1000.0,
+            )
+            * 1000.0
+        )
+        cutoff_hz = float(self.a_mode_highpass_cutoff.value()) * 1000.0
+        filter_order = int(self.a_mode_filter_order.value())
+        gate_start_s = float(self.bc_c_mode_gate_start.value()) * 1e-6
+        gate_width_s = float(self.bc_c_mode_gate_width.value()) * 1e-6
+        gate_end_s = gate_start_s + gate_width_s
+        metric_name = self.bc_c_mode_metric_combo.currentText().strip()
+        colormap = self.bc_c_mode_cmap_combo.currentText().strip()
+
+        gated_signal_map = np.empty((cross_steps, scan_steps), dtype=object)
+        gated_signal_map[:, :] = None
+        metric_map = np.full((cross_steps, scan_steps), np.nan, dtype=float)
+        loaded_points = 0
+        missing_points = 0
+
+        for axis2_idx in range(1, cross_steps + 1):
+            for axis1_idx in range(1, scan_steps + 1):
+                csv_path = os.path.join(
+                    scan_folder, f"row_{axis1_idx}_col_{axis2_idx}.csv"
+                )
+                if not os.path.exists(csv_path):
+                    missing_points += 1
+                    continue
+                try:
+                    data = np.loadtxt(csv_path, delimiter=",", skiprows=1)
+                except Exception:
+                    missing_points += 1
+                    continue
+
+                arr = np.asarray(data, dtype=float)
+                if arr.size == 0:
+                    missing_points += 1
+                    continue
+                if arr.ndim == 1:
+                    if arr.size < 2:
+                        missing_points += 1
+                        continue
+                    arr = arr.reshape(1, -1)
+                if arr.shape[1] < 2:
+                    missing_points += 1
+                    continue
+
+                t = np.asarray(arr[:, 0], dtype=float)
+                y = np.asarray(arr[:, 1], dtype=float)
+                if t.size == 0 or y.size == 0:
+                    missing_points += 1
+                    continue
+
+                envelope = np.asarray(
+                    module.estimate_a_mode_signal(
+                        t,
+                        y,
+                        highpass_cutoff_hz=cutoff_hz,
+                        filter_order=filter_order,
+                        sampling_rate_hz=sampling_rate_hz,
+                    ),
+                    dtype=float,
+                )
+                n = min(t.size, envelope.size)
+                t = t[:n]
+                envelope = envelope[:n]
+                gated = envelope[(t >= gate_start_s) & (t <= gate_end_s)]
+
+                r = axis2_idx - 1
+                c = axis1_idx - 1
+                gated_signal_map[r, c] = np.array(gated, copy=True)
+                metric_map[r, c] = self._compute_pressure_field_metric(
+                    gated, metric_name
+                )
+                loaded_points += 1
+
+        if loaded_points == 0:
+            self.bridge.bc_log.emit(
+                "Apply ignored: no saved C-Mode A-scan CSV files were found for post-processing."
+            )
+            return
+
+        self._bc_c_mode_cache = {
+            "axis1_name": axis1_name,
+            "axis2_name": axis2_name,
+            "axis1_mm": np.array(axis1_mm, copy=True),
+            "axis2_mm": np.array(axis2_mm, copy=True),
+            "signal_map": np.array(gated_signal_map, copy=True),
+        }
+
+        self._render_bc_live_preview(
+            {
+                "mode": "c_mode_map",
+                "axis1_name": axis1_name,
+                "axis2_name": axis2_name,
+                "axis1_mm": axis1_mm,
+                "axis2_mm": axis2_mm,
+                "metric_map": metric_map,
+                "metric_name": metric_name,
+                "colormap": colormap,
+            }
+        )
+        self.bridge.bc_log.emit(
+            f"Applied C-Mode post-processing from saved A-scans: loaded={loaded_points}, missing={missing_points}, "
+            f"gate_start_us={self.bc_c_mode_gate_start.value():.1f}, gate_width_us={self.bc_c_mode_gate_width.value():.1f}, metric={metric_name}."
+        )
+
+    def _refresh_pressure_field_map_from_cache(self) -> bool:
+        import numpy as np
+
+        cache = getattr(self, "_bc_pressure_field_cache", None)
+        if not cache:
+            return False
+
+        signal_map = np.asarray(cache.get("signal_map", []), dtype=object)
+        if signal_map.size == 0:
+            return False
+
+        metric_name = self.bc_pf_mode_metric_combo.currentText().strip()
+        metric_map = np.full(signal_map.shape, np.nan, dtype=float)
+        for r in range(signal_map.shape[0]):
+            for c in range(signal_map.shape[1]):
+                sig = signal_map[r, c]
+                if sig is None:
+                    continue
+                arr = np.asarray(sig, dtype=float)
+                if arr.size == 0:
+                    continue
+                metric_map[r, c] = self._compute_pressure_field_metric(arr, metric_name)
+
+        payload = {
+            "mode": "pressure_field_map",
+            "axis1_name": cache.get("axis1_name", "Axis 1"),
+            "axis2_name": cache.get("axis2_name", "Axis 2"),
+            "axis1_mm": np.asarray(cache.get("axis1_mm", []), dtype=float),
+            "axis2_mm": np.asarray(cache.get("axis2_mm", []), dtype=float),
+            "metric_map": metric_map,
+            "metric_name": metric_name,
+            "colormap": self.bc_pf_mode_cmap_combo.currentText().strip(),
+        }
+        self._render_bc_live_preview(payload)
+        return True
+
+    def _refresh_c_mode_map_from_cache(self) -> bool:
+        import numpy as np
+
+        cache = getattr(self, "_bc_c_mode_cache", None)
+        if not cache:
+            return False
+
+        signal_map = np.asarray(cache.get("signal_map", []), dtype=object)
+        if signal_map.size == 0:
+            return False
+
+        metric_name = self.bc_c_mode_metric_combo.currentText().strip()
+        metric_map = np.full(signal_map.shape, np.nan, dtype=float)
+        for r in range(signal_map.shape[0]):
+            for c in range(signal_map.shape[1]):
+                sig = signal_map[r, c]
+                if sig is None:
+                    continue
+                arr = np.asarray(sig, dtype=float)
+                if arr.size == 0:
+                    continue
+                metric_map[r, c] = self._compute_pressure_field_metric(arr, metric_name)
+
+        payload = {
+            "mode": "c_mode_map",
+            "axis1_name": cache.get("axis1_name", "Axis 1"),
+            "axis2_name": cache.get("axis2_name", "Axis 2"),
+            "axis1_mm": np.asarray(cache.get("axis1_mm", []), dtype=float),
+            "axis2_mm": np.asarray(cache.get("axis2_mm", []), dtype=float),
+            "metric_map": metric_map,
+            "metric_name": metric_name,
+            "colormap": self.bc_c_mode_cmap_combo.currentText().strip(),
+        }
+        self._render_bc_live_preview(payload)
+        return True
+
+    def _on_bc_pf_metric_changed(self, *_args) -> None:
+        if getattr(self, "_is_loading_settings", False):
+            return
+        if self._current_bc_scan_type() != "pressure_field":
+            return
+        self._refresh_pressure_field_map_from_cache()
+
+    def _on_bc_pf_colormap_changed(self, *_args) -> None:
+        if getattr(self, "_is_loading_settings", False):
+            return
+        if self._current_bc_scan_type() != "pressure_field":
+            return
+        if self._refresh_pressure_field_map_from_cache():
+            return
+        cached = getattr(self, "_bc_pressure_field_payload", None)
+        if not cached:
+            return
+        payload = dict(cached)
+        payload["mode"] = "pressure_field_map"
+        payload["colormap"] = self.bc_pf_mode_cmap_combo.currentText().strip()
+        self._render_bc_live_preview(payload)
+
+    def _on_bc_c_mode_metric_changed(self, *_args) -> None:
+        if getattr(self, "_is_loading_settings", False):
+            return
+        if self._current_bc_scan_type() != "c_mode":
+            return
+        self._refresh_c_mode_map_from_cache()
+
+    def _on_bc_c_mode_colormap_changed(self, *_args) -> None:
+        if getattr(self, "_is_loading_settings", False):
+            return
+        if self._current_bc_scan_type() != "c_mode":
+            return
+        self._refresh_c_mode_map_from_cache()
+
+    def _animate_bc_scan_type_indicator(self, animate: bool = True) -> None:
+        if not hasattr(self, "bc_scan_type_group") or not hasattr(
+            self, "bc_scan_type_indicator"
+        ):
+            return
+        btn = self.bc_scan_type_group.checkedButton()
+        if btn is None:
+            return
+
+        end_rect = QRect(btn.x(), btn.y(), btn.width(), btn.height())
+        # Button hasn't been laid out yet (tab still hidden) — skip.
+        if end_rect.width() == 0:
+            return
+
+        # Clamp to the segment frame's interior so the indicator never overflows.
+        frame_w = self.bc_scan_type_segment.width()
+        frame_h = self.bc_scan_type_segment.height()
+        x = max(0, end_rect.x())
+        y = max(0, end_rect.y())
+        w = min(end_rect.width(), frame_w - x)
+        h = min(end_rect.height(), frame_h - y)
+        end_rect = QRect(x, y, w, h)
+        radius = max(2, h // 2)
+        self.bc_scan_type_indicator.setStyleSheet(
+            f"QFrame#bcScanTypeIndicator {{ background: #d9c2ff; border: 1px solid #c9b1f7; border-radius: {radius}px; }}"
+        )
+
+        self._bc_indicator_ready = True
+        if not animate:
+            self.bc_scan_type_indicator.setGeometry(end_rect)
+            self.bc_scan_type_indicator.show()
+            return
+
+        self.bc_scan_type_indicator.show()
+        self._bc_scan_type_indicator_anim = QPropertyAnimation(
+            self.bc_scan_type_indicator, b"geometry", self
+        )
+        self._bc_scan_type_indicator_anim.setDuration(180)
+        self._bc_scan_type_indicator_anim.setEasingCurve(QEasingCurve.InOutCubic)
+        self._bc_scan_type_indicator_anim.setStartValue(
+            self.bc_scan_type_indicator.geometry()
+        )
+        self._bc_scan_type_indicator_anim.setEndValue(end_rect)
+        self._bc_scan_type_indicator_anim.start()
+
+    def eventFilter(self, obj, event) -> bool:
+        if (
+            hasattr(self, "bc_scan_type_segment")
+            and obj is self.bc_scan_type_segment
+            and event.type() == QEvent.Type.Resize
+        ):
+            QTimer.singleShot(
+                0, lambda: self._animate_bc_scan_type_indicator(animate=False)
+            )
+        return super().eventFilter(obj, event)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if hasattr(self, "bc_scan_type_indicator") and getattr(
+            self, "_bc_indicator_ready", False
+        ):
+            QTimer.singleShot(
+                0, lambda: self._animate_bc_scan_type_indicator(animate=False)
+            )
+
+    def _capture_a_mode_waveform(
+        self, osc, frequency: float, amplitude: float, cycles: float
+    ):
         import numpy as np
 
         def vbs(cmd: str) -> None:
@@ -1420,7 +3015,9 @@ class ScannerMainWindow(QMainWindow):
         vbs('app.Acquisition.Trigger.Source = "C1"')
         osc.write("TRIG_MODE NORM")
 
-        raw_data = osc.query_binary_values("C1:WF? DAT1", datatype="B", container=np.array)
+        raw_data = osc.query_binary_values(
+            "C1:WF? DAT1", datatype="B", container=np.array
+        )
         vdiv = self._extract_last_float(osc.query("C1:VDIV?"), 1.0)
         ofst = self._extract_last_float(osc.query("C1:OFST?"), 0.0)
         volts = ((raw_data - 128) * vdiv + ofst - 128) * (1.0 / 30.0)
@@ -1439,6 +3036,13 @@ class ScannerMainWindow(QMainWindow):
         y_first = np.asarray(payload.get("y_first", []))
         y_avg = np.asarray(payload.get("y_avg", []))
         y_mode = np.asarray(payload.get("y_mode", []))
+        sound_speed_mps = float(self.a_mode_sound_speed.value())
+        if sound_speed_mps > 0.0:
+            x = t * sound_speed_mps * 1000.0
+            x_label = "Distance (mm)"
+        else:
+            x = t * 1_000_000.0
+            x_label = r"Time ($\mu$s)"
 
         self.a_preview_canvas.figure.clear()
         self.a_preview_canvas.axes = self.a_preview_canvas.figure.add_subplot(111)
@@ -1447,7 +3051,7 @@ class ScannerMainWindow(QMainWindow):
         if mode == "live":
             pulse_idx = int(payload.get("pulse_idx", 1))
             pulse_total = int(payload.get("pulse_total", 1))
-            self.a_preview_canvas.axes.plot(t, y, color="#2f80ed", linewidth=1.2)
+            self.a_preview_canvas.axes.plot(x, y, color="#2f80ed", linewidth=1.2)
             self.a_preview_canvas.axes.set_title(
                 f"A-Mode Live Preview ({pulse_idx}/{pulse_total})", color="#1f2a37"
             )
@@ -1457,7 +3061,7 @@ class ScannerMainWindow(QMainWindow):
             if live_enabled and y.size == y_avg.size and y.size > 0:
                 if pulse_total > 1 and y_first.size == y.size:
                     self.a_preview_canvas.axes.plot(
-                        t,
+                        x,
                         y_first,
                         color="#3a8d5c",
                         linewidth=1.0,
@@ -1465,14 +3069,14 @@ class ScannerMainWindow(QMainWindow):
                         label="First echo",
                     )
                 self.a_preview_canvas.axes.plot(
-                    t, y, color="#2f80ed", linewidth=1.0, alpha=0.6, label="Last echo"
+                    x, y, color="#2f80ed", linewidth=1.0, alpha=0.6, label="Last echo"
                 )
                 self.a_preview_canvas.axes.plot(
-                    t, y_avg, color="#e04b3f", linewidth=1.8, label="Average"
+                    x, y_avg, color="#e04b3f", linewidth=1.8, label="Average"
                 )
                 if y_mode.size == y_avg.size and y_mode.size > 0:
                     self.a_preview_canvas.axes.plot(
-                        t,
+                        x,
                         y_mode,
                         color="#8a3ffc",
                         linewidth=1.8,
@@ -1486,7 +3090,7 @@ class ScannerMainWindow(QMainWindow):
             else:
                 if pulse_total > 1 and y_first.size == y_avg.size and y_avg.size > 0:
                     self.a_preview_canvas.axes.plot(
-                        t,
+                        x,
                         y_first,
                         color="#3a8d5c",
                         linewidth=1.0,
@@ -1494,7 +3098,7 @@ class ScannerMainWindow(QMainWindow):
                         label="First echo",
                     )
                     self.a_preview_canvas.axes.plot(
-                        t,
+                        x,
                         y,
                         color="#2f80ed",
                         linewidth=1.0,
@@ -1502,11 +3106,11 @@ class ScannerMainWindow(QMainWindow):
                         label="Last echo",
                     )
                 self.a_preview_canvas.axes.plot(
-                    t, y_avg, color="#e04b3f", linewidth=1.8, label="Average"
+                    x, y_avg, color="#e04b3f", linewidth=1.8, label="Average"
                 )
                 if y_mode.size == y_avg.size and y_mode.size > 0:
                     self.a_preview_canvas.axes.plot(
-                        t,
+                        x,
                         y_mode,
                         color="#8a3ffc",
                         linewidth=1.8,
@@ -1521,7 +3125,7 @@ class ScannerMainWindow(QMainWindow):
                     "A-Mode Average Echo", color="#1f2a37"
                 )
 
-        self.a_preview_canvas.axes.set_xlabel("Time (s)", color="#415368")
+            self.a_preview_canvas.axes.set_xlabel(x_label, color="#415368")
         self.a_preview_canvas.axes.set_ylabel("Amplitude (V)", color="#415368")
         self.a_preview_canvas.draw_idle()
 
@@ -1604,7 +3208,9 @@ class ScannerMainWindow(QMainWindow):
             avg = np.asarray(self._a_mode_last_results["avg"])
 
             with open(filename, "w", encoding="utf-8") as f:
-                f.write(f"# Exported at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(
+                    f"# Exported at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                )
                 header = ["Time_s"]
                 header.extend(f"AScan_{idx + 1}" for idx in range(traces.shape[0]))
                 header.append("Average")
@@ -1648,6 +3254,13 @@ class ScannerMainWindow(QMainWindow):
             self.transmit_output,
             "Export Excitation Logs",
             "excitation_log.txt",
+        )
+
+    def export_config_logs(self) -> None:
+        self._export_log_widget_text(
+            self.cfg_output,
+            "Export Config Logs",
+            "config_log.txt",
         )
 
     def export_a_mode_logs(self) -> None:
@@ -1725,16 +3338,6 @@ class ScannerMainWindow(QMainWindow):
         scan["cross_step"] = max(1, int(round(cross_step_mm * MM_TO_PULSE)))
         return pg, scan
 
-    def preview_scan(self) -> None:
-        pg, scan = self.validate_scan_inputs()
-        message = (
-            f"Scan axis: {scan['scan_axis']} ({scan['scan_points']} points, step {scan['scan_step']} pulses)\n"
-            f"Cross axis: {scan['cross_axis']} ({scan['cross_points']} rows, step {scan['cross_step']} pulses)\n"
-            f"Depth axis: {scan['depth_axis']}\n"
-            f"Pulse: shape={pg['shape']}, freq={pg['frequency']} Hz, amp={pg['amplitude']} V, cycles/pulse={pg['no_of_cycles_per_pulse']}, pulses={pg['no_of_pulses']}"
-        )
-        QMessageBox.information(self, "Scan Preview", message)
-
     def collect_b_mode_inputs(self) -> dict:
         params = {
             "host": self.host_edit.text().strip(),
@@ -1749,15 +3352,43 @@ class ScannerMainWindow(QMainWindow):
         params["scan_step"] = max(1, int(round(step_mm * MM_TO_PULSE)))
         return params
 
-    def preview_b_mode(self) -> None:
-        params = self.collect_b_mode_inputs()
-        message = (
-            f"Scan axis: {params['scan_axis']} ({params['scan_points']} points, step {params['scan_step']} pulses)\n"
-            f"Depth axis: {params['depth_axis']}\n"
-            f"Speed of sound: {params['sound_speed_mps']} m/s\n"
-            f"Dry run: {self.b_dry_run_check.isChecked()} | Live preview: {self.b_live_preview_check.isChecked()}"
+    def _on_b_mode_normalize_toggled(self, value: int) -> None:
+        if not self._b_mode_last_results:
+            return
+        show_normalized = bool(value)
+        original = self._b_mode_last_results.get("image_original")
+        normalized = self._b_mode_last_results.get("image_normalized")
+        if show_normalized and normalized is None:
+            self.bridge.b_mode_log.emit(
+                "Normalization unavailable: cannot toggle because normalized image is not available."
+            )
+            self.b_normalize_check.blockSignals(True)
+            self.b_normalize_check.setChecked(False)
+            self.b_normalize_check.blockSignals(False)
+            return
+
+        image = normalized if show_normalized else original
+        if image is None:
+            return
+
+        self._b_mode_show_normalized = show_normalized
+        self._b_mode_last_results["image"] = image
+        self._b_mode_last_results["normalized_display"] = show_normalized
+        self.bridge.b_preview.emit(
+            {
+                "mode": "b_image_final",
+                "x_axis": self._b_mode_last_results.get("x_axis"),
+                "x_label": self._b_mode_last_results.get("x_label", "Depth (mm)"),
+                "scan_mm": self._b_mode_last_results.get("scan_mm"),
+                "image": image,
+                "normalized_display": show_normalized,
+                "can_toggle_normalize": normalized is not None,
+                "pulse_total": int(self._b_mode_last_results.get("pulse_total", 1)),
+                "live_enabled": bool(
+                    self._b_mode_last_results.get("live_enabled", False)
+                ),
+            }
         )
-        QMessageBox.information(self, "B-Mode Preview", message)
 
     def _render_b_mode_preview(self, payload: dict) -> None:
         import numpy as np
@@ -1767,27 +3398,61 @@ class ScannerMainWindow(QMainWindow):
         scan_mm = np.asarray(payload.get("scan_mm", []), dtype=float)
         image = np.asarray(payload.get("image", []), dtype=float)
         x_label = str(payload.get("x_label", "Depth (mm)"))
+        normalized_display = bool(payload.get("normalized_display", False))
+        can_toggle_normalize = bool(payload.get("can_toggle_normalize", False))
         if x_axis.size == 0 or scan_mm.size == 0 or image.size == 0:
             self.b_preview_canvas.draw_placeholder("B-mode preview will appear here")
             return
 
-        self.b_preview_canvas.figure.clear()
-        self.b_preview_canvas.axes = self.b_preview_canvas.figure.add_subplot(111)
-        self.b_preview_canvas._style_axes()
-
         draw_image = np.array(image, copy=True)
         draw_image[~np.isfinite(draw_image)] = np.nan
-        extent = [float(x_axis.min()), float(x_axis.max()), float(scan_mm.min()), float(scan_mm.max())]
-        im = self.b_preview_canvas.axes.imshow(
-            draw_image,
-            cmap="gray",
-            aspect="auto",
-            interpolation="nearest",
-            origin="lower",
-            extent=extent,
+        extent = [
+            float(x_axis.min()),
+            float(x_axis.max()),
+            float(scan_mm.min()),
+            float(scan_mm.max()),
+        ]
+
+        needs_reset = (
+            self._b_mode_image_artist is None
+            or self.b_preview_canvas.axes is None
+            or self._b_mode_image_artist.get_array().shape != draw_image.shape
         )
-        cbar = self.b_preview_canvas.figure.colorbar(im, ax=self.b_preview_canvas.axes)
-        cbar.set_label("Amplitude")
+        if needs_reset:
+            self.b_preview_canvas.figure.clear()
+            self.b_preview_canvas.axes = self.b_preview_canvas.figure.add_subplot(111)
+            self.b_preview_canvas._style_axes()
+            self._b_mode_image_artist = self.b_preview_canvas.axes.imshow(
+                draw_image,
+                cmap="gray",
+                aspect="auto",
+                interpolation="nearest",
+                origin="lower",
+                extent=extent,
+                vmin=0.0 if normalized_display else None,
+                vmax=1.0 if normalized_display else None,
+            )
+            self._b_mode_colorbar = self.b_preview_canvas.figure.colorbar(
+                self._b_mode_image_artist,
+                ax=self.b_preview_canvas.axes,
+            )
+            self._b_mode_colorbar.set_label(
+                "Normalized intensity (16-bit)" if normalized_display else "Amplitude"
+            )
+        else:
+            self._b_mode_image_artist.set_data(draw_image)
+            self._b_mode_image_artist.set_extent(extent)
+            if normalized_display:
+                self._b_mode_image_artist.set_clim(0.0, 1.0)
+            else:
+                self._b_mode_image_artist.autoscale()
+            if self._b_mode_colorbar is not None:
+                self._b_mode_colorbar.update_normal(self._b_mode_image_artist)
+                self._b_mode_colorbar.set_label(
+                    "Normalized intensity (16-bit)"
+                    if normalized_display
+                    else "Amplitude"
+                )
 
         if mode == "b_image_live":
             pulse_idx = int(payload.get("pulse_idx", 1))
@@ -1795,8 +3460,23 @@ class ScannerMainWindow(QMainWindow):
             self.b_preview_canvas.axes.set_title(
                 f"B-Mode Live Preview ({pulse_idx}/{pulse_total})", color="#1f2a37"
             )
+            self.b_normalize_check.blockSignals(True)
+            self.b_normalize_check.setChecked(False)
+            self.b_normalize_check.setEnabled(False)
+            self.b_normalize_check.blockSignals(False)
         else:
-            self.b_preview_canvas.axes.set_title("B-Mode Image", color="#1f2a37")
+            if normalized_display:
+                self.b_preview_canvas.axes.set_title(
+                    "B-Mode Image (Normalized 16-bit)", color="#1f2a37"
+                )
+            else:
+                self.b_preview_canvas.axes.set_title("B-Mode Image", color="#1f2a37")
+            self.b_normalize_check.blockSignals(True)
+            self.b_normalize_check.setEnabled(can_toggle_normalize)
+            self.b_normalize_check.setChecked(
+                bool(normalized_display and can_toggle_normalize)
+            )
+            self.b_normalize_check.blockSignals(False)
 
         self.b_preview_canvas.axes.set_xlabel(x_label, color="#415368")
         self.b_preview_canvas.axes.set_ylabel("Scanning Axis (mm)", color="#415368")
@@ -1805,6 +3485,11 @@ class ScannerMainWindow(QMainWindow):
     def start_b_mode(self) -> None:
         self._save_settings_now()
         self._b_mode_last_results = None
+        self._b_mode_show_normalized = False
+        self.b_normalize_check.blockSignals(True)
+        self.b_normalize_check.setChecked(False)
+        self.b_normalize_check.setEnabled(False)
+        self.b_normalize_check.blockSignals(False)
         self.b_output.clear()
         self.stop_event.clear()
         self.b_start_button.setEnabled(False)
@@ -1813,7 +3498,9 @@ class ScannerMainWindow(QMainWindow):
 
     def stop_b_mode(self) -> None:
         self.stop_event.set()
-        self.bridge.b_mode_log.emit("Stop requested. Current capture/move will finish first.")
+        self.bridge.b_mode_log.emit(
+            "Stop requested. Current capture/move will finish first."
+        )
 
     def _run_b_mode_worker(self) -> None:
         script_path = BASE_DIR / "A scan.py"
@@ -1843,10 +3530,15 @@ class ScannerMainWindow(QMainWindow):
             cycles = float(self.tx_cycles.value())
             prf_hz = float(self.tx_prf.value())
             window_fn = self.tx_windowing_combo.currentText()
-            sampling_rate = self._extract_last_float(
-                self.sampling_rate_edit.text().strip(),
-                max(frequency * 100.0, 1e6) / 1000.0,
-            ) * 1000.0
+            pulses_per_point = max(1, int(self.tx_pulses.value()))
+            sampling_rate = (
+                self._extract_last_float(
+                    self.sampling_rate_edit.text().strip(),
+                    max(frequency * 100.0, 1e6) / 1000.0,
+                )
+                * 1000.0
+            )
+            period_sec = 1.0 / max(prf_hz, 1e-12)
             cutoff_hz = float(self.a_mode_highpass_cutoff.value()) * 1000.0
             filter_order = int(self.a_mode_filter_order.value())
 
@@ -1861,18 +3553,47 @@ class ScannerMainWindow(QMainWindow):
 
                 sg_address = self.sg_address_edit.text().strip() or None
                 sg = Agilent33500(sg_address) if sg_address else Agilent33500()
-                osc = oscmod.open_oscilloscope(self.osc_address_edit.text().strip() or None)
+                osc = oscmod.open_oscilloscope(
+                    self.osc_address_edit.text().strip() or None
+                )
                 motion_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 motion_sock.connect((params["host"], params["port"]))
                 rig_function.send_command(motion_sock, "INC")
                 rig_function.enable_axis(motion_sock, params["scan_axis"])
+
+                b_data_dir = BASE_DIR.parent / "data"
+                b_data_dir.mkdir(exist_ok=True)
+                existing = [
+                    d
+                    for d in os.listdir(b_data_dir)
+                    if d.startswith("b_mode_scan_")
+                    and os.path.isdir(b_data_dir / d)
+                    and d.split("_")[-1].isdigit()
+                ]
+                next_idx = max((int(d.split("_")[-1]) for d in existing), default=0) + 1
+                b_scan_folder = b_data_dir / f"b_mode_scan_{next_idx:03d}"
+                b_scan_folder.mkdir(parents=True, exist_ok=True)
             else:
                 Burst_generate = None
+                b_data_dir = BASE_DIR.parent / "data"
+                b_data_dir.mkdir(exist_ok=True)
+                existing = [
+                    d
+                    for d in os.listdir(b_data_dir)
+                    if d.startswith("b_mode_scan_")
+                    and os.path.isdir(b_data_dir / d)
+                    and d.split("_")[-1].isdigit()
+                ]
+                next_idx = max((int(d.split("_")[-1]) for d in existing), default=0) + 1
+                b_scan_folder = b_data_dir / f"b_mode_scan_{next_idx:03d}"
+                b_scan_folder.mkdir(parents=True, exist_ok=True)
 
             self.bridge.b_mode_log.emit(
                 f"B-Mode settings: scan_axis={params['scan_axis']}, depth_axis={params['depth_axis']}, "
                 f"scan_points={points}, scan_step={scan_step}, sound_speed={sound_speed_mps} m/s, "
-                f"dry_run={dry_run}, live_preview={live_enabled}"
+                f"dry_run={dry_run}, live_preview={live_enabled}, "
+                f"echo_averages={pulses_per_point}, "
+                f"line_period={period_sec:.6f} s"
             )
 
             scan_mm = np.linspace(0.0, float(params["scan_length"]), points)
@@ -1880,29 +3601,54 @@ class ScannerMainWindow(QMainWindow):
             x_label = "Depth (mm)" if sound_speed_mps > 0 else r"Time ($\mu$s)"
             b_image = None
             for idx in range(1, points + 1):
+                cycle_start = time.perf_counter()
                 if self.stop_event.is_set():
                     self.bridge.b_mode_log.emit("B-Mode scan stopped by user.")
                     break
-                if dry_run:
-                    t, y = module.generate_test_echo(
-                        frequency_hz=frequency,
-                        amplitude_v=amplitude,
-                        no_of_cycles_per_pulse=cycles,
-                        window_type=window_fn,
-                        sampling_rate_hz=sampling_rate,
+                t_echoes = []
+                y_echoes = []
+                for pulse_idx in range(1, pulses_per_point + 1):
+                    if dry_run:
+                        t_one, y_one = module.generate_test_echo(
+                            frequency_hz=frequency,
+                            amplitude_v=amplitude,
+                            no_of_cycles_per_pulse=cycles,
+                            window_type=window_fn,
+                            sampling_rate_hz=sampling_rate,
+                        )
+                    else:
+                        Burst_generate(
+                            sg,
+                            shape="SIN",
+                            frequency=frequency,
+                            amplitude=amplitude,
+                            no_of_cycles_per_pulse=cycles,
+                            no_of_pulses=1,
+                            prf=prf_hz,
+                            window_type=window_fn,
+                        )
+                        t_one, y_one = self._capture_a_mode_waveform(
+                            osc, frequency, amplitude, cycles
+                        )
+                    t_echoes.append(np.asarray(t_one, dtype=float))
+                    y_echoes.append(np.asarray(y_one, dtype=float))
+                    self.bridge.b_mode_log.emit(
+                        f"Captured echo {pulse_idx}/{pulses_per_point} at point {idx}/{points}"
                     )
-                else:
-                    Burst_generate(
-                        sg,
-                        shape="SIN",
-                        frequency=frequency,
-                        amplitude=amplitude,
-                        no_of_cycles_per_pulse=cycles,
-                        no_of_pulses=1,
-                        prf=prf_hz,
-                        window_type=window_fn,
-                    )
-                    t, y = self._capture_a_mode_waveform(osc, frequency, amplitude, cycles)
+
+                if not y_echoes:
+                    raise RuntimeError(f"No echoes captured for B-Mode point {idx}.")
+
+                min_len = min(e.size for e in y_echoes)
+                t = t_echoes[0][:min_len]
+                stack = np.vstack([e[:min_len] for e in y_echoes])
+                y = np.mean(stack, axis=0)
+
+                point_csv_path = b_scan_folder / f"point_{idx:04d}.csv"
+                with open(point_csv_path, "w", encoding="utf-8") as _f:
+                    _f.write("Time (s),Amplitude (V)\n")
+                    for _t, _v in zip(t, y):
+                        _f.write(f"{_t:.10e},{_v:.10e}\n")
 
                 envelope = module.estimate_a_mode_signal(
                     t,
@@ -1936,24 +3682,60 @@ class ScannerMainWindow(QMainWindow):
                             "x_label": x_label,
                             "scan_mm": scan_mm,
                             "image": b_image,
+                            "line_idx": idx - 1,
                             "pulse_idx": idx,
                             "pulse_total": points,
                         }
                     )
 
                 if idx < points and not dry_run and rig_function and motion_sock:
-                    rig_function.send_command(motion_sock, f"{params['scan_axis']}{scan_step}")
+                    rig_function.send_command(
+                        motion_sock, f"{params['scan_axis']}{scan_step}"
+                    )
                     rig_function.wait_until_stopped(motion_sock, params["scan_axis"])
+
+                if idx < points and period_sec > 0:
+                    remaining = period_sec - (time.perf_counter() - cycle_start)
+                    if remaining > 0:
+                        time.sleep(remaining)
 
             if x_axis is None or b_image is None:
                 raise RuntimeError("No B-mode echoes captured.")
+
+            original_image = np.array(b_image, copy=True)
+            normalized_image = None
+            finite = np.isfinite(original_image)
+            if np.any(finite):
+                max_val = float(np.nanmax(original_image[finite]))
+                if max_val > 0.0:
+                    scaled = np.zeros_like(original_image, dtype=float)
+                    scaled[finite] = np.clip(original_image[finite] / max_val, 0.0, 1.0)
+                    # Quantize to 16-bit grayscale levels, then map back to [0, 1] for imshow.
+                    quantized = np.round(scaled * 65535.0).astype(np.uint16)
+                    normalized_image = quantized.astype(float) / 65535.0
+                    normalized_image[~finite] = np.nan
+                    self.bridge.b_mode_log.emit(
+                        f"Normalized image prepared using max={max_val:.6e} (16-bit grayscale)."
+                    )
+                else:
+                    self.bridge.b_mode_log.emit(
+                        "Normalized image unavailable: maximum pixel value is not positive."
+                    )
+            else:
+                self.bridge.b_mode_log.emit(
+                    "Normalized image unavailable: image contains no finite pixels."
+                )
 
             self._b_mode_last_results = {
                 "x_axis": x_axis,
                 "x_label": x_label,
                 "scan_mm": scan_mm,
-                "image": b_image,
+                "image": original_image,
+                "image_original": original_image,
+                "image_normalized": normalized_image,
                 "live_enabled": live_enabled,
+                "normalized_display": False,
+                "pulse_total": points,
             }
             self.bridge.b_preview.emit(
                 {
@@ -1961,7 +3743,9 @@ class ScannerMainWindow(QMainWindow):
                     "x_axis": x_axis,
                     "x_label": x_label,
                     "scan_mm": scan_mm,
-                    "image": b_image,
+                    "image": original_image,
+                    "normalized_display": False,
+                    "can_toggle_normalize": normalized_image is not None,
                     "pulse_total": points,
                     "live_enabled": live_enabled,
                 }
@@ -2014,7 +3798,9 @@ class ScannerMainWindow(QMainWindow):
             image = np.asarray(self._b_mode_last_results["image"])
 
             with open(filename, "w", encoding="utf-8") as f:
-                f.write(f"# Exported at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(
+                    f"# Exported at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                )
                 header = ["ScanAxis_mm"]
                 prefix = "Depth_mm" if x_label == "Depth (mm)" else "Time_us"
                 header.extend(f"{prefix}_{value:.6f}" for value in x_axis)
@@ -2022,7 +3808,10 @@ class ScannerMainWindow(QMainWindow):
 
                 for row_idx in range(len(scan_mm)):
                     row = [f"{scan_mm[row_idx]:.9e}"]
-                    row.extend(f"{image[row_idx, col_idx]:.9e}" for col_idx in range(image.shape[1]))
+                    row.extend(
+                        f"{image[row_idx, col_idx]:.9e}"
+                        for col_idx in range(image.shape[1])
+                    )
                     f.write(",".join(row) + "\n")
 
             self.bridge.b_mode_log.emit(f"B-mode matrix exported to: {filename}")
@@ -2117,18 +3906,21 @@ class ScannerMainWindow(QMainWindow):
             cycles = float(self.tx_cycles.value())
             pulses = int(self.tx_pulses.value())
             prf_hz = float(self.tx_prf.value())
+            start_delay_sec = float(self.tx_start_delay_us.value()) * 1e-6
             frequency_khz = frequency / 1000.0
             prf_khz = prf_hz / 1000.0
 
             pulse_width_sec = cycles / frequency
             period_sec = 1.0 / prf_hz
-            total_duration_sec = max(period_sec, pulses * period_sec)
+            total_duration_sec = max(period_sec, start_delay_sec + pulses * period_sec)
 
             # Render the entire burst train so pulses and PRF are visible in preview.
             n_points = min(24000, max(3000, pulses * 700))
             t_sec = np.linspace(0.0, total_duration_sec, n_points, endpoint=False)
-            local_t = np.mod(t_sec, period_sec)
-            in_pulse = local_t < pulse_width_sec
+            delayed_t = t_sec - start_delay_sec
+            active = delayed_t >= 0.0
+            local_t = np.mod(np.clip(delayed_t, 0.0, None), period_sec)
+            in_pulse = active & (local_t < pulse_width_sec)
 
             phase = 2.0 * np.pi * frequency * local_t
             if shape == "SIN":
@@ -2165,7 +3957,7 @@ class ScannerMainWindow(QMainWindow):
             self.tx_preview_canvas.draw_idle()
             if log_update:
                 self.bridge.tx_log.emit(
-                    f"Preview updated: shape={shape}, window={window_fn}, frequency={frequency_khz} kHz, cycles/pulse={cycles}, pulses={pulses}, PRF={prf_khz} kHz"
+                    f"Preview updated: shape={shape}, window={window_fn}, frequency={frequency_khz} kHz, cycles/pulse={cycles}, pulses={pulses}, PRF={prf_khz} kHz, start_delay={start_delay_sec:.6f} s"
                 )
         except Exception as exc:
             self.tx_preview_canvas.draw_placeholder(f"Preview failed: {exc}")
@@ -2187,14 +3979,17 @@ class ScannerMainWindow(QMainWindow):
             cycles = float(self.tx_cycles.value())
             pulses = int(self.tx_pulses.value())
             prf_hz = float(self.tx_prf.value())
+            start_delay_sec = float(self.tx_start_delay_us.value()) * 1e-6
 
             pulse_width_sec = cycles / frequency
             period_sec = 1.0 / prf_hz
-            total_duration_sec = max(period_sec, pulses * period_sec)
+            total_duration_sec = max(period_sec, start_delay_sec + pulses * period_sec)
             n_points = min(24000, max(3000, pulses * 700))
             t_sec = np.linspace(0.0, total_duration_sec, n_points, endpoint=False)
-            local_t = np.mod(t_sec, period_sec)
-            in_pulse = local_t < pulse_width_sec
+            delayed_t = t_sec - start_delay_sec
+            active = delayed_t >= 0.0
+            local_t = np.mod(np.clip(delayed_t, 0.0, None), period_sec)
+            in_pulse = active & (local_t < pulse_width_sec)
             carrier = np.sin(2.0 * np.pi * frequency * local_t)
             window_lut = self._window_array(window_fn, 2048)
             norm = np.clip(local_t / pulse_width_sec, 0.0, 0.999999)
@@ -2216,7 +4011,9 @@ class ScannerMainWindow(QMainWindow):
             return
         try:
             with open(filename, "w") as f:
-                f.write(f"# Exported at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(
+                    f"# Exported at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                )
                 f.write("Time_us,Amplitude_V\n")
                 for t, v in zip(t_us, y):
                     f.write(f"{t:.6f},{v:.6f}\n")
@@ -2350,6 +4147,7 @@ class ScannerMainWindow(QMainWindow):
             cycles = float(self.tx_cycles.value())
             pulses = int(self.tx_pulses.value())
             prf_hz = float(self.tx_prf.value())
+            start_delay_sec = float(self.tx_start_delay_us.value()) * 1e-6
             window_fn = self.tx_windowing_combo.currentText()
             frequency_khz = frequency / 1000.0
             prf_khz = prf_hz / 1000.0
@@ -2359,8 +4157,10 @@ class ScannerMainWindow(QMainWindow):
                 f"Excitation settings: shape={shape}, window={window_fn}, "
                 f"frequency={frequency_khz} kHz, amplitude={amplitude} V, "
                 f"cycles/pulse={cycles}, pulses={pulses}, PRF={prf_khz} kHz, "
-                f"live_preview={live_preview}"
+                f"start_delay={start_delay_sec:.6f} s, live_preview={live_preview}"
             )
+            if start_delay_sec > 0:
+                time.sleep(start_delay_sec)
             Burst_generate(
                 sg,
                 shape=shape,
@@ -2418,6 +4218,7 @@ class ScannerMainWindow(QMainWindow):
             cycles = float(self.tx_cycles.value())
             pulses = int(self.tx_pulses.value())
             prf_hz = float(self.tx_prf.value())
+            start_delay_sec = float(self.tx_start_delay_us.value()) * 1e-6
             tolerance_percent = 10.0
             tolerance_ratio = tolerance_percent / 100.0
             frequency_khz = frequency / 1000.0
@@ -2430,8 +4231,11 @@ class ScannerMainWindow(QMainWindow):
             self.bridge.tx_log.emit(
                 f"Timing test settings: shape={shape}, window={window_fn}, frequency={frequency_khz} kHz, "
                 f"cycles/pulse={cycles}, pulses={pulses}, PRF={prf_khz} kHz, tolerance={tolerance_percent}%, "
-                f"live_preview={live_preview}"
+                f"start_delay={start_delay_sec:.6f} s, live_preview={live_preview}"
             )
+
+            if start_delay_sec > 0:
+                time.sleep(start_delay_sec)
 
             recorder = module.TriggerRecorder(sg)
             module.Burst_generate(
@@ -2502,23 +4306,33 @@ class ScannerMainWindow(QMainWindow):
             module = importlib.util.module_from_spec(spec)
             assert spec.loader is not None
             spec.loader.exec_module(module)
-            use_dummy = bool(getattr(module, "USE_DUMMY_SIGNAL_GENERATOR", False))
+            use_dummy = bool(self.a_dry_run_check.isChecked())
             if use_dummy:
                 self.bridge.a_mode_log.emit(
                     "A-mode test mode: using dummy signal generator echoes."
                 )
                 Burst_generate = None
             else:
-                pm = importlib.import_module("pymeasure.instruments.agilent")
-                Agilent33500 = getattr(pm, "Agilent33500", None)
-                if Agilent33500 is None:
-                    raise ImportError("Agilent33500 not available")
-                from Signal_function import Burst_generate
-                import Oscilloscope as oscmod
+                try:
+                    pm = importlib.import_module("pymeasure.instruments.agilent")
+                    Agilent33500 = getattr(pm, "Agilent33500", None)
+                    if Agilent33500 is None:
+                        raise ImportError("Agilent33500 not available")
+                    from Signal_function import Burst_generate
+                    import Oscilloscope as oscmod
 
-                sg_address = self.sg_address_edit.text().strip() or None
-                sg = Agilent33500(sg_address) if sg_address else Agilent33500()
-                osc = oscmod.open_oscilloscope(self.osc_address_edit.text().strip() or None)
+                    sg_address = self.sg_address_edit.text().strip() or None
+                    sg = Agilent33500(sg_address) if sg_address else Agilent33500()
+                    osc = oscmod.open_oscilloscope(
+                        self.osc_address_edit.text().strip() or None
+                    )
+                except Exception as hw_exc:
+                    self.bridge.a_mode_log.emit(
+                        "A-mode hardware not detected and Dry Run is off. "
+                        "Enable Dry Run or connect hardware."
+                    )
+                    self.bridge.a_mode_log.emit(f"Hardware detection error: {hw_exc}")
+                    return
 
             params = {
                 "X": float(self.a_mode_x.value()),
@@ -2532,10 +4346,13 @@ class ScannerMainWindow(QMainWindow):
             cycles = float(self.tx_cycles.value())
             prf_hz = float(self.tx_prf.value())
             window_fn = self.tx_windowing_combo.currentText()
-            sampling_rate = self._extract_last_float(
-                self.sampling_rate_edit.text().strip(),
-                max(frequency * 100.0, 1e6) / 1000.0,
-            ) * 1000.0
+            sampling_rate = (
+                self._extract_last_float(
+                    self.sampling_rate_edit.text().strip(),
+                    max(frequency * 100.0, 1e6) / 1000.0,
+                )
+                * 1000.0
+            )
             live_enabled = bool(self.a_live_preview_check.isChecked())
             cutoff_hz = float(self.a_mode_highpass_cutoff.value()) * 1000.0
             cutoff_khz = cutoff_hz / 1000.0
@@ -2587,7 +4404,9 @@ class ScannerMainWindow(QMainWindow):
                         osc, frequency, amplitude, cycles
                     )
                 traces.append((t, y))
-                self.bridge.a_mode_log.emit(f"Captured A-mode echo {pulse_idx}/{pulses}")
+                self.bridge.a_mode_log.emit(
+                    f"Captured A-mode echo {pulse_idx}/{pulses}"
+                )
 
                 if live_enabled:
                     self.bridge.a_preview.emit(
@@ -2667,12 +4486,24 @@ class ScannerMainWindow(QMainWindow):
         except Exception as exc:
             self._show_error("Invalid input", str(exc))
             return
+
+        active_scan_type = self._current_bc_scan_type()
+        self._bc_apply_unlocked = True
+        self._bc_pressure_field_cache = None
+        self._bc_pressure_field_source = None
+        self._bc_c_mode_cache = None
+        self._bc_c_mode_source = None
+        self._bc_c_mode_scanned = False
         self.stop_event.clear()
         self.bridge.scan_busy.emit(True)
         self.bc_output.clear()
-        threading.Thread(target=self._scan_worker, args=(pg, scan), daemon=True).start()
+        threading.Thread(
+            target=self._scan_worker,
+            args=(pg, scan, active_scan_type),
+            daemon=True,
+        ).start()
 
-    def _scan_worker(self, pg: dict, scan: dict) -> None:
+    def _scan_worker(self, pg: dict, scan: dict, scan_type: str = "standard") -> None:
         oscmod = None
         rig_function = None
         Agilent33500 = None
@@ -2680,13 +4511,40 @@ class ScannerMainWindow(QMainWindow):
         sock = None
         osc = None
         dry_run = self.dry_run_check.isChecked()
+        import importlib
 
         try:
-            if not dry_run:
-                import importlib
+            a_scan_script = BASE_DIR / "A scan.py"
+            a_scan_spec = importlib.util.spec_from_file_location(
+                "a_scan", a_scan_script
+            )
+            if a_scan_spec is None or a_scan_spec.loader is None:
+                raise RuntimeError(
+                    "Unable to load A scan.py for dummy signal generation"
+                )
+            a_scan_module = importlib.util.module_from_spec(a_scan_spec)
+            a_scan_spec.loader.exec_module(a_scan_module)
+            window_fn = self.tx_windowing_combo.currentText()
+            sampling_rate = (
+                self._extract_last_float(
+                    self.sampling_rate_edit.text().strip(),
+                    max(float(pg["frequency"]) * 100.0, 1e6) / 1000.0,
+                )
+                * 1000.0
+            )
 
+            # Align 3D dry-run excitation with A-mode/Excitation tab values.
+            dry_frequency_hz = float(self.tx_freq.value()) * 1000.0
+            dry_amplitude_v = float(self.tx_amp.value())
+            dry_cycles = float(self.tx_cycles.value())
+            dry_window_fn = self.tx_windowing_combo.currentText()
+            pulses_per_point = max(1, int(self.tx_pulses.value()))
+            dry_prf_hz = float(self.tx_prf.value())
+
+            if not dry_run:
                 pm = importlib.import_module("pymeasure.instruments.agilent")
                 Agilent33500 = getattr(pm, "Agilent33500", None)
+                from Signal_function import Burst_generate
                 import Oscilloscope as oscmod
                 import rig_function
 
@@ -2696,17 +4554,31 @@ class ScannerMainWindow(QMainWindow):
                 sg = Agilent33500(sg_address) if sg_address else Agilent33500()
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 sock.connect((scan["host"], self._port_value()))
-                osc = oscmod.open_oscilloscope(self.osc_address_edit.text().strip() or None)
+                osc = oscmod.open_oscilloscope(
+                    self.osc_address_edit.text().strip() or None
+                )
                 scan_folder = oscmod.create_scan_folder()
                 self.bridge.bc_log.emit(f"Scan folder: {scan_folder}")
                 self.bridge.bc_log.emit("Hardware connected.")
             else:
-                import Oscilloscope as oscmod
-                from dummy_signal_generator import generate_dummy_echo
-                import numpy as np
-                scan_folder = oscmod.create_scan_folder()
+                # Dry-run: create scan folder directly without importing Oscilloscope
+                _data_dir = BASE_DIR.parent / "data"
+                _data_dir.mkdir(exist_ok=True)
+                _existing = [
+                    d
+                    for d in os.listdir(_data_dir)
+                    if d.startswith("scan_") and os.path.isdir(_data_dir / d)
+                ]
+                _nums = [
+                    int(d.split("_")[1]) for d in _existing if d.split("_")[1].isdigit()
+                ]
+                _next = max(_nums, default=0) + 1
+                scan_folder = str(_data_dir / f"scan_{_next:03d}")
+                os.makedirs(scan_folder, exist_ok=True)
                 self.bridge.bc_log.emit(f"[Dry-run] Scan folder: {scan_folder}")
-                self.bridge.bc_log.emit("[Dry-run] Using dummy signal generator for acquisition.")
+                self.bridge.bc_log.emit(
+                    "[Dry-run] Using dummy_signal_generator.py for acquisition."
+                )
 
             if rig_function and sock:
                 rig_function.send_command(sock, "INC")
@@ -2717,7 +4589,6 @@ class ScannerMainWindow(QMainWindow):
             cross_steps = scan["cross_points"]
             scan_step = scan["scan_step"]
             cross_step = scan["cross_step"]
-            start_col = 2  # hardcoded: pre-sample is always saved as col 1
             self.bridge.bc_log.emit(
                 f"B-Mode settings: dry_run={dry_run}, live_preview={self.live_update_check.isChecked()}, "
                 f"shape={pg['shape']}, frequency={pg['frequency']} Hz, amplitude={pg['amplitude']} V, "
@@ -2727,9 +4598,40 @@ class ScannerMainWindow(QMainWindow):
                 f"scan_step={scan_step}, cross_step={cross_step}"
             )
             self.bridge.bc_log.emit(
+                f"Averaging echoes per 3D point using Excitation No. Of Pulses: {pulses_per_point}"
+            )
+            self.bridge.bc_log.emit(
+                f"Post-processing mode: {str(scan_type).strip().lower() or 'standard'}"
+            )
+            if dry_run:
+                self.bridge.bc_log.emit(
+                    f"[Dry-run] Using Excitation tab params for dummy echoes: "
+                    f"frequency={dry_frequency_hz} Hz, amplitude={dry_amplitude_v} V, "
+                    f"cycles/pulse={dry_cycles}, window={dry_window_fn}"
+                )
+            self.bridge.bc_log.emit(
                 f"Starting B Scan: {scan['scan_axis']} {scan_steps} steps ({scan_step} pulses) | "
                 f"{scan['cross_axis']} {cross_steps} rows ({cross_step} pulses)"
             )
+
+            # Initialize list to accumulate A-mode signals for matrix
+            import numpy as np
+
+            a_mode_signals = []  # Will store (amplitude_array) for each acquisition
+            acquisition_count = 0
+            live_preview = bool(self.live_update_check.isChecked())
+            total_scans = scan_steps * cross_steps
+            c_mode_enabled = str(scan_type).strip().lower() == "c_mode"
+            pressure_field_mode = str(scan_type).strip().lower() == "pressure_field"
+            c_mode_signal_map = np.empty((cross_steps, scan_steps), dtype=object)
+            c_mode_signal_map[:, :] = None
+            c_mode_metric_map = np.full((cross_steps, scan_steps), np.nan, dtype=float)
+            c_mode_gate_start_s = float(self.bc_c_mode_gate_start.value()) * 1e-6
+            c_mode_gate_width_s = float(self.bc_c_mode_gate_width.value()) * 1e-6
+            c_mode_metric_name = self.bc_c_mode_metric_combo.currentText().strip()
+            c_mode_colormap = self.bc_c_mode_cmap_combo.currentText().strip()
+            a_mode_cutoff_hz = float(self.a_mode_highpass_cutoff.value()) * 1000.0
+            a_mode_filter_order = int(self.a_mode_filter_order.value())
 
             for cross in range(cross_steps):
                 if self.stop_event.is_set():
@@ -2740,9 +4642,10 @@ class ScannerMainWindow(QMainWindow):
                 for scan_idx in range(scan_steps):
                     if self.stop_event.is_set():
                         break
-                    column = (
-                        (scan_steps - scan_idx) if cross % 2 else (scan_idx + start_col)
-                    )
+                    # Physical traversal along Axis1 is zig-zag, but saved filenames
+                    # should always map to logical Axis1(rows) x Axis2(columns).
+                    axis1_idx = (scan_steps - scan_idx) if cross % 2 else (scan_idx + 1)
+                    axis2_idx = cross + 1
                     if rig_function and sock:
                         rig_function.send_command(
                             sock, f"{scan['scan_axis']}{scan_direction}"
@@ -2752,31 +4655,114 @@ class ScannerMainWindow(QMainWindow):
                         self.bridge.bc_log.emit(
                             f"[Dry-run] Move {scan['scan_axis']} {scan_direction}"
                         )
-                    if oscmod and osc and sg:
-                        oscmod.send_burst(osc, sg, cross, column, scan_folder)
-                        csv_path = os.path.join(
-                            scan_folder, f"row_{cross + 1}_col_{column}.csv"
-                        )
-                        self.bridge.bc_plot_csv.emit(csv_path)
+                    # --- acquire and average echoes for this point ---
+                    t_acq = None
+                    echo_acq = None
+                    t_echoes = []
+                    y_echoes = []
+                    for pulse_idx in range(1, pulses_per_point + 1):
+                        if oscmod and osc and sg and not dry_run:
+                            Burst_generate(
+                                sg,
+                                shape="SIN",
+                                frequency=dry_frequency_hz,
+                                amplitude=dry_amplitude_v,
+                                no_of_cycles_per_pulse=dry_cycles,
+                                no_of_pulses=1,
+                                prf=dry_prf_hz,
+                                window_type=dry_window_fn,
+                            )
+                            t_one, y_one = self._capture_a_mode_waveform(
+                                osc,
+                                dry_frequency_hz,
+                                dry_amplitude_v,
+                                dry_cycles,
+                            )
+                        else:
+                            t_one, y_one = a_scan_module.generate_test_echo(
+                                frequency_hz=dry_frequency_hz,
+                                amplitude_v=dry_amplitude_v,
+                                no_of_cycles_per_pulse=dry_cycles,
+                                window_type=dry_window_fn,
+                                sampling_rate_hz=sampling_rate,
+                            )
+                        t_echoes.append(np.asarray(t_one, dtype=float))
+                        y_echoes.append(np.asarray(y_one, dtype=float))
                         self.bridge.bc_log.emit(
-                            f"Acquired row {cross + 1}, col {column}"
+                            f"Captured echo {pulse_idx}/{pulses_per_point} at row {axis1_idx}, col {axis2_idx}"
                         )
-                    else:
-                        t, echo = generate_dummy_echo(
-                            frequency_hz=float(pg["frequency"]),
-                            amplitude_v=float(pg["amplitude"]),
-                            no_of_cycles_per_pulse=float(pg["no_of_cycles_per_pulse"]),
-                        )
+
+                    if y_echoes:
+                        min_len = min(e.size for e in y_echoes)
+                        t_acq = t_echoes[0][:min_len]
+                        stack = np.vstack([e[:min_len] for e in y_echoes])
+                        echo_acq = np.mean(stack, axis=0)
+
                         csv_path = os.path.join(
-                            scan_folder, f"row_{cross + 1}_col_{column}.csv"
+                            scan_folder, f"row_{axis1_idx}_col_{axis2_idx}.csv"
                         )
                         with open(csv_path, "w", encoding="utf-8") as _f:
                             _f.write("Time (s),Amplitude (V)\n")
-                            for _t, _v in zip(t, echo):
+                            for _t, _v in zip(t_acq, echo_acq):
                                 _f.write(f"{_t:.10e},{_v:.10e}\n")
                         self.bridge.bc_plot_csv.emit(csv_path)
                         self.bridge.bc_log.emit(
-                            f"[Dry-run] Generated dummy echo: row {cross + 1}, col {column}"
+                            f"Saved averaged echo: row {axis1_idx}, col {axis2_idx}"
+                        )
+
+                        if c_mode_enabled:
+                            try:
+                                envelope = np.asarray(
+                                    a_scan_module.estimate_a_mode_signal(
+                                        t_acq,
+                                        echo_acq,
+                                        highpass_cutoff_hz=a_mode_cutoff_hz,
+                                        filter_order=a_mode_filter_order,
+                                        sampling_rate_hz=sampling_rate,
+                                    ),
+                                    dtype=float,
+                                )
+                                n_env = min(t_acq.size, envelope.size)
+                                t_env = np.asarray(t_acq[:n_env], dtype=float)
+                                env = np.asarray(envelope[:n_env], dtype=float)
+                                gate_end_s = c_mode_gate_start_s + c_mode_gate_width_s
+                                gate_mask = (t_env >= c_mode_gate_start_s) & (t_env <= gate_end_s)
+                                gated_env = env[gate_mask]
+                                r = axis2_idx - 1
+                                c = axis1_idx - 1
+                                c_mode_signal_map[r, c] = np.array(gated_env, copy=True)
+                                c_mode_metric_map[r, c] = self._compute_pressure_field_metric(
+                                    gated_env, c_mode_metric_name
+                                )
+                            except Exception as c_exc:
+                                self.bridge.bc_log.emit(
+                                    f"C-Mode metric failed at row {axis1_idx}, col {axis2_idx}: {c_exc}"
+                                )
+
+                        a_mode_signals.append(echo_acq)
+                        acquisition_count += 1
+                    else:
+                        self.bridge.bc_log.emit(
+                            f"Warning: No echoes captured at row {axis1_idx}, col {axis2_idx}"
+                        )
+
+                    # --- live preview: emit raw signal only; renderer computes envelope ---
+                    if live_preview and t_acq is not None and echo_acq is not None:
+                        current_scan_num = cross * scan_steps + scan_idx + 1
+                        self.bridge.bc_preview.emit(
+                            {
+                                "t": t_acq,
+                                "raw": echo_acq,
+                                "scan_idx": current_scan_num,
+                                "total_scans": total_scans,
+                                "axis1_name": scan["scan_axis"],
+                                "axis2_name": scan["cross_axis"],
+                                "axis1_idx": axis1_idx,
+                                "axis2_idx": axis2_idx,
+                                "axis1_total": scan_steps,
+                                "axis2_total": cross_steps,
+                                "scan_type": scan_type,
+                            }
                         )
                 if cross < cross_steps - 1 and not self.stop_event.is_set():
                     if rig_function and sock:
@@ -2789,6 +4775,135 @@ class ScannerMainWindow(QMainWindow):
                             f"[Dry-run] Move {scan['cross_axis']} {cross_step}"
                         )
             self.bridge.bc_log.emit("B Scan finished.")
+
+            if pressure_field_mode and not self.stop_event.is_set():
+                try:
+                    axis1_mm = np.linspace(0.0, float(scan["scan_length"]), scan_steps)
+                    axis2_mm = np.linspace(
+                        0.0, float(scan["cross_length"]), cross_steps
+                    )
+                    self._bc_pressure_field_source = {
+                        "scan_folder": str(scan_folder),
+                        "axis1_name": scan["scan_axis"],
+                        "axis2_name": scan["cross_axis"],
+                        "scan_steps": int(scan_steps),
+                        "cross_steps": int(cross_steps),
+                        "axis1_mm": np.array(axis1_mm, copy=True),
+                        "axis2_mm": np.array(axis2_mm, copy=True),
+                    }
+                    self.bridge.bc_log.emit(
+                        "Pressure-field scan complete. Applying post-processing automatically..."
+                    )
+                    self.bridge.bc_pf_auto_apply.emit()
+                except Exception as pf_exc:
+                    self.bridge.bc_log.emit(
+                        f"Pressure-field source metadata update failed: {pf_exc}"
+                    )
+
+            if c_mode_enabled and not self.stop_event.is_set():
+                try:
+                    axis1_mm = np.linspace(0.0, float(scan["scan_length"]), scan_steps)
+                    axis2_mm = np.linspace(
+                        0.0, float(scan["cross_length"]), cross_steps
+                    )
+                    self._bc_c_mode_source = {
+                        "scan_folder": str(scan_folder),
+                        "axis1_name": scan["scan_axis"],
+                        "axis2_name": scan["cross_axis"],
+                        "scan_steps": int(scan_steps),
+                        "cross_steps": int(cross_steps),
+                        "axis1_mm": np.array(axis1_mm, copy=True),
+                        "axis2_mm": np.array(axis2_mm, copy=True),
+                    }
+                    self._bc_c_mode_cache = {
+                        "axis1_name": scan["scan_axis"],
+                        "axis2_name": scan["cross_axis"],
+                        "axis1_mm": np.array(axis1_mm, copy=True),
+                        "axis2_mm": np.array(axis2_mm, copy=True),
+                        "signal_map": np.array(c_mode_signal_map, copy=True),
+                    }
+                    self.bridge.bc_preview.emit(
+                        {
+                            "mode": "c_mode_map",
+                            "axis1_name": scan["scan_axis"],
+                            "axis2_name": scan["cross_axis"],
+                            "axis1_mm": axis1_mm,
+                            "axis2_mm": axis2_mm,
+                            "metric_map": c_mode_metric_map,
+                            "metric_name": c_mode_metric_name,
+                            "colormap": c_mode_colormap,
+                        }
+                    )
+                    self.bridge.bc_log.emit(
+                        f"C-Mode image rendered automatically using gated envelope metric: {c_mode_metric_name}."
+                    )
+                except Exception as c_map_exc:
+                    self.bridge.bc_log.emit(
+                        f"C-Mode map render failed: {c_map_exc}"
+                    )
+
+            # Save A-mode matrix with auto-incrementing ID
+            if a_mode_signals and acquisition_count > 0:
+                try:
+                    # Find the maximum signal length
+                    max_length = max(len(signal) for signal in a_mode_signals)
+
+                    # Create matrix with padding (fill missing values with NaN)
+                    a_mode_matrix = np.full(
+                        (len(a_mode_signals), max_length), np.nan, dtype=float
+                    )
+                    for idx, signal in enumerate(a_mode_signals):
+                        a_mode_matrix[idx, : len(signal)] = signal
+
+                    # Generate unique matrix filename with auto-incrementing ID
+                    data_dir = BASE_DIR / "data"
+                    data_dir.mkdir(exist_ok=True)
+
+                    # Find next available matrix ID
+                    existing_matrices = [
+                        f
+                        for f in os.listdir(data_dir)
+                        if f.startswith("a_mode_matrix_") and f.endswith(".npy")
+                    ]
+                    matrix_numbers = []
+                    for f in existing_matrices:
+                        try:
+                            num = int(
+                                f.replace("a_mode_matrix_", "").replace(".npy", "")
+                            )
+                            matrix_numbers.append(num)
+                        except ValueError:
+                            pass
+                    next_matrix_id = max(matrix_numbers, default=0) + 1
+
+                    # Save matrix
+                    matrix_path = data_dir / f"a_mode_matrix_{next_matrix_id:03d}.npy"
+                    np.save(str(matrix_path), a_mode_matrix)
+
+                    # Also save metadata
+                    metadata_path = (
+                        data_dir / f"a_mode_matrix_{next_matrix_id:03d}_metadata.txt"
+                    )
+                    with open(str(metadata_path), "w", encoding="utf-8") as mf:
+                        mf.write(f"A-Mode Matrix Data\n")
+                        mf.write(
+                            f"Shape: {a_mode_matrix.shape} (acquisitions × samples)\n"
+                        )
+                        mf.write(f"Total Acquisitions: {acquisition_count}\n")
+                        mf.write(f"Scan Points (Axis 1): {scan_steps}\n")
+                        mf.write(f"Cross Points (Axis 2): {cross_steps}\n")
+                        mf.write(f"Frequency: {pg.get('frequency')} Hz\n")
+                        mf.write(f"Amplitude: {pg.get('amplitude')} V\n")
+                        mf.write(f"Dry Run: {dry_run}\n")
+
+                    self.bridge.bc_log.emit(
+                        f"A-mode matrix saved: {matrix_path.name} "
+                        f"(shape: {a_mode_matrix.shape[0]} acquisitions × {a_mode_matrix.shape[1]} samples)"
+                    )
+                except Exception as e:
+                    self.bridge.bc_log.emit(
+                        f"Warning: Failed to save A-mode matrix: {e}"
+                    )
         except Exception as exc:
             self.bridge.bc_log.emit(f"Error during scan: {exc}")
         finally:

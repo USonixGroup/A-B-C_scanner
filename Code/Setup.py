@@ -1,4 +1,3 @@
-# ▶️ 信号参数
 SIGNAL_PARAMS = {
     "shape": "SIN",
     "frequency": 1000000,

@@ -148,37 +148,3 @@ def a_scan(sock, x, y, z, mode):
 
     print("✅ A Scan complete.")
 
-# Perform B Scan (raster scan)
-def b_scan(sock, scan_axis=None, cross_axis=None, 
-           scan_length=None, scan_step=None, 
-           cross_length=None, cross_step=None, 
-           fixed_axis=None, fixed_value=None):
-    scan_steps = int(scan_length / scan_step)
-    cross_steps = int(cross_length / cross_step)
-    subsequent_scan_steps = scan_steps - 1
-
-    send_command(sock, "INC")  # Set incremental mode
-    enable_axis(sock, scan_axis)
-    enable_axis(sock, cross_axis)
-
-    if fixed_axis:
-        send_command(sock, f"{fixed_axis}{fixed_value}")
-        wait_until_stopped(sock, fixed_axis)
-
-    print(f"🔄 Starting B Scan: {scan_axis} {scan_steps} steps, {scan_step} each | {cross_axis} {cross_steps} lines, {cross_step} each")
-
-    for cross in range(cross_steps):
-        print(f"📏 Scanning row {cross + 1}/{cross_steps}")
-
-        current_scan_steps = scan_steps if cross == 0 else subsequent_scan_steps
-        scan_direction = scan_step if cross % 2 == 0 else -scan_step
-
-        for _ in range(current_scan_steps):
-            send_command(sock, f"{scan_axis}{scan_direction}")
-            wait_until_stopped(sock, scan_axis)
-
-        if cross < cross_steps - 1:
-            send_command(sock, f"{cross_axis}{cross_step}")
-            wait_until_stopped(sock, cross_axis)
-
-    print("✅ B Scan complete.")
