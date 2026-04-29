@@ -195,7 +195,9 @@ class ScannerMainWindow(QMainWindow):
             lambda text: self._append_log(self.b_output, text)
         )
         self.bridge.b_preview.connect(self._render_b_mode_preview)
-        self.bridge.bc_log.connect(lambda text: self._append_log(self.bc_output, text))
+        self.bridge.bc_log.connect(
+            lambda text: self._append_log(self.bc_output, text)
+        )
         self.bridge.bc_preview.connect(self._render_bc_live_preview)
         self.bridge.bc_pf_auto_apply.connect(self._apply_pressure_field_postprocessing_from_saved_data)
         self.bridge.bc_plot_csv.connect(self._on_bc_plot_csv)
@@ -205,9 +207,54 @@ class ScannerMainWindow(QMainWindow):
 
     def _build_ui(self) -> None:
         self.setWindowTitle("A/B/C/Field Scanner")
-        about_action = QAction("About A/B/C/Field Scanner", self)
+        # Remove About menu, add File menu with Documentation, About, Exit
+        file_menu = self.menuBar().addMenu("File")
+
+
+        # Style File menu dropdown: light purple background, larger font
+        modern_menu_style = (
+            "QMenu {"
+            "  background-color: #f3eaff;"
+            "  border-radius: 10px;"
+            "  padding: 8px 0px;"
+            "  font-size: 15pt;"
+            "  min-width: 220px;"
+            "  border: 1.5px solid #bba6e6;"
+            "}"
+            "QMenu::item {"
+            "  padding: 10px 28px 10px 24px;"
+            "  border-radius: 7px;"
+            "  font-size: 15pt;"
+            "  color: #2d1b69;"
+            "}"
+            "QMenu::item:selected {"
+            "  background-color: #d1b3f7;"
+            "  color: #1a0d3a;"
+            "}"
+        )
+        file_menu.setStyleSheet(modern_menu_style)
+
+        # Documentation submenu
+        from PySide6.QtWidgets import QMenu
+        doc_menu = QMenu("Documentation", self)
+        doc_menu.setStyleSheet(modern_menu_style)
+        file_menu.addMenu(doc_menu)
+
+        show_doc_action = QAction("Show Documentation", self)
+        show_doc_action.triggered.connect(self.show_documentation)
+        doc_menu.addAction(show_doc_action)
+
+        update_doc_action = QAction("Update Documentation", self)
+        update_doc_action.triggered.connect(self.update_documentation)
+        doc_menu.addAction(update_doc_action)
+
+        about_action = QAction("About", self)
         about_action.triggered.connect(self.show_about)
-        self.menuBar().addMenu("About").addAction(about_action)
+        file_menu.addAction(about_action)
+
+        exit_action = QAction("Exit", self)
+        exit_action.triggered.connect(self.close)
+        file_menu.addAction(exit_action)
 
         central = QWidget()
         root_layout = QVBoxLayout(central)
@@ -392,6 +439,7 @@ class ScannerMainWindow(QMainWindow):
         self.tx_windowing_combo.addItems(
             ["Hanning", "Hamming", "Blackman-Harris", "Flat-Top", "None (Rectangular)"]
         )
+        self.tx_windowing_combo.setStyleSheet("QComboBox { padding-right: 28px; }")
         self.tx_freq = self._make_double_spin(0.001, 100_000.0, 1000.0, decimals=3)
         self.tx_amp = self._make_double_spin(0.01, 100, 1.0)
         self.tx_cycles = self._make_spin(1, 10_000, 60)
@@ -836,28 +884,8 @@ class ScannerMainWindow(QMainWindow):
                 "jet",
             ]
         )
-        self.bc_c_mode_metric_combo.setStyleSheet(
-            "QComboBox { padding-right: 26px; }"
-            "QComboBox::drop-down { width: 22px; border-left: 1px solid #cfd9e6; }"
-            "QComboBox::down-arrow {"
-            "image: none; width: 0px; height: 0px;"
-            "border-left: 5px solid transparent;"
-            "border-right: 5px solid transparent;"
-            "border-top: 7px solid #7b63b5;"
-            "margin-right: 6px;"
-            "}"
-        )
-        self.bc_c_mode_cmap_combo.setStyleSheet(
-            "QComboBox { padding-right: 26px; }"
-            "QComboBox::drop-down { width: 22px; border-left: 1px solid #cfd9e6; }"
-            "QComboBox::down-arrow {"
-            "image: none; width: 0px; height: 0px;"
-            "border-left: 5px solid transparent;"
-            "border-right: 5px solid transparent;"
-            "border-top: 7px solid #7b63b5;"
-            "margin-right: 6px;"
-            "}"
-        )
+        # Removed empty setStyleSheet calls for bc_c_mode_metric_combo and bc_c_mode_cmap_combo
+        # Removed incomplete setStyleSheet calls for bc_c_mode_metric_combo and bc_c_mode_cmap_combo
         c_row1.addWidget(self.bc_c_mode_metric_label)
         c_row1.addWidget(self.bc_c_mode_metric_combo)
         c_row1.addSpacing(8)
@@ -911,50 +939,20 @@ class ScannerMainWindow(QMainWindow):
                 "jet",
             ]
         )
+        self.bc_c_mode_metric_combo.setStyleSheet(
+            "QComboBox { padding-right: 28px; }"
+        )
+        self.bc_c_mode_cmap_combo.setStyleSheet(
+            "QComboBox { padding-right: 28px; }"
+        )
         self.bc_pf_mode_metric_combo.setStyleSheet(
-            "QComboBox { padding-right: 26px; }"
-            "QComboBox::drop-down { width: 22px; border-left: 1px solid #cfd9e6; }"
-            "QComboBox::down-arrow {"
-            "image: none; width: 0px; height: 0px;"
-            "border-left: 5px solid transparent;"
-            "border-right: 5px solid transparent;"
-            "border-top: 7px solid #7b63b5;"
-            "margin-right: 6px;"
-            "}"
+            "QComboBox { padding-right: 28px; }"
         )
         self.bc_pf_mode_cmap_combo.setStyleSheet(
-            "QComboBox { padding-right: 26px; }"
-            "QComboBox::drop-down { width: 22px; border-left: 1px solid #cfd9e6; }"
-            "QComboBox::down-arrow {"
-            "image: none; width: 0px; height: 0px;"
-            "border-left: 5px solid transparent;"
-            "border-right: 5px solid transparent;"
-            "border-top: 7px solid #7b63b5;"
-            "margin-right: 6px;"
-            "}"
+            "QComboBox { padding-right: 28px; }"
         )
         self.bc_pf_mode_extra_combo.setStyleSheet(
-            "QComboBox { padding-right: 26px; }"
-            "QComboBox::drop-down { width: 22px; border-left: 1px solid #cfd9e6; }"
-            "QComboBox::down-arrow {"
-            "image: none; width: 0px; height: 0px;"
-            "border-left: 5px solid transparent;"
-            "border-right: 5px solid transparent;"
-            "border-top: 7px solid #7b63b5;"
-            "margin-right: 6px;"
-            "}"
-        )
-        pf_row.addWidget(self.bc_pf_mode_filtering_label)
-        pf_row.addWidget(self.bc_pf_mode_extra_combo)
-        pf_row.addSpacing(8)
-        pf_row.addWidget(self.bc_pf_mode_metric_label)
-        pf_row.addWidget(self.bc_pf_mode_metric_combo)
-        pf_row.addSpacing(8)
-        pf_row.addWidget(self.bc_pf_mode_cmap_label)
-        pf_row.addWidget(self.bc_pf_mode_cmap_combo)
-        pf_row.addStretch(1)
-        self.bc_pf_mode_cmap_combo.currentIndexChanged.connect(
-            self._on_bc_pf_colormap_changed
+            "QComboBox { padding-right: 28px; }"
         )
         self.bc_pf_mode_metric_combo.currentIndexChanged.connect(
             self._on_bc_pf_metric_changed
@@ -1357,6 +1355,19 @@ class ScannerMainWindow(QMainWindow):
                 padding: 16px 14px 14px 14px;
                 font-weight: 600;
                 color: #2c4f77;
+
+            QComboBox::drop-down {
+                border: none;
+                width: 28px;
+                subcontrol-origin: padding;
+                subcontrol-position: top right;
+            }
+            QComboBox::down-arrow {
+                image: url('data:image/svg+xml;utf8,<svg width="16" height="16" viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg"><polygon points="4,6 8,11 12,6" fill="%237b63b5"/></svg>');
+                width: 16px;
+                height: 16px;
+                margin-right: 6px;
+            }
             }
             QGroupBox::title {
                 subcontrol-origin: margin;
@@ -1528,6 +1539,7 @@ class ScannerMainWindow(QMainWindow):
         combo = QComboBox()
         combo.addItems(["X", "Y", "Z"])
         combo.setCurrentText(default)
+        combo.setStyleSheet("QComboBox { padding-right: 28px; }")
         return combo
 
     def _normalize_button_row(
@@ -1954,12 +1966,64 @@ class ScannerMainWindow(QMainWindow):
                 if hasattr(self, "bc_apply_cmode_button"):
                     self.bc_apply_cmode_button.setEnabled(True)
 
+
     def show_about(self) -> None:
-        QMessageBox.information(
-            self,
-            "About A/B Scanner",
-            "A/B Scanner\n\nPySide6 desktop UI for the ultrasonic scanner rig.",
-        )
+        from PySide6.QtWidgets import QDialog, QVBoxLayout, QLabel, QHBoxLayout, QPushButton
+        from PySide6.QtCore import Qt
+        class AboutDialog(QDialog):
+            def __init__(self, parent=None):
+                super().__init__(parent)
+                self.setWindowTitle("About")
+                self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+                self.setFixedSize(480, 180)
+                layout = QVBoxLayout(self)
+                label = QLabel(
+                    "Developed by Anqi Yang and Reza Haqshenas at the UCL Ultrasonics Group. This project was created with assistance from GitHub Copilot and is released as open-source software under the MIT License, 2026."
+                )
+                label.setWordWrap(True)
+                label.setAlignment(Qt.AlignCenter)
+                label.setStyleSheet("font-size: 13pt; padding: 18px;")
+                layout.addWidget(label)
+                # Remove Ok button, only X at top right
+                self.setWindowFlag(Qt.WindowCloseButtonHint, True)
+                self.setWindowFlag(Qt.WindowMinimizeButtonHint, False)
+                self.setWindowFlag(Qt.WindowMaximizeButtonHint, False)
+        dlg = AboutDialog(self)
+        dlg.exec()
+
+    def show_documentation(self) -> None:
+        import webbrowser
+        import os
+        docs_path = os.path.abspath(os.path.join("docs", "docs.html"))
+        if not os.path.exists(docs_path):
+            QMessageBox.warning(self, "Documentation Not Found", "docs/docs.html was not found. Please run 'Update Documentation' first.")
+            return
+        webbrowser.open(f"file://{docs_path}")
+
+    def update_documentation(self) -> None:
+        import os
+        import shutil
+        import subprocess
+        docs_dir = os.path.join(os.path.dirname(__file__), "docs")
+        ipynb_path = os.path.join(docs_dir, "documentation.ipynb")
+        html_path = os.path.join(docs_dir, "docs.html")
+        if not os.path.exists(ipynb_path):
+            QMessageBox.warning(self, "Missing File", "docs/documentation.ipynb was not found.")
+            return
+        try:
+            result = subprocess.run([
+                sys.executable, "-m", "jupyter", "nbconvert", "--to", "html", ipynb_path, "--output", html_path, "--no-input"
+            ], capture_output=True, text=True)
+            if result.returncode != 0:
+                if "No module named nbconvert" in result.stderr:
+                    QMessageBox.warning(self, "nbconvert Not Installed", "Jupyter nbconvert is not installed. Please run:\n\npip install nbconvert\n\nin your terminal.")
+                else:
+                    QMessageBox.warning(self, "Conversion Error", f"nbconvert failed:\n{result.stderr}")
+                return
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"An error occurred: {e}")
+            return
+        self.show_documentation()
 
     def _load_settings_file(self) -> dict:
         if not SETTINGS_PATH.exists():
