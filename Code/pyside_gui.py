@@ -1811,20 +1811,40 @@ class ScannerMainWindow(QMainWindow):
             self.bc_canvas._style_axes()
             plot_map = np.array(metric_map, dtype=float)
             plot_map[~np.isfinite(plot_map)] = np.nan
-            extent = [
-                float(np.min(axis1_mm)),
-                float(np.max(axis1_mm)),
-                float(np.min(axis2_mm)),
-                float(np.max(axis2_mm)),
-            ]
-            im = self.bc_canvas.axes.imshow(
-                plot_map,
-                cmap=cmap_name,
-                aspect="auto",
-                interpolation="nearest",
-                origin="lower",
-                extent=extent,
-            )
+            if axis1_mm.size == 1 or axis2_mm.size == 1:
+                xg, yg = np.meshgrid(axis1_mm, axis2_mm)
+                x_vals = np.asarray(xg, dtype=float).ravel()
+                y_vals = np.asarray(yg, dtype=float).ravel()
+                c_vals = np.asarray(plot_map, dtype=float).ravel()
+                finite = np.isfinite(c_vals)
+                if not np.any(finite):
+                    self.bc_canvas.draw_placeholder("C-Mode preview unavailable")
+                    return
+                im = self.bc_canvas.axes.scatter(
+                    x_vals[finite],
+                    y_vals[finite],
+                    c=c_vals[finite],
+                    cmap=cmap_name,
+                    s=100,
+                    marker="o",
+                    linewidths=0.4,
+                    edgecolors="#1f2a37",
+                )
+            else:
+                extent = [
+                    float(np.min(axis1_mm)),
+                    float(np.max(axis1_mm)),
+                    float(np.min(axis2_mm)),
+                    float(np.max(axis2_mm)),
+                ]
+                im = self.bc_canvas.axes.imshow(
+                    plot_map,
+                    cmap=cmap_name,
+                    aspect="auto",
+                    interpolation="nearest",
+                    origin="lower",
+                    extent=extent,
+                )
             if getattr(self, "_bc_colorbar", None) is not None:
                 try:
                     self._bc_colorbar.remove()
@@ -1877,20 +1897,40 @@ class ScannerMainWindow(QMainWindow):
             self.bc_canvas._style_axes()
             plot_map = np.array(metric_map, dtype=float)
             plot_map[~np.isfinite(plot_map)] = np.nan
-            extent = [
-                float(np.min(axis1_mm)),
-                float(np.max(axis1_mm)),
-                float(np.min(axis2_mm)),
-                float(np.max(axis2_mm)),
-            ]
-            im = self.bc_canvas.axes.imshow(
-                plot_map,
-                cmap=cmap_name,
-                aspect="auto",
-                interpolation="nearest",
-                origin="lower",
-                extent=extent,
-            )
+            if axis1_mm.size == 1 or axis2_mm.size == 1:
+                xg, yg = np.meshgrid(axis1_mm, axis2_mm)
+                x_vals = np.asarray(xg, dtype=float).ravel()
+                y_vals = np.asarray(yg, dtype=float).ravel()
+                c_vals = np.asarray(plot_map, dtype=float).ravel()
+                finite = np.isfinite(c_vals)
+                if not np.any(finite):
+                    self.bc_canvas.draw_placeholder("Pressure field preview unavailable")
+                    return
+                im = self.bc_canvas.axes.scatter(
+                    x_vals[finite],
+                    y_vals[finite],
+                    c=c_vals[finite],
+                    cmap=cmap_name,
+                    s=100,
+                    marker="o",
+                    linewidths=0.4,
+                    edgecolors="#1f2a37",
+                )
+            else:
+                extent = [
+                    float(np.min(axis1_mm)),
+                    float(np.max(axis1_mm)),
+                    float(np.min(axis2_mm)),
+                    float(np.max(axis2_mm)),
+                ]
+                im = self.bc_canvas.axes.imshow(
+                    plot_map,
+                    cmap=cmap_name,
+                    aspect="auto",
+                    interpolation="nearest",
+                    origin="lower",
+                    extent=extent,
+                )
             if getattr(self, "_bc_colorbar", None) is not None:
                 try:
                     self._bc_colorbar.remove()
