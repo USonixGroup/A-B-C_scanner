@@ -93,18 +93,12 @@ def estimate_a_mode_signal(
     3. apply a light Tukey taper to reduce edge artefacts
     4. detect the envelope with the Hilbert transform
     """
-    time_arr = np.asarray(time_axis, dtype=float)
+    _ = time_axis
     trace = np.asarray(signal, dtype=float)
     if trace.size == 0:
         return trace
 
     processed = detrend(trace, type="linear")
-
-    sample_rate_hz_from_time = None
-    if time_arr.size > 1:
-        dt = float(np.median(np.diff(time_arr)))
-        if dt > 0.0:
-            sample_rate_hz_from_time = 1.0 / dt
 
     sample_rate_hz_from_input = None
     if sampling_rate_hz is not None:
@@ -113,11 +107,7 @@ def estimate_a_mode_signal(
         except Exception:
             sample_rate_hz_from_input = None
 
-    # Prefer the actual sample spacing from the trace when available. The passed-in
-    # UI/config sampling rate can drift from the scope's effective time axis.
-    sample_rate_hz = sample_rate_hz_from_time
-    if sample_rate_hz is None or sample_rate_hz <= 0.0:
-        sample_rate_hz = sample_rate_hz_from_input
+    sample_rate_hz = sample_rate_hz_from_input
 
     if sample_rate_hz is not None and sample_rate_hz > 0.0:
         nyquist_hz = 0.5 * sample_rate_hz

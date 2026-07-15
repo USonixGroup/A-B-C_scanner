@@ -969,8 +969,20 @@ class ScannerMainWindow(QMainWindow):
         self.bc_pf_mode_extra_combo.setStyleSheet(
             "QComboBox { padding-right: 28px; }"
         )
+        pf_row.addWidget(self.bc_pf_mode_filtering_label)
+        pf_row.addWidget(self.bc_pf_mode_extra_combo)
+        pf_row.addSpacing(8)
+        pf_row.addWidget(self.bc_pf_mode_metric_label)
+        pf_row.addWidget(self.bc_pf_mode_metric_combo)
+        pf_row.addSpacing(8)
+        pf_row.addWidget(self.bc_pf_mode_cmap_label)
+        pf_row.addWidget(self.bc_pf_mode_cmap_combo)
+        pf_row.addStretch(1)
         self.bc_pf_mode_metric_combo.currentIndexChanged.connect(
             self._on_bc_pf_metric_changed
+        )
+        self.bc_pf_mode_cmap_combo.currentIndexChanged.connect(
+            self._on_bc_pf_colormap_changed
         )
         self.bc_options_stack.addWidget(pf_page)
 
@@ -1201,6 +1213,10 @@ class ScannerMainWindow(QMainWindow):
             'Speed of Sound (m/s)<br><span style="color:#c23b3b; font-size:9pt;">0 = use time in \\mu s</span>'
         )
         scan_form.addRow(speed_label, self.b_sound_speed)
+        self.b_depth_axis.currentIndexChanged.connect(
+            self._sync_b_mode_scan_axis_options
+        )
+        self._sync_b_mode_scan_axis_options()
         left_layout.addWidget(scan_box)
 
         self.b_export_button = QPushButton("Export Data")
@@ -1604,6 +1620,33 @@ class ScannerMainWindow(QMainWindow):
         )
         if self.depth_axis.currentText() != depth:
             self.depth_axis.setCurrentText(depth)
+
+    def _sync_b_mode_scan_axis_options(self, *_args, preferred_scan_axis: str | None = None) -> None:
+        if not hasattr(self, "b_depth_axis") or not hasattr(self, "b_scan_axis"):
+            return
+
+        depth_axis = str(self.b_depth_axis.currentText()).strip().upper()
+        current_scan_axis = str(self.b_scan_axis.currentText()).strip().upper()
+        requested_scan_axis = (
+            str(preferred_scan_axis).strip().upper()
+            if preferred_scan_axis is not None
+            else current_scan_axis
+        )
+        valid_scan_axes = [axis for axis in ("X", "Y", "Z") if axis != depth_axis]
+        if not valid_scan_axes:
+            valid_scan_axes = ["X", "Y", "Z"]
+
+        selected_scan_axis = (
+            requested_scan_axis
+            if requested_scan_axis in valid_scan_axes
+            else valid_scan_axes[0]
+        )
+
+        self.b_scan_axis.blockSignals(True)
+        self.b_scan_axis.clear()
+        self.b_scan_axis.addItems(valid_scan_axes)
+        self.b_scan_axis.setCurrentText(selected_scan_axis)
+        self.b_scan_axis.blockSignals(False)
 
     def _append_log(self, widget: QPlainTextEdit, text: str) -> None:
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -2136,8 +2179,10 @@ class ScannerMainWindow(QMainWindow):
             self.b_depth_axis.setCurrentText(
                 str(b_line.get("depth_axis", self.b_depth_axis.currentText()))
             )
-            self.b_scan_axis.setCurrentText(
-                str(b_line.get("scan_axis", self.b_scan_axis.currentText()))
+            self._sync_b_mode_scan_axis_options(
+                preferred_scan_axis=str(
+                    b_line.get("scan_axis", self.b_scan_axis.currentText())
+                )
             )
             self.b_scan_length.setValue(
                 float(b_line.get("scan_length", self.b_scan_length.value()))
@@ -3074,6 +3119,9 @@ class ScannerMainWindow(QMainWindow):
             "colormap": self.bc_pf_mode_cmap_combo.currentText().strip(),
         }
         self._render_bc_live_preview(payload)
+        self.bridge.bc_log.emit(
+            f"Pressure-field map updated: metric={metric_name}, colormap={self.bc_pf_mode_cmap_combo.currentText().strip()}."
+        )
         return True
 
     def _refresh_c_mode_map_from_cache(self) -> bool:
@@ -3267,19 +3315,47 @@ class ScannerMainWindow(QMainWindow):
                     "A-mode: Applied scope capture configuration for current cached hardware/config signature."
                 )
 
+        import struct
+
+        osc.write("C1:WF? ALL")
+        raw = b""
+        while True:
+            try:
+                chunk = osc.read_raw()
+            except Exception as read_exc:
+                if raw:
+                    break
+                raise RuntimeError(
+                    f"Unable to read scope waveform for exact axis reconstruction: {read_exc}"
+                ) from read_exc
+            if not chunk:
+                break
+            raw += chunk
+
+        wd_start = raw.find(b"WAVEDESC")
+        if wd_start < 0:
+            raise RuntimeError("LeCroy waveform descriptor was not found in the scope response.")
+
+        desc_len = struct.unpack("<i", raw[wd_start + 36 : wd_start + 40])[0]
+        text_len = struct.unpack("<i", raw[wd_start + 40 : wd_start + 44])[0]
+        num_points = struct.unpack("<i", raw[wd_start + 60 : wd_start + 64])[0]
+        v_gain = struct.unpack("<f", raw[wd_start + 156 : wd_start + 160])[0]
+        v_off = struct.unpack("<f", raw[wd_start + 160 : wd_start + 164])[0]
+        h_int = struct.unpack("<f", raw[wd_start + 176 : wd_start + 180])[0]
+        h_off = struct.unpack("<d", raw[wd_start + 180 : wd_start + 188])[0]
+
         raw_data = osc.query_binary_values(
             "C1:WF? DAT1", datatype="h", container=np.array
         )
-        vdiv = self._extract_last_float(osc.query("C1:VDIV?"), 1.0)
-        ofst = self._extract_last_float(osc.query("C1:OFST?"), 0.0)
-        volts = (raw_data * (vdiv * 8.0 / 65536.0)) - ofst
+        volts = (raw_data * v_gain) - v_off
+        num_points = len(raw_data)
+        t = np.arange(num_points, dtype=float) * h_int + h_off
+        actual_sampling_rate = 1.0 / h_int if h_int > 0.0 else float("nan")
 
-        tdiv = self._extract_last_float(osc.query("TDIV?"), burst_duration)
-        trdl = self._extract_last_float(osc.query("TRDL?"), 0.0)
-        n = len(raw_data)
-        span_s = max(10.0 * tdiv, 1e-12)
-        actual_sampling_rate = n / span_s
-        t = np.linspace(trdl, trdl + span_s, n, endpoint=False)
+        if callable(log_fn):
+            log_fn(
+                f"Scope waveform axis: points={num_points}, xzero={h_off:.9e} s, xincrement={h_int:.9e} s"
+            )
 
         if callable(log_fn):
             req_msps = sampling_rate / 1e6
@@ -3290,14 +3366,14 @@ class ScannerMainWindow(QMainWindow):
                 else 0.0
             )
             log_fn(
-                f"Scope sampling rate: requested={req_msps:.6f} MS/s, actual={act_msps:.6f} MS/s, points={n}, TDIV={tdiv:.9e} s/div, TRDL={trdl:.9e} s"
+                f"Scope sampling rate: requested={req_msps:.6f} MS/s, actual={act_msps:.6f} MS/s, points={num_points}, xzero={h_off:.9e} s, xincrement={h_int:.9e} s"
             )
             if delta_pct > 2.0:
                 log_fn(
                     f"Scope sampling-rate deviation: {delta_pct:.2f}% (instrument constrained by timebase/memory settings)."
                 )
 
-        return t, volts
+        return t, volts, actual_sampling_rate
 
     def _render_a_mode_preview(self, payload: dict) -> None:
         import numpy as np
@@ -3462,44 +3538,51 @@ class ScannerMainWindow(QMainWindow):
             if t_ref.size == 0 or traces.size == 0:
                 return
 
-            avg = np.mean(traces, axis=0)
+            detrended_traces = np.vstack(
+                [self._detrend_signal(trace) for trace in traces]
+            )
+            pulse_total = int(detrended_traces.shape[0])
+            if pulse_total > 1:
+                avg = np.mean(detrended_traces, axis=0)
+            else:
+                avg = detrended_traces[0].copy()
             cutoff_hz = float(self.a_mode_highpass_cutoff.value()) * 1000.0
             filter_order = int(self.a_mode_filter_order.value())
-            sampling_rate_hz = (
-                self._extract_last_float(self.sampling_rate_edit.text().strip(), 0.0)
-                * 1000.0
+            sampling_rate_hz = float(
+                self._a_mode_last_results.get(
+                    "filter_sampling_rate_hz",
+                    self._extract_last_float(self.sampling_rate_edit.text().strip(), 0.0)
+                    * 1000.0,
+                )
             )
-            if bool(self._a_mode_last_results.get("use_dummy", False)):
-                envelope_stack = np.vstack(
-                    [
-                        np.asarray(
-                            module.estimate_a_mode_signal(
-                                t_ref,
-                                trace,
-                                highpass_cutoff_hz=cutoff_hz,
-                                filter_order=filter_order,
-                                sampling_rate_hz=sampling_rate_hz,
-                            ),
-                            dtype=float,
-                        )
-                        for trace in traces
-                    ]
-                )
-                a_mode_signal = np.mean(envelope_stack, axis=0)
-            else:
-                a_mode_signal = module.estimate_a_mode_signal(
-                    t_ref,
-                    avg,
-                    highpass_cutoff_hz=cutoff_hz,
-                    filter_order=filter_order,
-                    sampling_rate_hz=sampling_rate_hz,
-                )
+            effective_cutoff_hz = cutoff_hz
+            if sampling_rate_hz > 0.0:
+                nyquist_hz = 0.5 * sampling_rate_hz
+                if cutoff_hz >= nyquist_hz:
+                    self.bridge.a_mode_log.emit(
+                        f"A-mode filtering ERROR: cutoff={cutoff_hz/1000.0:.3f} kHz is >= Nyquist={nyquist_hz/1000.0:.3f} kHz. High-pass filter is disabled."
+                    )
+                    self.bridge.a_mode_log.emit(
+                        "A-mode filtering note: filtering is only meaningful when cutoff is much smaller than Nyquist frequency."
+                    )
+                    effective_cutoff_hz = 0.0
+                elif cutoff_hz >= 0.8 * nyquist_hz:
+                    self.bridge.a_mode_log.emit(
+                        f"A-mode filtering WARNING: cutoff={cutoff_hz/1000.0:.3f} kHz is close to Nyquist={nyquist_hz/1000.0:.3f} kHz; filtering is meaningful when cutoff is much smaller than Nyquist."
+                    )
+            a_mode_signal = module.estimate_a_mode_signal(
+                t_ref,
+                avg,
+                highpass_cutoff_hz=effective_cutoff_hz,
+                filter_order=filter_order,
+                sampling_rate_hz=sampling_rate_hz,
+            )
 
-            first = traces[0]
-            last = traces[-1]
-            pulse_total = int(traces.shape[0])
+            first = detrended_traces[0]
+            last = detrended_traces[-1]
             live_enabled = bool(self._a_mode_last_results.get("live_enabled", True))
 
+            self._a_mode_last_results["traces"] = detrended_traces
             self._a_mode_last_results["avg"] = avg
             self._a_mode_last_results["a_mode"] = a_mode_signal
             self.bridge.a_preview.emit(
@@ -4028,6 +4111,7 @@ class ScannerMainWindow(QMainWindow):
                     break
                 t_echoes = []
                 y_echoes = []
+                scope_sampling_rates = []
                 for pulse_idx in range(1, pulses_per_point + 1):
                     if dry_run:
                         t_one, y_one = module.generate_test_echo(
@@ -4048,13 +4132,15 @@ class ScannerMainWindow(QMainWindow):
                             prf=prf_hz,
                             window_type=window_fn,
                         )
-                        t_one, y_one = self._capture_a_mode_waveform(
+                        t_one, y_one, _scope_fs_hz = self._capture_a_mode_waveform(
                             osc,
                             frequency,
                             amplitude_vpp,
                             cycles,
                             log_fn=self.bridge.b_mode_log.emit,
                         )
+                        if _scope_fs_hz is not None and np.isfinite(_scope_fs_hz) and _scope_fs_hz > 0.0:
+                            scope_sampling_rates.append(float(_scope_fs_hz))
                     t_echoes.append(np.asarray(t_one, dtype=float))
                     y_echoes.append(np.asarray(y_one, dtype=float))
                     self.bridge.b_mode_log.emit(
@@ -4066,8 +4152,51 @@ class ScannerMainWindow(QMainWindow):
 
                 min_len = min(e.size for e in y_echoes)
                 t = t_echoes[0][:min_len]
-                stack = np.vstack([e[:min_len] for e in y_echoes])
-                y = np.mean(stack, axis=0)
+                stack = np.vstack(
+                    [self._detrend_signal(e[:min_len]) for e in y_echoes]
+                )
+                if pulses_per_point > 1:
+                    y = np.mean(stack, axis=0)
+                else:
+                    y = stack[0].copy()
+
+                config_sampling_rate_hz = float(sampling_rate)
+                if scope_sampling_rates:
+                    filter_sampling_rate_hz = float(
+                        np.median(np.asarray(scope_sampling_rates, dtype=float))
+                    )
+                    pct = (
+                        abs(filter_sampling_rate_hz - config_sampling_rate_hz)
+                        / max(config_sampling_rate_hz, 1e-12)
+                        * 100.0
+                    )
+                    self.bridge.b_mode_log.emit(
+                        f"B-mode filtering: Config sampling rate={config_sampling_rate_hz/1e6:.6f} MS/s, scope measured sampling rate={filter_sampling_rate_hz/1e6:.6f} MS/s (delta={pct:.2f}%)."
+                    )
+                    self.bridge.b_mode_log.emit(
+                        f"B-mode filtering: fs={filter_sampling_rate_hz/1e6:.6f} MS/s (scope actual) is used for Nyquist/cutoff calculations."
+                    )
+                else:
+                    filter_sampling_rate_hz = config_sampling_rate_hz
+                    self.bridge.b_mode_log.emit(
+                        f"B-mode filtering: scope sampling rate unavailable; fs={filter_sampling_rate_hz/1e6:.6f} MS/s (Config) is used for Nyquist/cutoff calculations."
+                    )
+
+                effective_cutoff_hz = cutoff_hz
+                if filter_sampling_rate_hz > 0.0:
+                    nyquist_hz = 0.5 * filter_sampling_rate_hz
+                    if cutoff_hz >= nyquist_hz:
+                        self.bridge.b_mode_log.emit(
+                            f"B-mode filtering ERROR: cutoff={cutoff_hz/1000.0:.3f} kHz is >= Nyquist={nyquist_hz/1000.0:.3f} kHz. High-pass filter is disabled."
+                        )
+                        self.bridge.b_mode_log.emit(
+                            "B-mode filtering note: filtering is only meaningful when cutoff is much smaller than Nyquist frequency."
+                        )
+                        effective_cutoff_hz = 0.0
+                    elif cutoff_hz >= 0.8 * nyquist_hz:
+                        self.bridge.b_mode_log.emit(
+                            f"B-mode filtering WARNING: cutoff={cutoff_hz/1000.0:.3f} kHz is close to Nyquist={nyquist_hz/1000.0:.3f} kHz; filtering is meaningful when cutoff is much smaller than Nyquist."
+                        )
 
                 point_csv_path = b_scan_folder / f"point_{idx:04d}.csv"
                 with open(point_csv_path, "w", encoding="utf-8") as _f:
@@ -4078,9 +4207,9 @@ class ScannerMainWindow(QMainWindow):
                 envelope = module.estimate_a_mode_signal(
                     t,
                     y,
-                    highpass_cutoff_hz=cutoff_hz,
+                    highpass_cutoff_hz=effective_cutoff_hz,
                     filter_order=filter_order,
-                    sampling_rate_hz=sampling_rate,
+                    sampling_rate_hz=filter_sampling_rate_hz,
                 )
                 t_axis = np.asarray(t, dtype=float)
                 env_axis = np.asarray(envelope, dtype=float)
@@ -4940,7 +5069,7 @@ class ScannerMainWindow(QMainWindow):
                     )
 
             traces = []
-            envelope_traces = []
+            scope_sampling_rates = []
             self.bridge.a_mode_log.emit(f"A-mode running for {pulses} pulse(s).")
             for pulse_idx in range(1, pulses + 1):
                 if use_dummy:
@@ -4951,14 +5080,6 @@ class ScannerMainWindow(QMainWindow):
                         window_type=window_fn,
                         sampling_rate_hz=sampling_rate,
                     )
-                    dummy_envelope = module.estimate_a_mode_signal(
-                        t,
-                        y,
-                        highpass_cutoff_hz=cutoff_hz,
-                        filter_order=filter_order,
-                        sampling_rate_hz=sampling_rate,
-                    )
-                    envelope_traces.append((t, dummy_envelope))
                 else:
                     Burst_generate(
                         sg,
@@ -4970,13 +5091,15 @@ class ScannerMainWindow(QMainWindow):
                         prf=prf_hz,
                         window_type=window_fn,
                     )
-                    t, y = self._capture_a_mode_waveform(
+                    t, y, scope_fs_hz = self._capture_a_mode_waveform(
                         osc,
                         frequency,
                         amplitude,
                         cycles,
                         log_fn=self.bridge.a_mode_log.emit,
                     )
+                    if scope_fs_hz is not None and scope_fs_hz > 0.0:
+                        scope_sampling_rates.append(float(scope_fs_hz))
                 traces.append((t, y))
                 self.bridge.a_mode_log.emit(
                     f"Captured A-mode echo {pulse_idx}/{pulses}"
@@ -4998,36 +5121,58 @@ class ScannerMainWindow(QMainWindow):
 
             min_len = min(len(item[1]) for item in traces)
             t_ref = traces[0][0][:min_len]
-            stack = np.vstack([item[1][:min_len] for item in traces])
-            avg = np.mean(stack, axis=0)
-            first = traces[0][1][:min_len]
-            last = traces[-1][1][:min_len]
-            if use_dummy and envelope_traces:
-                env_min_len = min(len(item[1]) for item in envelope_traces)
-                envelope_stack = np.vstack([item[1][:env_min_len] for item in envelope_traces])
-                a_mode_signal = np.mean(envelope_stack, axis=0)
-                if env_min_len < min_len:
-                    t_ref = t_ref[:env_min_len]
-                    stack = stack[:, :env_min_len]
-                    avg = avg[:env_min_len]
-                    first = first[:env_min_len]
-                    last = last[:env_min_len]
+            stack = np.vstack(
+                [self._detrend_signal(item[1][:min_len]) for item in traces]
+            )
+            if pulses > 1:
+                avg = np.mean(stack, axis=0)
+            else:
+                avg = stack[0].copy()
+            first = stack[0]
+            last = stack[-1]
+            config_sampling_rate_hz = float(sampling_rate)
+            if scope_sampling_rates:
+                filter_sampling_rate_hz = float(np.median(np.asarray(scope_sampling_rates, dtype=float)))
+                pct = abs(filter_sampling_rate_hz - config_sampling_rate_hz) / max(config_sampling_rate_hz, 1e-12) * 100.0
                 self.bridge.a_mode_log.emit(
-                    f"A-mode dry run: averaged {len(envelope_traces)} per-trace envelopes derived from the Excitation pulse settings."
+                    f"A-mode filtering: Config sampling rate={config_sampling_rate_hz/1e6:.6f} MS/s, scope measured sampling rate={filter_sampling_rate_hz/1e6:.6f} MS/s (delta={pct:.2f}%)."
+                )
+                self.bridge.a_mode_log.emit(
+                    f"A-mode filtering: fs={filter_sampling_rate_hz/1e6:.6f} MS/s (scope actual) is used for Nyquist/cutoff calculations."
                 )
             else:
-                a_mode_signal = module.estimate_a_mode_signal(
-                    t_ref,
-                    avg,
-                    highpass_cutoff_hz=cutoff_hz,
-                    filter_order=filter_order,
-                    sampling_rate_hz=sampling_rate,
+                filter_sampling_rate_hz = config_sampling_rate_hz
+                self.bridge.a_mode_log.emit(
+                    f"A-mode filtering: scope sampling rate unavailable; fs={filter_sampling_rate_hz/1e6:.6f} MS/s (Config) is used for Nyquist/cutoff calculations."
                 )
+            effective_cutoff_hz = cutoff_hz
+            if filter_sampling_rate_hz > 0.0:
+                nyquist_hz = 0.5 * filter_sampling_rate_hz
+                if cutoff_hz >= nyquist_hz:
+                    self.bridge.a_mode_log.emit(
+                        f"A-mode filtering ERROR: cutoff={cutoff_hz/1000.0:.3f} kHz is >= Nyquist={nyquist_hz/1000.0:.3f} kHz. High-pass filter is disabled."
+                    )
+                    self.bridge.a_mode_log.emit(
+                        "A-mode filtering note: filtering is only meaningful when cutoff is much smaller than Nyquist frequency."
+                    )
+                    effective_cutoff_hz = 0.0
+                elif cutoff_hz >= 0.8 * nyquist_hz:
+                    self.bridge.a_mode_log.emit(
+                        f"A-mode filtering WARNING: cutoff={cutoff_hz/1000.0:.3f} kHz is close to Nyquist={nyquist_hz/1000.0:.3f} kHz; filtering is meaningful when cutoff is much smaller than Nyquist."
+                    )
+            a_mode_signal = module.estimate_a_mode_signal(
+                t_ref,
+                avg,
+                highpass_cutoff_hz=effective_cutoff_hz,
+                filter_order=filter_order,
+                sampling_rate_hz=filter_sampling_rate_hz,
+            )
             self._a_mode_last_results = {
                 "t": t_ref,
                 "traces": stack,
                 "avg": avg,
                 "a_mode": a_mode_signal,
+                "filter_sampling_rate_hz": float(filter_sampling_rate_hz),
                 "live_enabled": live_enabled,
                 "use_dummy": use_dummy,
             }
@@ -5136,16 +5281,61 @@ class ScannerMainWindow(QMainWindow):
                 if sg_class is None:
                     raise ImportError(f"Signal generator model '{sg_model}' not available in pymeasure.instruments.agilent")
                 sg_address = pg.get("sg_address") or self._default_sg_address
-                sg = sg_class(sg_address)
+                retries = max(1, int(self.test_retries.value()))
+                retry_delay = min(0.3, float(self.test_timeout.value()))
+                was_sg_cached = self._get_stable_sg(sg_address) is not None
+                try:
+                    sg, _opened_sg_now = self._acquire_cached_sg(
+                        sg_address,
+                        driver=sg_class,
+                        retries=retries,
+                        retry_delay=retry_delay,
+                    )
+                except Exception as sg_exc:
+                    self.bridge.bc_log.emit(
+                        "3D-Mode hardware not detected and Dry Run is off. "
+                        "Enable Dry Run or connect hardware."
+                    )
+                    self.bridge.bc_log.emit(
+                        f"3D-Mode: Failed to connect to signal generator at {sg_address}: {sg_exc}"
+                    )
+                    return
+                if was_sg_cached:
+                    self.bridge.bc_log.emit(
+                        f"3D-Mode: Using cached signal generator connection at {sg_address}."
+                    )
+                else:
+                    self.bridge.bc_log.emit(
+                        f"3D-Mode: Opened and cached signal generator connection at {sg_address}."
+                    )
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 sock.connect((scan["host"], self._port_value()))
-                osc_retries = max(1, int(self.test_retries.value()))
-                osc_retry_delay = min(0.3, float(self.test_timeout.value()))
-                osc = oscmod.open_oscilloscope(
-                    self.osc_address_edit.text().strip() or None,
-                    max_attempts=osc_retries,
-                    retry_delay=osc_retry_delay,
-                )
+                osc_address = self.osc_address_edit.text().strip()
+                if not osc_address:
+                    self.bridge.bc_log.emit(
+                        "3D-Mode: No oscilloscope VISA address configured. Please set it in the Config tab."
+                    )
+                    return
+                was_osc_cached = self._get_stable_osc(osc_address) is not None
+                try:
+                    osc, _opened_osc_now = self._acquire_cached_osc(
+                        osc_address,
+                        retries=retries,
+                        retry_delay=retry_delay,
+                    )
+                except Exception as osc_exc:
+                    self.bridge.bc_log.emit(
+                        f"3D-Mode: Failed to connect to oscilloscope at {osc_address}: {osc_exc}"
+                    )
+                    return
+                if was_osc_cached:
+                    self.bridge.bc_log.emit(
+                        f"3D-Mode: Using cached oscilloscope connection at {osc_address}."
+                    )
+                else:
+                    self.bridge.bc_log.emit(
+                        f"3D-Mode: Opened and cached oscilloscope connection at {osc_address}."
+                    )
                 scan_folder = oscmod.create_scan_folder()
                 self.bridge.bc_log.emit(f"Scan folder: {scan_folder}")
                 self.bridge.bc_log.emit("Hardware connected.")
@@ -5174,17 +5364,27 @@ class ScannerMainWindow(QMainWindow):
                 rig_function.enable_axis(sock, scan["scan_axis"])
                 rig_function.enable_axis(sock, scan["cross_axis"])
 
-            scan_steps = scan["scan_points"]
-            cross_steps = scan["cross_points"]
-            scan_step = scan["scan_step"]
-            cross_step = scan["cross_step"]
+            import numpy as np
+
+            scan_steps = int(scan["scan_points"])
+            cross_steps = int(scan["cross_points"])
+            axis1_mm = np.linspace(0.0, float(scan["scan_length"]), scan_steps)
+            axis2_mm = np.linspace(0.0, float(scan["cross_length"]), cross_steps)
+            axis1_pulses = np.rint(axis1_mm * MM_TO_PULSE).astype(int)
+            axis2_pulses = np.rint(axis2_mm * MM_TO_PULSE).astype(int)
+            nominal_scan_step = (
+                int(axis1_pulses[1] - axis1_pulses[0]) if scan_steps > 1 else 0
+            )
+            nominal_cross_step = (
+                int(axis2_pulses[1] - axis2_pulses[0]) if cross_steps > 1 else 0
+            )
             self.bridge.bc_log.emit(
                 f"B-Mode settings: dry_run={dry_run}, live_preview={self.live_update_check.isChecked()}, "
                 f"shape={pg['shape']}, frequency={pg['frequency']} Hz, amplitude={pg['amplitude']} V, "
                 f"cycles/pulse={pg['no_of_cycles_per_pulse']}, pulses={pg['no_of_pulses']}, "
                 f"scan_axis={scan['scan_axis']}, cross_axis={scan['cross_axis']}, depth_axis={scan['depth_axis']}, "
                 f"scan_points={scan_steps}, cross_points={cross_steps}, "
-                f"scan_step={scan_step}, cross_step={cross_step}"
+                f"scan_step={nominal_scan_step}, cross_step={nominal_cross_step}"
             )
             self.bridge.bc_log.emit(
                 f"Averaging echoes per 3D point using Excitation No. Of Pulses: {pulses_per_point}"
@@ -5199,12 +5399,11 @@ class ScannerMainWindow(QMainWindow):
                     f"cycles/pulse={dry_cycles}, window={dry_window_fn}"
                 )
             self.bridge.bc_log.emit(
-                f"Starting B Scan: {scan['scan_axis']} {scan_steps} steps ({scan_step} pulses) | "
-                f"{scan['cross_axis']} {cross_steps} rows ({cross_step} pulses)"
+                f"Starting 3D grid scan: {scan_steps} x {cross_steps} points "
+                f"(endpoints included on both axes)."
             )
 
             # Initialize list to accumulate A-mode signals for matrix
-            import numpy as np
 
             a_mode_signals = []  # Will store (amplitude_array) for each acquisition
             acquisition_count = 0
@@ -5221,34 +5420,60 @@ class ScannerMainWindow(QMainWindow):
             c_mode_colormap = self.bc_c_mode_cmap_combo.currentText().strip()
             a_mode_cutoff_hz = float(self.a_mode_highpass_cutoff.value()) * 1000.0
             a_mode_filter_order = int(self.a_mode_filter_order.value())
+            current_axis1_pulse = 0
+            current_axis2_pulse = 0
 
             for cross in range(cross_steps):
                 if self.stop_event.is_set():
                     self.bridge.bc_log.emit("Scan stopped by user.")
                     break
                 self.bridge.bc_log.emit(f"Scanning row {cross + 1}/{cross_steps}")
-                scan_direction = -scan_step if cross % 2 else scan_step
-                for scan_idx in range(scan_steps):
+                target_axis2_pulse = int(axis2_pulses[cross])
+                scan_indices = (
+                    range(scan_steps) if cross % 2 == 0 else range(scan_steps - 1, -1, -1)
+                )
+                for scan_order_idx, scan_idx in enumerate(scan_indices):
                     if self.stop_event.is_set():
                         break
-                    # Physical traversal along Axis1 is zig-zag, but saved filenames
-                    # should always map to logical Axis1(rows) x Axis2(columns).
-                    axis1_idx = (scan_steps - scan_idx) if cross % 2 else (scan_idx + 1)
+                    axis1_idx = scan_idx + 1
                     axis2_idx = cross + 1
+                    target_axis1_pulse = int(axis1_pulses[scan_idx])
+
                     if rig_function and sock:
-                        rig_function.send_command(
-                            sock, f"{scan['scan_axis']}{scan_direction}"
-                        )
-                        rig_function.wait_until_stopped(sock, scan["scan_axis"])
+                        delta_axis2 = target_axis2_pulse - current_axis2_pulse
+                        if delta_axis2 != 0:
+                            rig_function.send_command(
+                                sock, f"{scan['cross_axis']}{delta_axis2}"
+                            )
+                            rig_function.wait_until_stopped(sock, scan["cross_axis"])
+                            current_axis2_pulse = target_axis2_pulse
+
+                        delta_axis1 = target_axis1_pulse - current_axis1_pulse
+                        if delta_axis1 != 0:
+                            rig_function.send_command(
+                                sock, f"{scan['scan_axis']}{delta_axis1}"
+                            )
+                            rig_function.wait_until_stopped(sock, scan["scan_axis"])
+                            current_axis1_pulse = target_axis1_pulse
                     else:
-                        self.bridge.bc_log.emit(
-                            f"[Dry-run] Move {scan['scan_axis']} {scan_direction}"
-                        )
+                        delta_axis2 = target_axis2_pulse - current_axis2_pulse
+                        delta_axis1 = target_axis1_pulse - current_axis1_pulse
+                        if delta_axis2 != 0:
+                            self.bridge.bc_log.emit(
+                                f"[Dry-run] Move {scan['cross_axis']} {delta_axis2}"
+                            )
+                            current_axis2_pulse = target_axis2_pulse
+                        if delta_axis1 != 0:
+                            self.bridge.bc_log.emit(
+                                f"[Dry-run] Move {scan['scan_axis']} {delta_axis1}"
+                            )
+                            current_axis1_pulse = target_axis1_pulse
                     # --- acquire and average echoes for this point ---
                     t_acq = None
                     echo_acq = None
                     t_echoes = []
                     y_echoes = []
+                    scope_sampling_rates = []
                     for pulse_idx in range(1, pulses_per_point + 1):
                         if oscmod and osc and sg and not dry_run:
                             Burst_generate(
@@ -5261,13 +5486,15 @@ class ScannerMainWindow(QMainWindow):
                                 prf=dry_prf_hz,
                                 window_type=dry_window_fn,
                             )
-                            t_one, y_one = self._capture_a_mode_waveform(
+                            t_one, y_one, _scope_fs_hz = self._capture_a_mode_waveform(
                                 osc,
                                 dry_frequency_hz,
                                 dry_amplitude_v,
                                 dry_cycles,
                                 log_fn=self.bridge.bc_log.emit,
                             )
+                            if _scope_fs_hz is not None and np.isfinite(_scope_fs_hz) and _scope_fs_hz > 0.0:
+                                scope_sampling_rates.append(float(_scope_fs_hz))
                         else:
                             t_one, y_one = a_scan_module.generate_test_echo(
                                 frequency_hz=dry_frequency_hz,
@@ -5285,8 +5512,45 @@ class ScannerMainWindow(QMainWindow):
                     if y_echoes:
                         min_len = min(e.size for e in y_echoes)
                         t_acq = t_echoes[0][:min_len]
-                        stack = np.vstack([e[:min_len] for e in y_echoes])
-                        echo_acq = np.mean(stack, axis=0)
+                        stack = np.vstack(
+                            [self._detrend_signal(e[:min_len]) for e in y_echoes]
+                        )
+                        if pulses_per_point > 1:
+                            echo_acq = np.mean(stack, axis=0)
+                        else:
+                            echo_acq = stack[0].copy()
+
+                        config_sampling_rate_hz = float(sampling_rate)
+                        if scope_sampling_rates:
+                            filter_sampling_rate_hz = float(
+                                np.median(np.asarray(scope_sampling_rates, dtype=float))
+                            )
+                            pct = (
+                                abs(filter_sampling_rate_hz - config_sampling_rate_hz)
+                                / max(config_sampling_rate_hz, 1e-12)
+                                * 100.0
+                            )
+                            self.bridge.bc_log.emit(
+                                f"3D-mode filtering: Config fs={config_sampling_rate_hz/1e6:.6f} MS/s, "
+                                f"scope measured fs={filter_sampling_rate_hz/1e6:.6f} MS/s (delta={pct:.2f}%)."
+                            )
+                        else:
+                            filter_sampling_rate_hz = config_sampling_rate_hz
+                        effective_cutoff_hz = a_mode_cutoff_hz
+                        if filter_sampling_rate_hz > 0.0:
+                            nyquist_hz = 0.5 * filter_sampling_rate_hz
+                            if a_mode_cutoff_hz >= nyquist_hz:
+                                self.bridge.bc_log.emit(
+                                    f"3D-mode filtering ERROR: cutoff={a_mode_cutoff_hz/1000.0:.3f} kHz is >= Nyquist={nyquist_hz/1000.0:.3f} kHz. High-pass filter is disabled."
+                                )
+                                self.bridge.bc_log.emit(
+                                    "3D-mode filtering note: filtering is only meaningful when cutoff is much smaller than Nyquist frequency."
+                                )
+                                effective_cutoff_hz = 0.0
+                            elif a_mode_cutoff_hz >= 0.8 * nyquist_hz:
+                                self.bridge.bc_log.emit(
+                                    f"3D-mode filtering WARNING: cutoff={a_mode_cutoff_hz/1000.0:.3f} kHz is close to Nyquist={nyquist_hz/1000.0:.3f} kHz; filtering is meaningful when cutoff is much smaller than Nyquist."
+                                )
 
                         csv_path = os.path.join(
                             scan_folder, f"row_{axis1_idx}_col_{axis2_idx}.csv"
@@ -5306,9 +5570,9 @@ class ScannerMainWindow(QMainWindow):
                                     a_scan_module.estimate_a_mode_signal(
                                         t_acq,
                                         echo_acq,
-                                        highpass_cutoff_hz=a_mode_cutoff_hz,
+                                        highpass_cutoff_hz=effective_cutoff_hz,
                                         filter_order=a_mode_filter_order,
-                                        sampling_rate_hz=sampling_rate,
+                                        sampling_rate_hz=filter_sampling_rate_hz,
                                     ),
                                     dtype=float,
                                 )
@@ -5338,7 +5602,7 @@ class ScannerMainWindow(QMainWindow):
 
                     # --- live preview: emit raw signal only; renderer computes envelope ---
                     if live_preview and t_acq is not None and echo_acq is not None:
-                        current_scan_num = cross * scan_steps + scan_idx + 1
+                        current_scan_num = cross * scan_steps + scan_order_idx + 1
                         self.bridge.bc_preview.emit(
                             {
                                 "t": t_acq,
@@ -5353,16 +5617,6 @@ class ScannerMainWindow(QMainWindow):
                                 "axis2_total": cross_steps,
                                 "scan_type": scan_type,
                             }
-                        )
-                if cross < cross_steps - 1 and not self.stop_event.is_set():
-                    if rig_function and sock:
-                        rig_function.send_command(
-                            sock, f"{scan['cross_axis']}{cross_step}"
-                        )
-                        rig_function.wait_until_stopped(sock, scan["cross_axis"])
-                    else:
-                        self.bridge.bc_log.emit(
-                            f"[Dry-run] Move {scan['cross_axis']} {cross_step}"
                         )
             self.bridge.bc_log.emit("B Scan finished.")
 
@@ -5500,16 +5754,6 @@ class ScannerMainWindow(QMainWindow):
             if sock is not None:
                 try:
                     sock.close()
-                except Exception:
-                    pass
-            if sg is not None:
-                try:
-                    sg.shutdown()
-                except Exception:
-                    pass
-            if oscmod is not None:
-                try:
-                    oscmod.close_oscilloscope()
                 except Exception:
                     pass
             self.bridge.scan_busy.emit(False)
