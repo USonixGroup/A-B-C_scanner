@@ -13,7 +13,7 @@ PORT = 5001
 
 # ✅ Utility functions
 def mm_to_pulse(mm):
-    return int(mm * 700)
+    return int(mm * 5000)
 
 
 def main():

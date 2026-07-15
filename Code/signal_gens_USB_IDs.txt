@@ -1,0 +1,9 @@
+and if 33521a is selected, set the visa address to: USB0::2391::5639::MY50004553::0::INSTR
+
+if 33500B is selected, set the visa address to: USB0::2391::11015::MY52701391::0::INSTR
+
+when Agilent3320A is selected, set the visa address to: USB0::2391::1031::MY44055132::0::INSTR
+
+in the config page, and in the signal generator section, change the box Name to a dropdown menu with the following items: Agilent33220A, Agilent33500B, Agilent33521A. 
+
+in the config page, and in the signal generator section, change the box Name to a dropdown menu with the following items: Agilent33220A, Agilent33500B, Agilent33521A. 

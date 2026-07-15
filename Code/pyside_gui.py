@@ -1,6 +1,6 @@
 """PySide6 implementation of the A/B scanner GUI.
 
-This module replaces the old Tkinter surface with a Qt-based desktop UI while
+This module replaces the old T& "C:\Miniforge3\Scripts\conda.exe" init powershellkinter surface with a Qt-based desktop UI while
 reusing the existing scan, motion, and acquisition backends from this project.
 """
 
@@ -63,7 +63,7 @@ from PySide6.QtWidgets import (
 
 from scan_utils import compute_step
 
-MM_TO_PULSE = 700
+MM_TO_PULSE = 5000
 MODE_LEFT_PANEL_WIDTH = 430
 B_MODE_LEFT_PANEL_WIDTH = 540
 PANEL_GAP = 14
@@ -150,6 +150,15 @@ class ScannerMainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.stop_event = threading.Event()
+        self._sg_state_lock = threading.Lock()
+        self._sg_use_lock = threading.Lock()
+        self._osc_state_lock = threading.Lock()
+        self._stable_sg = None
+        self._stable_sg_address = None
+        self._stable_osc = None
+        self._stable_osc_address = None
+        self._scope_capture_config_signature = None
+        self._scope_capture_config_handle_id = None
         self.bridge = UiBridge()
         self._a_mode_last_results = None
         self._b_mode_last_results = None
@@ -293,6 +302,8 @@ class ScannerMainWindow(QMainWindow):
         sg_box = QGroupBox("Signal Generator")
         sg_form = QFormLayout(sg_box)
         self.sg_name_edit = QLineEdit("Agilent33500")
+        # Use a generic VISA address as the fallback, not device-specific
+        self._default_sg_address = "USB0::INSTR"
         self.sg_address_edit = QLineEdit()
         self.sg_address_edit.setPlaceholderText("USB0::...::INSTR")
         sg_form.addRow("Name", self.sg_name_edit)
@@ -446,10 +457,14 @@ class ScannerMainWindow(QMainWindow):
         self.tx_pulses = self._make_spin(1, 100000, 1)
         self.tx_prf = self._make_double_spin(0.1, 1_000_000, 1000.0, decimals=2)
         self.tx_start_delay_us = self._make_double_spin(0.0, 10_000_000.0, 0.0)
+        self.tx_start_delay_us.setEnabled(False)
+        self.tx_start_delay_us.setToolTip(
+            "Start Delay is currently disabled and is not used by Excitation signal generation."
+        )
         pg_form.addRow("Waveform Shape", QLabel("SIN"))
         pg_form.addRow("Windowing Function", self.tx_windowing_combo)
         pg_form.addRow("Frequency (kHz)", self.tx_freq)
-        pg_form.addRow("Amplitude (V)", self.tx_amp)
+        pg_form.addRow("Amplitude (Vpp)", self.tx_amp)
         pg_form.addRow("No. Of Cycles Per Pulse", self.tx_cycles)
         pg_form.addRow("No. Of Pulses", self.tx_pulses)
         pg_form.addRow("Pulse Repetition Frequency (Hz)", self.tx_prf)
@@ -2049,7 +2064,7 @@ class ScannerMainWindow(QMainWindow):
             bc = settings.get("b_mode", settings.get("bc_mode", {}))
 
             self.sg_address_edit.setText(
-                str(cfg.get("sg_address", self.sg_address_edit.text()))
+                str(cfg.get("sg_address", self._default_sg_address))
             )
             self.sg_name_edit.setText(str(cfg.get("sg_name", self.sg_name_edit.text())))
             self.osc_name_edit.setText(
@@ -2273,7 +2288,7 @@ class ScannerMainWindow(QMainWindow):
         return {
             "config": {
                 "sg_name": self.sg_name_edit.text().strip(),
-                "sg_address": self.sg_address_edit.text().strip(),
+                "sg_address": self.sg_address_edit.text().strip() or self._default_sg_address,
                 "osc_name": self.osc_name_edit.text().strip(),
                 "osc_address": self.osc_address_edit.text().strip(),
                 "host": self.host_edit.text().strip(),
@@ -2455,6 +2470,153 @@ class ScannerMainWindow(QMainWindow):
             except ValueError:
                 continue
         return fallback
+
+    def _format_hz_for_log(self, value_hz: float | None) -> str:
+        if value_hz is None:
+            return "generator-internal"
+        hz = float(value_hz)
+        if hz >= 1_000_000.0:
+            return f"{hz / 1_000_000.0:.3f} MHz"
+        if hz >= 1_000.0:
+            return f"{hz / 1_000.0:.3f} kHz"
+        return f"{hz:.3f} Hz"
+
+    def _close_sg_handle(self, sg) -> None:
+        if sg is None:
+            return
+        try:
+            sg.output = False
+        except Exception:
+            pass
+        try:
+            sg.shutdown()
+        except Exception:
+            pass
+        try:
+            adapter = getattr(sg, "adapter", None)
+            if adapter is not None and hasattr(adapter, "close"):
+                adapter.close()
+        except Exception:
+            pass
+
+    def _get_stable_sg(self, sg_address: str):
+        addr = str(sg_address).strip()
+        with self._sg_state_lock:
+            if self._stable_sg is None:
+                return None
+            if str(self._stable_sg_address or "").strip() != addr:
+                return None
+            return self._stable_sg
+
+    def _set_stable_sg(self, sg, sg_address: str) -> None:
+        old = None
+        with self._sg_state_lock:
+            old = self._stable_sg
+            self._stable_sg = sg
+            self._stable_sg_address = str(sg_address).strip()
+        if old is not None and old is not sg:
+            self._close_sg_handle(old)
+
+    def _clear_stable_sg(self) -> None:
+        old = None
+        with self._sg_state_lock:
+            old = self._stable_sg
+            self._stable_sg = None
+            self._stable_sg_address = None
+        self._close_sg_handle(old)
+
+    def _acquire_cached_sg(self, sg_address: str, driver, retries: int, retry_delay: float):
+        addr = str(sg_address).strip()
+        stable_sg = self._get_stable_sg(addr)
+        if stable_sg is not None:
+            return stable_sg, False
+
+        last_err = None
+        for _ in range(max(1, int(retries))):
+            sg = None
+            try:
+                sg = driver(addr)
+                self._set_stable_sg(sg, addr)
+                return sg, True
+            except Exception as exc:
+                last_err = exc
+                if sg is not None:
+                    self._close_sg_handle(sg)
+                time.sleep(max(float(retry_delay), 0.0))
+
+        raise last_err
+
+    def _close_osc_handle(self, osc) -> None:
+        if osc is None:
+            return
+        if id(osc) == self._scope_capture_config_handle_id:
+            self._scope_capture_config_handle_id = None
+            self._scope_capture_config_signature = None
+        try:
+            osc.close()
+        except Exception:
+            pass
+        try:
+            import Oscilloscope as oscmod
+
+            oscmod.close_oscilloscope()
+        except Exception:
+            pass
+
+    def _get_stable_osc(self, osc_address: str):
+        addr = str(osc_address).strip()
+        with self._osc_state_lock:
+            if self._stable_osc is None:
+                return None
+            if str(self._stable_osc_address or "").strip() != addr:
+                return None
+            return self._stable_osc
+
+    def _set_stable_osc(self, osc, osc_address: str) -> None:
+        old = None
+        with self._osc_state_lock:
+            old = self._stable_osc
+            self._stable_osc = osc
+            self._stable_osc_address = str(osc_address).strip()
+            self._scope_capture_config_signature = None
+            self._scope_capture_config_handle_id = None
+        if old is not None and old is not osc:
+            self._close_osc_handle(old)
+
+    def _clear_stable_osc(self) -> None:
+        old = None
+        with self._osc_state_lock:
+            old = self._stable_osc
+            self._stable_osc = None
+            self._stable_osc_address = None
+            self._scope_capture_config_signature = None
+            self._scope_capture_config_handle_id = None
+        self._close_osc_handle(old)
+
+    def _acquire_cached_osc(self, osc_address: str, retries: int, retry_delay: float):
+        import Oscilloscope as oscmod
+
+        addr = str(osc_address).strip()
+        stable_osc = self._get_stable_osc(addr)
+        if stable_osc is not None:
+            return stable_osc, False
+
+        last_err = None
+        for _ in range(max(1, int(retries))):
+            try:
+                osc = oscmod.open_oscilloscope(
+                    addr,
+                    max_attempts=1,
+                    retry_delay=retry_delay,
+                    force_reopen=False,
+                )
+                self._set_stable_osc(osc, addr)
+                return osc, True
+            except Exception as exc:
+                last_err = exc
+                time.sleep(max(float(retry_delay), 0.0))
+
+        raise last_err
 
     def _update_a_mode_source_label(self, *_args) -> None:
         if self.a_dry_run_check.isChecked():
@@ -3052,43 +3214,89 @@ class ScannerMainWindow(QMainWindow):
             )
 
     def _capture_a_mode_waveform(
-        self, osc, frequency: float, amplitude: float, cycles: float
+        self,
+        osc,
+        frequency: float,
+        amplitude: float,
+        cycles: float,
+        log_fn=None,
     ):
         import numpy as np
 
-        def vbs(cmd: str) -> None:
-            osc.write(f"VBS '{cmd}'")
-            time.sleep(0.05)
-
         burst_duration = max(float(cycles) / max(float(frequency), 1e-12), 1e-9)
-        hor_scale = max(burst_duration / 5.0, 1e-9)
-        ver_scale = max(float(amplitude), 0.01)
-        sampling_rate = (
-            self._extract_last_float(
-                self.sampling_rate_edit.text().strip(),
-                max(float(frequency) * 100.0, 1e6) / 1000.0,
-            )
-            * 1000.0
+        sampling_rate = max(
+            (
+                self._extract_last_float(
+                    self.sampling_rate_edit.text().strip(),
+                    max(float(frequency) * 100.0, 1e6) / 1000.0,
+                )
+                * 1000.0
+            ),
+            1.0,
         )
+        capture_signature = (
+            id(osc),
+            str(self.osc_address_edit.text().strip()),
+            round(float(frequency), 6),
+            round(float(amplitude), 6),
+            round(float(cycles), 6),
+            round(float(sampling_rate), 3),
+        )
+        if (
+            self._scope_capture_config_handle_id != id(osc)
+            or self._scope_capture_config_signature != capture_signature
+        ):
+            def vbs(cmd: str) -> None:
+                osc.write(f"VBS '{cmd}'")
+                time.sleep(0.1)
 
-        vbs(f"app.Acquisition.Horizontal.HorScale = {hor_scale}")
-        vbs(f"app.Acquisition.C1.VerScale = {ver_scale}")
-        vbs(f"app.Acquisition.Horizontal.SampleRate = {sampling_rate}")
-        vbs("app.Acquisition.C1.Offset = 0")
-        vbs("app.Acquisition.C1.View = true")
-        vbs('app.Acquisition.Trigger.Source = "C1"')
-        osc.write("TRIG_MODE NORM")
+            hor_scale = max(burst_duration, 1e-9)
+            ver_scale = max(float(amplitude), 0.01)
+            osc.write("COMM_HEADER OFF")
+            osc.write("COMM_FORMAT DEF9,WORD,BIN")
+            vbs(f"app.Acquisition.Horizontal.HorScale = {hor_scale}")
+            vbs(f"app.Acquisition.C1.VerScale = {ver_scale}")
+            vbs(f"app.Acquisition.Horizontal.SampleRate = {sampling_rate}")
+            vbs("app.Acquisition.C1.View = true")
+            vbs('app.Acquisition.Trigger.Source = "C1"')
+            osc.write("TRIG_MODE NORM")
+            self._scope_capture_config_handle_id = id(osc)
+            self._scope_capture_config_signature = capture_signature
+            if callable(log_fn):
+                log_fn(
+                    "A-mode: Applied scope capture configuration for current cached hardware/config signature."
+                )
 
         raw_data = osc.query_binary_values(
-            "C1:WF? DAT1", datatype="B", container=np.array
+            "C1:WF? DAT1", datatype="h", container=np.array
         )
         vdiv = self._extract_last_float(osc.query("C1:VDIV?"), 1.0)
         ofst = self._extract_last_float(osc.query("C1:OFST?"), 0.0)
-        volts = ((raw_data - 128) * vdiv + ofst - 128) * (1.0 / 30.0)
+        volts = (raw_data * (vdiv * 8.0 / 65536.0)) - ofst
 
-        tdiv = self._extract_last_float(osc.query("TDIV?"), burst_duration / 10.0)
+        tdiv = self._extract_last_float(osc.query("TDIV?"), burst_duration)
+        trdl = self._extract_last_float(osc.query("TRDL?"), 0.0)
         n = len(raw_data)
-        t = np.linspace(0.0, 10.0 * tdiv, n, endpoint=False)
+        span_s = max(10.0 * tdiv, 1e-12)
+        actual_sampling_rate = n / span_s
+        t = np.linspace(trdl, trdl + span_s, n, endpoint=False)
+
+        if callable(log_fn):
+            req_msps = sampling_rate / 1e6
+            act_msps = actual_sampling_rate / 1e6
+            delta_pct = (
+                abs(actual_sampling_rate - sampling_rate) / sampling_rate * 100.0
+                if sampling_rate > 0.0
+                else 0.0
+            )
+            log_fn(
+                f"Scope sampling rate: requested={req_msps:.6f} MS/s, actual={act_msps:.6f} MS/s, points={n}, TDIV={tdiv:.9e} s/div, TRDL={trdl:.9e} s"
+            )
+            if delta_pct > 2.0:
+                log_fn(
+                    f"Scope sampling-rate deviation: {delta_pct:.2f}% (instrument constrained by timebase/memory settings)."
+                )
+
         return t, volts
 
     def _render_a_mode_preview(self, payload: dict) -> None:
@@ -3115,7 +3323,9 @@ class ScannerMainWindow(QMainWindow):
         if mode == "live":
             pulse_idx = int(payload.get("pulse_idx", 1))
             pulse_total = int(payload.get("pulse_total", 1))
-            self.a_preview_canvas.axes.plot(x, y, color="#2f80ed", linewidth=1.2)
+            self.a_preview_canvas.axes.plot(
+                x, y, color="#2f80ed", linewidth=1.1, alpha=0.8, zorder=2
+            )
             self.a_preview_canvas.axes.set_title(
                 f"A-Mode Live Preview ({pulse_idx}/{pulse_total})", color="#1f2a37"
             )
@@ -3129,22 +3339,44 @@ class ScannerMainWindow(QMainWindow):
                         y_first,
                         color="#3a8d5c",
                         linewidth=1.0,
-                        alpha=0.7,
+                        alpha=0.5,
+                        zorder=2,
                         label="First echo",
                     )
                 self.a_preview_canvas.axes.plot(
-                    x, y, color="#2f80ed", linewidth=1.0, alpha=0.6, label="Last echo"
+                    x,
+                    y,
+                    color="#2f80ed",
+                    linewidth=1.0,
+                    alpha=0.45,
+                    zorder=2,
+                    label="Last echo",
                 )
                 self.a_preview_canvas.axes.plot(
-                    x, y_avg, color="#e04b3f", linewidth=1.8, label="Average"
+                    x,
+                    y_avg,
+                    color="#e04b3f",
+                    linewidth=1.6,
+                    alpha=0.9,
+                    zorder=3,
+                    label="Average",
                 )
                 if y_mode.size == y_avg.size and y_mode.size > 0:
+                    self.a_preview_canvas.axes.fill_between(
+                        x,
+                        0.0,
+                        y_mode,
+                        color="#f7b801",
+                        alpha=0.18,
+                        zorder=1,
+                    )
                     self.a_preview_canvas.axes.plot(
                         x,
                         y_mode,
-                        color="#8a3ffc",
-                        linewidth=1.8,
-                        linestyle="--",
+                        color="#f59e0b",
+                        linewidth=2.2,
+                        linestyle="-",
+                        zorder=4,
                         label="A-Mode envelope",
                     )
                 self.a_preview_canvas.axes.legend(loc="best")
@@ -3158,7 +3390,8 @@ class ScannerMainWindow(QMainWindow):
                         y_first,
                         color="#3a8d5c",
                         linewidth=1.0,
-                        alpha=0.7,
+                        alpha=0.5,
+                        zorder=2,
                         label="First echo",
                     )
                     self.a_preview_canvas.axes.plot(
@@ -3166,19 +3399,35 @@ class ScannerMainWindow(QMainWindow):
                         y,
                         color="#2f80ed",
                         linewidth=1.0,
-                        alpha=0.6,
+                        alpha=0.45,
+                        zorder=2,
                         label="Last echo",
                     )
                 self.a_preview_canvas.axes.plot(
-                    x, y_avg, color="#e04b3f", linewidth=1.8, label="Average"
+                    x,
+                    y_avg,
+                    color="#e04b3f",
+                    linewidth=1.6,
+                    alpha=0.9,
+                    zorder=3,
+                    label="Average",
                 )
                 if y_mode.size == y_avg.size and y_mode.size > 0:
+                    self.a_preview_canvas.axes.fill_between(
+                        x,
+                        0.0,
+                        y_mode,
+                        color="#f7b801",
+                        alpha=0.18,
+                        zorder=1,
+                    )
                     self.a_preview_canvas.axes.plot(
                         x,
                         y_mode,
-                        color="#8a3ffc",
-                        linewidth=1.8,
-                        linestyle="--",
+                        color="#f59e0b",
+                        linewidth=2.2,
+                        linestyle="-",
+                        zorder=4,
                         label="A-Mode envelope",
                     )
                 if pulse_total > 1:
@@ -3214,16 +3463,37 @@ class ScannerMainWindow(QMainWindow):
                 return
 
             avg = np.mean(traces, axis=0)
-            a_mode_signal = module.estimate_a_mode_signal(
-                t_ref,
-                avg,
-                highpass_cutoff_hz=float(self.a_mode_highpass_cutoff.value()) * 1000.0,
-                filter_order=int(self.a_mode_filter_order.value()),
-                sampling_rate_hz=self._extract_last_float(
-                    self.sampling_rate_edit.text().strip(), 0.0
-                )
-                * 1000.0,
+            cutoff_hz = float(self.a_mode_highpass_cutoff.value()) * 1000.0
+            filter_order = int(self.a_mode_filter_order.value())
+            sampling_rate_hz = (
+                self._extract_last_float(self.sampling_rate_edit.text().strip(), 0.0)
+                * 1000.0
             )
+            if bool(self._a_mode_last_results.get("use_dummy", False)):
+                envelope_stack = np.vstack(
+                    [
+                        np.asarray(
+                            module.estimate_a_mode_signal(
+                                t_ref,
+                                trace,
+                                highpass_cutoff_hz=cutoff_hz,
+                                filter_order=filter_order,
+                                sampling_rate_hz=sampling_rate_hz,
+                            ),
+                            dtype=float,
+                        )
+                        for trace in traces
+                    ]
+                )
+                a_mode_signal = np.mean(envelope_stack, axis=0)
+            else:
+                a_mode_signal = module.estimate_a_mode_signal(
+                    t_ref,
+                    avg,
+                    highpass_cutoff_hz=cutoff_hz,
+                    filter_order=filter_order,
+                    sampling_rate_hz=sampling_rate_hz,
+                )
 
             first = traces[0]
             last = traces[-1]
@@ -3569,7 +3839,6 @@ class ScannerMainWindow(QMainWindow):
     def _run_b_mode_worker(self) -> None:
         script_path = BASE_DIR / "A scan.py"
         sg = None
-        oscmod = None
         osc = None
         motion_sock = None
         rig_function = None
@@ -3590,7 +3859,7 @@ class ScannerMainWindow(QMainWindow):
             spec.loader.exec_module(module)
 
             frequency = float(self.tx_freq.value()) * 1000.0
-            amplitude = float(self.tx_amp.value())
+            amplitude_vpp = float(self.tx_amp.value())
             cycles = float(self.tx_cycles.value())
             prf_hz = float(self.tx_prf.value())
             window_fn = self.tx_windowing_combo.currentText()
@@ -3607,23 +3876,111 @@ class ScannerMainWindow(QMainWindow):
             filter_order = int(self.a_mode_filter_order.value())
 
             if not dry_run:
-                pm = importlib.import_module("pymeasure.instruments.agilent")
-                Agilent33500 = getattr(pm, "Agilent33500", None)
-                if Agilent33500 is None:
-                    raise ImportError("Agilent33500 not available")
-                from Signal_function import Burst_generate
-                import Oscilloscope as oscmod
-                import rig_function
+                try:
+                    pm = importlib.import_module("pymeasure.instruments.agilent")
+                    sg_model = self.sg_name_edit.text().strip()
+                    sg_class = getattr(pm, sg_model, None)
+                    if sg_class is None:
+                        raise ImportError(f"Signal generator model '{sg_model}' not available in pymeasure.instruments.agilent")
+                    from Signal_function import Burst_generate
+                    import rig_function
 
-                sg_address = self.sg_address_edit.text().strip() or None
-                sg = Agilent33500(sg_address) if sg_address else Agilent33500()
-                osc = oscmod.open_oscilloscope(
-                    self.osc_address_edit.text().strip() or None
-                )
-                motion_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                motion_sock.connect((params["host"], params["port"]))
-                rig_function.send_command(motion_sock, "INC")
-                rig_function.enable_axis(motion_sock, params["scan_axis"])
+                    sg_address = self.sg_address_edit.text().strip() or self._default_sg_address
+                    osc_address = self.osc_address_edit.text().strip()
+                    if not osc_address:
+                        self.bridge.b_mode_log.emit("B-Mode: No oscilloscope VISA address configured. Please set it in the Config tab.")
+                        return
+                    retries = max(1, int(self.test_retries.value()))
+                    retry_delay = min(0.3, float(self.test_timeout.value()))
+
+                    was_sg_cached = self._get_stable_sg(sg_address) is not None
+                    try:
+                        sg, _opened_sg_now = self._acquire_cached_sg(
+                            sg_address,
+                            driver=sg_class,
+                            retries=retries,
+                            retry_delay=retry_delay,
+                        )
+                    except Exception as sg_exc:
+                        self.bridge.b_mode_log.emit(
+                            "B-Mode hardware not detected and Dry Run is off. "
+                            "Enable Dry Run or connect hardware."
+                        )
+                        self.bridge.b_mode_log.emit(
+                            f"B-Mode: Failed to connect to signal generator at {sg_address}: {sg_exc}"
+                        )
+                        return
+
+                    if was_sg_cached:
+                        self.bridge.b_mode_log.emit(
+                            f"B-Mode: Using cached signal generator connection at {sg_address}."
+                        )
+                    else:
+                        self.bridge.b_mode_log.emit(
+                            f"B-Mode: Opened and cached signal generator connection at {sg_address}."
+                        )
+
+                    try:
+                        was_osc_cached = self._get_stable_osc(osc_address) is not None
+                        osc, _opened_osc_now = self._acquire_cached_osc(
+                            osc_address,
+                            retries=retries,
+                            retry_delay=retry_delay,
+                        )
+                        if was_osc_cached:
+                            self.bridge.b_mode_log.emit(
+                                f"B-Mode: Using cached oscilloscope connection at {osc_address}."
+                            )
+                        else:
+                            self.bridge.b_mode_log.emit(
+                                f"B-Mode: Opened and cached oscilloscope connection at {osc_address}."
+                            )
+                    except Exception as osc_exc:
+                        self.bridge.b_mode_log.emit(
+                            "B-Mode hardware not detected and Dry Run is off. "
+                            "Enable Dry Run or connect hardware."
+                        )
+                        self.bridge.b_mode_log.emit(
+                            f"B-Mode: Failed to connect to oscilloscope at {osc_address}: {osc_exc}"
+                        )
+                        return
+
+                    try:
+                        idn = osc.query("*IDN?").strip()
+                        self.bridge.b_mode_log.emit(
+                            f"B-Mode: Oscilloscope connected ({idn})"
+                        )
+                    except Exception as idn_exc:
+                        self.bridge.b_mode_log.emit(
+                            f"B-Mode: Oscilloscope connected, but *IDN? failed: {idn_exc}"
+                        )
+
+                    rig_host = params["host"]
+                    rig_port = params["port"]
+                    self.bridge.b_mode_log.emit(
+                        f"B-Mode: Connecting to rig at {rig_host}:{rig_port} for scanning."
+                    )
+                    try:
+                        motion_sock = socket.create_connection(
+                            (rig_host, rig_port),
+                            timeout=float(self.test_timeout.value()),
+                        )
+                        rig_function.send_command(motion_sock, "INC")
+                        rig_function.enable_axis(motion_sock, params["scan_axis"])
+                    except Exception as rig_exc:
+                        self.bridge.b_mode_log.emit(
+                            f"B-Mode: Failed to connect to rig at {rig_host}:{rig_port}: {rig_exc}"
+                        )
+                        return
+                except Exception as hw_exc:
+                    self.bridge.b_mode_log.emit(
+                        "B-Mode hardware not detected and Dry Run is off. "
+                        "Enable Dry Run or connect hardware."
+                    )
+                    self.bridge.b_mode_log.emit(
+                        f"B-Mode: Hardware detection error: {hw_exc}"
+                    )
+                    return
 
                 b_data_dir = BASE_DIR.parent / "data"
                 b_data_dir.mkdir(exist_ok=True)
@@ -3675,7 +4032,7 @@ class ScannerMainWindow(QMainWindow):
                     if dry_run:
                         t_one, y_one = module.generate_test_echo(
                             frequency_hz=frequency,
-                            amplitude_v=amplitude,
+                            amplitude_v=amplitude_vpp,
                             no_of_cycles_per_pulse=cycles,
                             window_type=window_fn,
                             sampling_rate_hz=sampling_rate,
@@ -3685,14 +4042,18 @@ class ScannerMainWindow(QMainWindow):
                             sg,
                             shape="SIN",
                             frequency=frequency,
-                            amplitude=amplitude,
+                            amplitude=amplitude_vpp,
                             no_of_cycles_per_pulse=cycles,
                             no_of_pulses=1,
                             prf=prf_hz,
                             window_type=window_fn,
                         )
                         t_one, y_one = self._capture_a_mode_waveform(
-                            osc, frequency, amplitude, cycles
+                            osc,
+                            frequency,
+                            amplitude_vpp,
+                            cycles,
+                            log_fn=self.bridge.b_mode_log.emit,
                         )
                     t_echoes.append(np.asarray(t_one, dtype=float))
                     y_echoes.append(np.asarray(y_one, dtype=float))
@@ -3828,11 +4189,6 @@ class ScannerMainWindow(QMainWindow):
                     sg.shutdown()
                 except Exception:
                     pass
-            if oscmod is not None:
-                try:
-                    oscmod.close_oscilloscope()
-                except Exception:
-                    pass
             self.b_start_button.setEnabled(True)
             self.b_stop_button.setEnabled(False)
 
@@ -3895,7 +4251,7 @@ class ScannerMainWindow(QMainWindow):
         if pulses <= 0:
             return False, "No. Of Pulses must be greater than 0."
         if prf_hz <= 0:
-            return False, "Pulse Repetition Frequency must be greater than 0 kHz."
+            return False, "Pulse Repetition Frequency must be greater than 0 Hz."
 
         pulse_width_sec = cycles / frequency
         prf_period_sec = 1.0 / prf_hz
@@ -3962,53 +4318,40 @@ class ScannerMainWindow(QMainWindow):
             return
         try:
             import numpy as np
+            from Signal_function import _build_windowed_sine_waveform
 
             shape = "SIN"
             window_fn = self.tx_windowing_combo.currentText()
             frequency = float(self.tx_freq.value()) * 1000.0
-            amplitude = float(self.tx_amp.value())
+            amplitude_vpp = float(self.tx_amp.value())
+            amplitude_peak = 0.5 * amplitude_vpp
             cycles = float(self.tx_cycles.value())
             pulses = int(self.tx_pulses.value())
             prf_hz = float(self.tx_prf.value())
-            start_delay_sec = float(self.tx_start_delay_us.value()) * 1e-6
             frequency_khz = frequency / 1000.0
-            prf_khz = prf_hz / 1000.0
 
             pulse_width_sec = cycles / frequency
             period_sec = 1.0 / prf_hz
-            total_duration_sec = max(period_sec, start_delay_sec + pulses * period_sec)
+            total_duration_sec = pulses * period_sec
+            preview_sampling_rate_hz = max(40.0 * frequency, 1.0)
 
-            # Render the entire burst train so pulses and PRF are visible in preview.
-            n_points = min(24000, max(3000, pulses * 700))
+            # Build the pulse on the same kind of sample grid used for ARB upload so
+            # preview timing matches the actual generated waveform.
+            n_points = max(2, int(np.ceil(total_duration_sec * preview_sampling_rate_hz)))
             t_sec = np.linspace(0.0, total_duration_sec, n_points, endpoint=False)
-            delayed_t = t_sec - start_delay_sec
-            active = delayed_t >= 0.0
-            local_t = np.mod(np.clip(delayed_t, 0.0, None), period_sec)
-            in_pulse = active & (local_t < pulse_width_sec)
-
-            phase = 2.0 * np.pi * frequency * local_t
-            if shape == "SIN":
-                carrier = np.sin(phase)
-            elif shape in {"SQU", "SQUARE"}:
-                carrier = np.sign(np.sin(phase))
-            elif shape in {"RAMP", "SAW"}:
-                carrier = 2.0 * (
-                    (frequency * local_t) - np.floor(0.5 + frequency * local_t)
-                )
-            elif shape in {"TRI", "TRIANGLE"}:
-                saw = 2.0 * (
-                    (frequency * local_t) - np.floor(0.5 + frequency * local_t)
-                )
-                carrier = 2.0 * np.abs(saw) - 1.0
-            else:
-                carrier = np.sin(phase)
-
-            window_lut = self._window_array(window_fn, 2048)
-            norm = np.clip(local_t / pulse_width_sec, 0.0, 0.999999)
-            lut_idx = (norm * len(window_lut)).astype(int)
-            window = window_lut[lut_idx]
-
-            y = amplitude * carrier * window * in_pulse.astype(float)
+            y = np.zeros_like(t_sec)
+            pulse_samples = max(64, int(np.ceil(pulse_width_sec * preview_sampling_rate_hz)))
+            pulse_waveform = amplitude_peak * _build_windowed_sine_waveform(
+                no_of_cycles_per_pulse=cycles,
+                window_type=window_fn,
+                sample_count=pulse_samples,
+            )
+            pulse_offsets = np.arange(pulses, dtype=float) * period_sec
+            for pulse_offset_sec in pulse_offsets:
+                start_idx = int(round(pulse_offset_sec * preview_sampling_rate_hz))
+                end_idx = min(start_idx + pulse_samples, y.size)
+                if end_idx > start_idx:
+                    y[start_idx:end_idx] = pulse_waveform[: end_idx - start_idx]
             t_us = t_sec * 1e6
 
             self.tx_preview_canvas.figure.clear()
@@ -4017,11 +4360,11 @@ class ScannerMainWindow(QMainWindow):
             self.tx_preview_canvas.axes.plot(t_us, y, color="#2f80ed", linewidth=1.4)
             self.tx_preview_canvas.axes.set_title("Excitation Preview", color="#1f2a37")
             self.tx_preview_canvas.axes.set_xlabel(r"Time ($\mu$s)", color="#415368")
-            self.tx_preview_canvas.axes.set_ylabel("Amplitude (V)", color="#415368")
+            self.tx_preview_canvas.axes.set_ylabel("Voltage (V)", color="#415368")
             self.tx_preview_canvas.draw_idle()
             if log_update:
                 self.bridge.tx_log.emit(
-                    f"Preview updated: shape={shape}, window={window_fn}, frequency={frequency_khz} kHz, cycles/pulse={cycles}, pulses={pulses}, PRF={prf_khz} kHz, start_delay={start_delay_sec:.6f} s"
+                    f"Preview updated: shape={shape}, window={window_fn}, frequency={frequency_khz} kHz, amplitude={amplitude_vpp} Vpp, cycles/pulse={cycles}, pulses={pulses}, PRF={prf_hz} Hz, preview_sampling_rate={self._format_hz_for_log(preview_sampling_rate_hz)}"
                 )
         except Exception as exc:
             self.tx_preview_canvas.draw_placeholder(f"Preview failed: {exc}")
@@ -4036,30 +4379,35 @@ class ScannerMainWindow(QMainWindow):
             return
         try:
             import numpy as np
+            from Signal_function import _build_windowed_sine_waveform
 
             window_fn = self.tx_windowing_combo.currentText()
             frequency = float(self.tx_freq.value()) * 1000.0
-            amplitude = float(self.tx_amp.value())
+            amplitude_vpp = float(self.tx_amp.value())
+            amplitude_peak = 0.5 * amplitude_vpp
             cycles = float(self.tx_cycles.value())
             pulses = int(self.tx_pulses.value())
             prf_hz = float(self.tx_prf.value())
-            start_delay_sec = float(self.tx_start_delay_us.value()) * 1e-6
 
             pulse_width_sec = cycles / frequency
             period_sec = 1.0 / prf_hz
-            total_duration_sec = max(period_sec, start_delay_sec + pulses * period_sec)
-            n_points = min(24000, max(3000, pulses * 700))
+            total_duration_sec = pulses * period_sec
+            preview_sampling_rate_hz = max(40.0 * frequency, 1.0)
+            n_points = max(2, int(np.ceil(total_duration_sec * preview_sampling_rate_hz)))
             t_sec = np.linspace(0.0, total_duration_sec, n_points, endpoint=False)
-            delayed_t = t_sec - start_delay_sec
-            active = delayed_t >= 0.0
-            local_t = np.mod(np.clip(delayed_t, 0.0, None), period_sec)
-            in_pulse = active & (local_t < pulse_width_sec)
-            carrier = np.sin(2.0 * np.pi * frequency * local_t)
-            window_lut = self._window_array(window_fn, 2048)
-            norm = np.clip(local_t / pulse_width_sec, 0.0, 0.999999)
-            lut_idx = (norm * len(window_lut)).astype(int)
-            window = window_lut[lut_idx]
-            y = amplitude * carrier * window * in_pulse.astype(float)
+            y = np.zeros_like(t_sec)
+            pulse_samples = max(64, int(np.ceil(pulse_width_sec * preview_sampling_rate_hz)))
+            pulse_waveform = amplitude_peak * _build_windowed_sine_waveform(
+                no_of_cycles_per_pulse=cycles,
+                window_type=window_fn,
+                sample_count=pulse_samples,
+            )
+            pulse_offsets = np.arange(pulses, dtype=float) * period_sec
+            for pulse_offset_sec in pulse_offsets:
+                start_idx = int(round(pulse_offset_sec * preview_sampling_rate_hz))
+                end_idx = min(start_idx + pulse_samples, y.size)
+                if end_idx > start_idx:
+                    y[start_idx:end_idx] = pulse_waveform[: end_idx - start_idx]
             t_us = t_sec * 1e6
         except Exception as exc:
             self._show_error("Export failed", str(exc))
@@ -4078,7 +4426,7 @@ class ScannerMainWindow(QMainWindow):
                 f.write(
                     f"# Exported at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
                 )
-                f.write("Time_us,Amplitude_V\n")
+                f.write("Time_us,Voltage_V\n")
                 for t, v in zip(t_us, y):
                     f.write(f"{t:.6f},{v:.6f}\n")
             self.bridge.tx_log.emit(f"Waveform exported to: {filename}")
@@ -4112,7 +4460,7 @@ class ScannerMainWindow(QMainWindow):
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
                 sock.connect((self.host_edit.text().strip(), self._port_value()))
                 self.bridge.move_log.emit("Connected to rig.")
-                rig_function.move_to_position(sock, x=x_p, y=y_p, z=z_p)
+                rig_function.move_to_position(sock, x=x_p, y=y_p, z=z_p, log_func=self.bridge.move_log.emit)
                 self.bridge.move_log.emit("Move complete.")
         except Exception as exc:
             self.bridge.move_log.emit(f"Move failed: {exc}")
@@ -4123,7 +4471,7 @@ class ScannerMainWindow(QMainWindow):
         threading.Thread(target=self._test_connections_worker, daemon=True).start()
 
     def _test_connections_worker(self) -> None:
-        sg_addr = self.sg_address_edit.text().strip()
+        sg_addr = self.sg_address_edit.text().strip() or self._default_sg_address
         retries = self.test_retries.value()
         timeout = float(self.test_timeout.value())
         if not sg_addr:
@@ -4131,41 +4479,74 @@ class ScannerMainWindow(QMainWindow):
         else:
             try:
                 import importlib
-
                 pm = importlib.import_module("pymeasure.instruments.agilent")
-                driver = getattr(pm, "Agilent33500", None)
+                sg_model = self.sg_name_edit.text().strip()
+                driver = getattr(pm, sg_model, None)
                 if driver is None:
-                    raise ImportError("Agilent33500 not available")
+                    raise ImportError(f"Signal generator model '{sg_model}' not available in pymeasure.instruments.agilent")
             except Exception as exc:
                 self.bridge.cfg_log.emit(
                     f"Signal generator: driver unavailable ({exc})"
                 )
                 driver = None
             if driver is not None:
-                last_err = None
-                for _ in range(retries):
-                    try:
-                        sg = driver(sg_addr)
+                with self._sg_use_lock:
+                    stable = self._get_stable_sg(sg_addr)
+                    if stable is not None:
                         self.bridge.cfg_log.emit(
-                            f"Signal generator: Connected at {sg_addr}"
+                            f"Signal generator: Connected at {sg_addr} (stable cached session)"
                         )
+                    else:
                         try:
-                            sg.shutdown()
-                        except Exception:
-                            pass
-                        last_err = None
-                        break
-                    except Exception as exc:
-                        last_err = exc
-                        time.sleep(min(0.3, timeout))
-                if last_err is not None:
-                    self.bridge.cfg_log.emit(
-                        f"Signal generator: Failed to open {sg_addr}: {last_err}"
-                    )
+                            self._acquire_cached_sg(
+                                sg_addr,
+                                driver=driver,
+                                retries=retries,
+                                retry_delay=min(0.3, timeout),
+                            )
+                            self.bridge.cfg_log.emit(
+                                f"Signal generator: Connected at {sg_addr}"
+                            )
+                            self.bridge.cfg_log.emit(
+                                "Signal generator: Stable session cached for subsequent operations."
+                            )
+                        except Exception as exc:
+                            self._clear_stable_sg()
+                            self.bridge.cfg_log.emit(
+                                f"Signal generator: Failed to open {sg_addr}: {exc}"
+                            )
+        osc_addr = self.osc_address_edit.text().strip()
         try:
-            import Oscilloscope  # noqa: F401
+            if not osc_addr:
+                self.bridge.cfg_log.emit("Oscilloscope: No VISA address configured")
+            else:
+                stable_osc = self._get_stable_osc(osc_addr)
+                if stable_osc is not None:
+                    try:
+                        idn = stable_osc.query("*IDN?").strip()
+                        self.bridge.cfg_log.emit(
+                            f"Oscilloscope: Connected at {osc_addr} (stable cached session, {idn})"
+                        )
+                    except Exception:
+                        self._clear_stable_osc()
+                        stable_osc = None
 
-            self.bridge.cfg_log.emit("Oscilloscope utilities: available")
+                if stable_osc is None:
+                    try:
+                        osc, opened_now = self._acquire_cached_osc(
+                            osc_addr,
+                            retries=retries,
+                            retry_delay=min(0.3, timeout),
+                        )
+                        idn = osc.query("*IDN?").strip()
+                        self.bridge.cfg_log.emit(f"Oscilloscope: Connected at {osc_addr} ({idn})")
+                        if opened_now:
+                            self.bridge.cfg_log.emit(
+                                "Oscilloscope: Stable session cached for subsequent operations."
+                            )
+                    except Exception as exc:
+                        self._clear_stable_osc()
+                        self.bridge.cfg_log.emit(f"Oscilloscope: Failed to open {osc_addr}: {exc}")
         except Exception as exc:
             self.bridge.cfg_log.emit(f"Oscilloscope utilities: not available ({exc})")
         try:
@@ -4191,19 +4572,47 @@ class ScannerMainWindow(QMainWindow):
 
     def _run_transmit_worker(self) -> None:
         """Transmit-only path: trigger SG burst(s), no oscilloscope read."""
+        sg = None
+        close_after_use = True
         try:
-            import importlib
+            test_script = BASE_DIR / "test_prf_timing.py"
+            spec = importlib.util.spec_from_file_location(
+                "test_prf_timing", test_script
+            )
+            if spec is None or spec.loader is None:
+                raise RuntimeError("Unable to load test_prf_timing.py")
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[spec.name] = module
+            spec.loader.exec_module(module)
 
-            pm = importlib.import_module("pymeasure.instruments.agilent")
-            Agilent33500 = getattr(pm, "Agilent33500", None)
-            if Agilent33500 is None:
-                raise ImportError("Agilent33500 not available")
+            from Signal_function import Burst_generate, describe_burst_generation
 
-            from Signal_function import Burst_generate
+            # Always use the config page value, fallback only if empty
+            sg_address = self.sg_address_edit.text().strip() or self._default_sg_address
+            retries = max(1, int(self.test_retries.value()))
+            timeout = float(self.test_timeout.value())
 
-            sg_address = self.sg_address_edit.text().strip() or None
-            sg = Agilent33500(sg_address) if sg_address else Agilent33500()
-            self.bridge.tx_log.emit("Connected to signal generator.")
+            with self._sg_use_lock:
+                stable = self._get_stable_sg(sg_address)
+                if stable is not None:
+                    sg = stable
+                    close_after_use = False
+                    self.bridge.tx_log.emit("Connected to signal generator (stable cached session).")
+                else:
+                    last_err = None
+                    for _ in range(retries):
+                        try:
+                            sg = module.connect_signal_generator(sg_address)
+                            last_err = None
+                            break
+                        except Exception as conn_exc:
+                            last_err = conn_exc
+                            time.sleep(min(0.3, timeout))
+                    if sg is None:
+                        raise RuntimeError(
+                            f"Unable to connect to signal generator at {sg_address}: {last_err}"
+                        )
+                    self.bridge.tx_log.emit("Connected to signal generator.")
 
             shape = "SIN"
             frequency = float(self.tx_freq.value()) * 1000.0
@@ -4211,39 +4620,41 @@ class ScannerMainWindow(QMainWindow):
             cycles = float(self.tx_cycles.value())
             pulses = int(self.tx_pulses.value())
             prf_hz = float(self.tx_prf.value())
-            start_delay_sec = float(self.tx_start_delay_us.value()) * 1e-6
             window_fn = self.tx_windowing_combo.currentText()
             frequency_khz = frequency / 1000.0
-            prf_khz = prf_hz / 1000.0
             live_preview = bool(self.tx_auto_preview_check.isChecked())
 
             self.bridge.tx_log.emit(
                 f"Excitation settings: shape={shape}, window={window_fn}, "
-                f"frequency={frequency_khz} kHz, amplitude={amplitude} V, "
-                f"cycles/pulse={cycles}, pulses={pulses}, PRF={prf_khz} kHz, "
-                f"start_delay={start_delay_sec:.6f} s, live_preview={live_preview}"
+                f"frequency={frequency_khz} kHz, amplitude={amplitude} Vpp, "
+                f"cycles/pulse={cycles}, pulses={pulses}, PRF={prf_hz} Hz, "
+                f"live_preview={live_preview}"
             )
-            if start_delay_sec > 0:
-                time.sleep(start_delay_sec)
-            Burst_generate(
-                sg,
-                shape=shape,
-                frequency=frequency,
-                amplitude=amplitude,
-                no_of_cycles_per_pulse=cycles,
-                no_of_pulses=pulses,
-                prf=prf_hz,
-                window_type=window_fn,
+            generation = describe_burst_generation(shape, frequency, cycles, window_fn)
+            hw_sampling_rate = self._format_hz_for_log(generation["sampling_rate_hz"])
+            self.bridge.tx_log.emit(
+                f"Hardware generation: mode={generation['mode']}, sampling_rate={hw_sampling_rate}"
             )
+            with self._sg_use_lock:
+                Burst_generate(
+                    sg,
+                    shape=shape,
+                    frequency=frequency,
+                    amplitude=amplitude,
+                    no_of_cycles_per_pulse=cycles,
+                    no_of_pulses=pulses,
+                    prf=prf_hz,
+                    window_type=window_fn,
+                )
 
             self.bridge.tx_log.emit("Excitation completed (signal generator only).")
-            try:
-                sg.shutdown()
-            except Exception:
-                pass
         except Exception as exc:
             self.bridge.tx_log.emit(f"Transmit failed: {exc}")
+            if not close_after_use:
+                self._clear_stable_sg()
         finally:
+            if close_after_use:
+                self._close_sg_handle(sg)
             self.transmit_preview_button.setEnabled(True)
             self.transmit_start_button.setEnabled(True)
             self.transmit_timing_button.setEnabled(True)
@@ -4263,7 +4674,10 @@ class ScannerMainWindow(QMainWindow):
 
     def _run_transmit_timing_test_worker(self) -> None:
         sg = None
+        close_after_use = True
         try:
+            from Signal_function import describe_burst_generation
+
             test_script = BASE_DIR / "test_prf_timing.py"
             spec = importlib.util.spec_from_file_location(
                 "test_prf_timing", test_script
@@ -4282,36 +4696,46 @@ class ScannerMainWindow(QMainWindow):
             cycles = float(self.tx_cycles.value())
             pulses = int(self.tx_pulses.value())
             prf_hz = float(self.tx_prf.value())
-            start_delay_sec = float(self.tx_start_delay_us.value()) * 1e-6
             tolerance_percent = 10.0
             tolerance_ratio = tolerance_percent / 100.0
             frequency_khz = frequency / 1000.0
-            prf_khz = prf_hz / 1000.0
             live_preview = bool(self.tx_auto_preview_check.isChecked())
+            generation = describe_burst_generation(
+                shape, frequency, cycles, window_fn
+            )
+            hw_sampling_rate = self._format_hz_for_log(generation["sampling_rate_hz"])
 
-            sg_address = self.sg_address_edit.text().strip() or None
-            sg = module.connect_signal_generator(sg_address)
-            self.bridge.tx_log.emit("Timing test: connected to signal generator.")
+            sg_address = self.sg_address_edit.text().strip() or self._default_sg_address
+            with self._sg_use_lock:
+                stable = self._get_stable_sg(sg_address)
+                if stable is not None:
+                    sg = stable
+                    close_after_use = False
+                    self.bridge.tx_log.emit("Timing test: connected to signal generator (stable cached session).")
+                else:
+                    sg = module.connect_signal_generator(sg_address)
+                    self.bridge.tx_log.emit("Timing test: connected to signal generator.")
             self.bridge.tx_log.emit(
                 f"Timing test settings: shape={shape}, window={window_fn}, frequency={frequency_khz} kHz, "
-                f"cycles/pulse={cycles}, pulses={pulses}, PRF={prf_khz} kHz, tolerance={tolerance_percent}%, "
-                f"start_delay={start_delay_sec:.6f} s, live_preview={live_preview}"
+                f"cycles/pulse={cycles}, pulses={pulses}, PRF={prf_hz} Hz, amplitude={amplitude} Vpp, tolerance={tolerance_percent}%, "
+                f"live_preview={live_preview}"
+            )
+            self.bridge.tx_log.emit(
+                f"Hardware generation: mode={generation['mode']}, sampling_rate={hw_sampling_rate}"
             )
 
-            if start_delay_sec > 0:
-                time.sleep(start_delay_sec)
-
-            recorder = module.TriggerRecorder(sg)
-            module.Burst_generate(
-                recorder,
-                shape=shape,
-                frequency=frequency,
-                amplitude=amplitude,
-                no_of_cycles_per_pulse=cycles,
-                no_of_pulses=pulses,
-                prf=prf_hz,
-                window_type=window_fn,
-            )
+            with self._sg_use_lock:
+                recorder = module.TriggerRecorder(sg)
+                module.Burst_generate(
+                    recorder,
+                    shape=shape,
+                    frequency=frequency,
+                    amplitude=amplitude,
+                    no_of_cycles_per_pulse=cycles,
+                    no_of_pulses=pulses,
+                    prf=prf_hz,
+                    window_type=window_fn,
+                )
 
             result = module.evaluate_timing(recorder.trigger_times, pulses, prf_hz)
             tolerance_s = result.expected_period_s * tolerance_ratio
@@ -4324,7 +4748,7 @@ class ScannerMainWindow(QMainWindow):
                 f"min={result.min_period_s:.9f}, max={result.max_period_s:.9f}"
             )
             self.bridge.tx_log.emit(
-                f"Error: max_abs={result.max_abs_error_s:.9f} s, allowed={tolerance_s:.9f} s"
+                f"Timing deviation: max_abs={result.max_abs_error_s:.9f} s, max_allowed={tolerance_s:.9f} s"
             )
 
             pass_count = result.pulse_count == result.expected_pulses
@@ -4340,12 +4764,11 @@ class ScannerMainWindow(QMainWindow):
                     self.bridge.tx_log.emit("FAIL: PRF spacing is outside tolerance.")
         except Exception as exc:
             self.bridge.tx_log.emit(f"Timing test failed: {exc}")
+            if not close_after_use:
+                self._clear_stable_sg()
         finally:
-            if sg is not None:
-                try:
-                    sg.shutdown()
-                except Exception:
-                    pass
+            if close_after_use:
+                self._close_sg_handle(sg)
             self.transmit_preview_button.setEnabled(True)
             self.transmit_start_button.setEnabled(True)
             self.transmit_timing_button.setEnabled(True)
@@ -4359,7 +4782,6 @@ class ScannerMainWindow(QMainWindow):
     def _run_a_mode_worker(self) -> None:
         script_path = BASE_DIR / "A scan.py"
         sg = None
-        oscmod = None
         osc = None
         motion_sock = None
         try:
@@ -4379,23 +4801,81 @@ class ScannerMainWindow(QMainWindow):
             else:
                 try:
                     pm = importlib.import_module("pymeasure.instruments.agilent")
-                    Agilent33500 = getattr(pm, "Agilent33500", None)
-                    if Agilent33500 is None:
-                        raise ImportError("Agilent33500 not available")
+                    sg_model = self.sg_name_edit.text().strip()
+                    sg_class = getattr(pm, sg_model, None)
+                    if sg_class is None:
+                        raise ImportError(f"Signal generator model '{sg_model}' not available in pymeasure.instruments.agilent")
                     from Signal_function import Burst_generate
-                    import Oscilloscope as oscmod
 
-                    sg_address = self.sg_address_edit.text().strip() or None
-                    sg = Agilent33500(sg_address) if sg_address else Agilent33500()
-                    osc = oscmod.open_oscilloscope(
-                        self.osc_address_edit.text().strip() or None
-                    )
+                    sg_address = self.sg_address_edit.text().strip() or self._default_sg_address
+                    osc_address = self.osc_address_edit.text().strip()
+                    if not osc_address:
+                        self.bridge.a_mode_log.emit("A-mode: No oscilloscope VISA address configured. Please set it in the Config tab.")
+                        return
+                    retries = max(1, int(self.test_retries.value()))
+                    retry_delay = min(0.3, float(self.test_timeout.value()))
+
+                    was_sg_cached = self._get_stable_sg(sg_address) is not None
+                    try:
+                        sg, _opened_sg_now = self._acquire_cached_sg(
+                            sg_address,
+                            driver=sg_class,
+                            retries=retries,
+                            retry_delay=retry_delay,
+                        )
+                    except Exception as sg_exc:
+                        self.bridge.a_mode_log.emit(
+                            "A-mode hardware not detected and Dry Run is off. "
+                            "Enable Dry Run or connect hardware."
+                        )
+                        self.bridge.a_mode_log.emit(
+                            f"A-mode: Failed to connect to signal generator at {sg_address}: {sg_exc}"
+                        )
+                        return
+
+                    if was_sg_cached:
+                        self.bridge.a_mode_log.emit(
+                            f"A-mode: Using cached signal generator connection at {sg_address}."
+                        )
+                    else:
+                        self.bridge.a_mode_log.emit(
+                            f"A-mode: Opened and cached signal generator connection at {sg_address}."
+                        )
+
+                    try:
+                        was_cached = self._get_stable_osc(osc_address) is not None
+                        osc, _opened_now = self._acquire_cached_osc(
+                            osc_address,
+                            retries=retries,
+                            retry_delay=retry_delay,
+                        )
+                        if was_cached:
+                            self.bridge.a_mode_log.emit(
+                                f"A-mode: Using cached oscilloscope connection at {osc_address}."
+                            )
+                        else:
+                            self.bridge.a_mode_log.emit(
+                                f"A-mode: Opened and cached oscilloscope connection at {osc_address}."
+                            )
+                    except Exception as hw_exc:
+                        self.bridge.a_mode_log.emit(
+                            "A-mode hardware not detected and Dry Run is off. "
+                            "Enable Dry Run or connect hardware."
+                        )
+                        self.bridge.a_mode_log.emit(f"A-mode: Failed to connect to oscilloscope at {osc_address}: {hw_exc}")
+                        return
+                    # Optionally, try a simple *IDN? query to verify communication
+                    try:
+                        idn = osc.query("*IDN?").strip()
+                        self.bridge.a_mode_log.emit(f"A-mode: Oscilloscope connected ({idn})")
+                    except Exception as idn_exc:
+                        self.bridge.a_mode_log.emit(f"A-mode: Oscilloscope connected, but *IDN? failed: {idn_exc}")
                 except Exception as hw_exc:
                     self.bridge.a_mode_log.emit(
                         "A-mode hardware not detected and Dry Run is off. "
                         "Enable Dry Run or connect hardware."
                     )
-                    self.bridge.a_mode_log.emit(f"Hardware detection error: {hw_exc}")
+                    self.bridge.a_mode_log.emit(f"A-mode: Hardware detection error: {hw_exc}")
                     return
 
             params = {
@@ -4422,13 +4902,12 @@ class ScannerMainWindow(QMainWindow):
             cutoff_khz = cutoff_hz / 1000.0
             filter_order = int(self.a_mode_filter_order.value())
             frequency_khz = frequency / 1000.0
-            prf_khz = prf_hz / 1000.0
             sampling_rate_khz = sampling_rate / 1000.0
 
             self.bridge.a_mode_log.emit(
                 f"A-mode settings: mode={params['mode']}, X={params['X']} mm, Y={params['Y']} mm, Z={params['Z']} mm, "
                 f"frequency={frequency_khz} kHz, amplitude={amplitude} V, cycles/pulse={cycles}, pulses={pulses}, "
-                f"PRF={prf_khz} kHz, window={window_fn}, sampling_rate={sampling_rate_khz} kHz, "
+                f"PRF={prf_hz} Hz, window={window_fn}, sampling_rate={sampling_rate_khz} kHz, "
                 f"highpass_cutoff={cutoff_khz} kHz, filter_order={filter_order}, live_preview={live_enabled}, "
                 f"signal_source={'dummy' if use_dummy else 'hardware'}"
             )
@@ -4438,11 +4917,30 @@ class ScannerMainWindow(QMainWindow):
                 x_p = module.mm_to_pulse(params["X"])
                 y_p = module.mm_to_pulse(params["Y"])
                 z_p = module.mm_to_pulse(params["Z"])
-                motion_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                motion_sock.connect((self.host_edit.text().strip(), self._port_value()))
-                module.move(motion_sock, x=x_p, y=y_p, z=z_p)
+                if any(value != 0 for value in (x_p, y_p, z_p)):
+                    rig_host = self.host_edit.text().strip()
+                    rig_port = self._port_value()
+                    self.bridge.a_mode_log.emit(
+                        f"A-mode: Connecting to rig at {rig_host}:{rig_port} for positioning."
+                    )
+                    try:
+                        motion_sock = socket.create_connection(
+                            (rig_host, rig_port),
+                            timeout=float(self.test_timeout.value()),
+                        )
+                        module.move(motion_sock, x=x_p, y=y_p, z=z_p)
+                    except Exception as rig_exc:
+                        self.bridge.a_mode_log.emit(
+                            f"A-mode: Failed to connect to rig at {rig_host}:{rig_port}: {rig_exc}"
+                        )
+                        return
+                else:
+                    self.bridge.a_mode_log.emit(
+                        "A-mode: Requested position is zero-offset; skipping rig connection and movement."
+                    )
 
             traces = []
+            envelope_traces = []
             self.bridge.a_mode_log.emit(f"A-mode running for {pulses} pulse(s).")
             for pulse_idx in range(1, pulses + 1):
                 if use_dummy:
@@ -4453,6 +4951,14 @@ class ScannerMainWindow(QMainWindow):
                         window_type=window_fn,
                         sampling_rate_hz=sampling_rate,
                     )
+                    dummy_envelope = module.estimate_a_mode_signal(
+                        t,
+                        y,
+                        highpass_cutoff_hz=cutoff_hz,
+                        filter_order=filter_order,
+                        sampling_rate_hz=sampling_rate,
+                    )
+                    envelope_traces.append((t, dummy_envelope))
                 else:
                     Burst_generate(
                         sg,
@@ -4465,7 +4971,11 @@ class ScannerMainWindow(QMainWindow):
                         window_type=window_fn,
                     )
                     t, y = self._capture_a_mode_waveform(
-                        osc, frequency, amplitude, cycles
+                        osc,
+                        frequency,
+                        amplitude,
+                        cycles,
+                        log_fn=self.bridge.a_mode_log.emit,
                     )
                 traces.append((t, y))
                 self.bridge.a_mode_log.emit(
@@ -4492,19 +5002,34 @@ class ScannerMainWindow(QMainWindow):
             avg = np.mean(stack, axis=0)
             first = traces[0][1][:min_len]
             last = traces[-1][1][:min_len]
-            a_mode_signal = module.estimate_a_mode_signal(
-                t_ref,
-                avg,
-                highpass_cutoff_hz=cutoff_hz,
-                filter_order=filter_order,
-                sampling_rate_hz=sampling_rate,
-            )
+            if use_dummy and envelope_traces:
+                env_min_len = min(len(item[1]) for item in envelope_traces)
+                envelope_stack = np.vstack([item[1][:env_min_len] for item in envelope_traces])
+                a_mode_signal = np.mean(envelope_stack, axis=0)
+                if env_min_len < min_len:
+                    t_ref = t_ref[:env_min_len]
+                    stack = stack[:, :env_min_len]
+                    avg = avg[:env_min_len]
+                    first = first[:env_min_len]
+                    last = last[:env_min_len]
+                self.bridge.a_mode_log.emit(
+                    f"A-mode dry run: averaged {len(envelope_traces)} per-trace envelopes derived from the Excitation pulse settings."
+                )
+            else:
+                a_mode_signal = module.estimate_a_mode_signal(
+                    t_ref,
+                    avg,
+                    highpass_cutoff_hz=cutoff_hz,
+                    filter_order=filter_order,
+                    sampling_rate_hz=sampling_rate,
+                )
             self._a_mode_last_results = {
                 "t": t_ref,
                 "traces": stack,
                 "avg": avg,
                 "a_mode": a_mode_signal,
                 "live_enabled": live_enabled,
+                "use_dummy": use_dummy,
             }
             self.bridge.a_preview.emit(
                 {
@@ -4531,11 +5056,6 @@ class ScannerMainWindow(QMainWindow):
             if sg is not None:
                 try:
                     sg.shutdown()
-                except Exception:
-                    pass
-            if oscmod is not None:
-                try:
-                    oscmod.close_oscilloscope()
                 except Exception:
                     pass
             self.a_start_button.setEnabled(True)
@@ -4607,19 +5127,24 @@ class ScannerMainWindow(QMainWindow):
 
             if not dry_run:
                 pm = importlib.import_module("pymeasure.instruments.agilent")
-                Agilent33500 = getattr(pm, "Agilent33500", None)
+                sg_model = self.sg_name_edit.text().strip()
+                sg_class = getattr(pm, sg_model, None)
                 from Signal_function import Burst_generate
                 import Oscilloscope as oscmod
                 import rig_function
 
-                if Agilent33500 is None:
-                    raise ImportError("Agilent33500 not available")
-                sg_address = pg.get("sg_address")
-                sg = Agilent33500(sg_address) if sg_address else Agilent33500()
+                if sg_class is None:
+                    raise ImportError(f"Signal generator model '{sg_model}' not available in pymeasure.instruments.agilent")
+                sg_address = pg.get("sg_address") or self._default_sg_address
+                sg = sg_class(sg_address)
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 sock.connect((scan["host"], self._port_value()))
+                osc_retries = max(1, int(self.test_retries.value()))
+                osc_retry_delay = min(0.3, float(self.test_timeout.value()))
                 osc = oscmod.open_oscilloscope(
-                    self.osc_address_edit.text().strip() or None
+                    self.osc_address_edit.text().strip() or None,
+                    max_attempts=osc_retries,
+                    retry_delay=osc_retry_delay,
                 )
                 scan_folder = oscmod.create_scan_folder()
                 self.bridge.bc_log.emit(f"Scan folder: {scan_folder}")
@@ -4741,6 +5266,7 @@ class ScannerMainWindow(QMainWindow):
                                 dry_frequency_hz,
                                 dry_amplitude_v,
                                 dry_cycles,
+                                log_fn=self.bridge.bc_log.emit,
                             )
                         else:
                             t_one, y_one = a_scan_module.generate_test_echo(
@@ -5001,6 +5527,7 @@ class ScannerMainWindow(QMainWindow):
                 event.ignore()
                 return
             self.stop_event.set()
+        self._clear_stable_sg()
         event.accept()
 
 

@@ -1,21 +1,21 @@
 {
   "config": {
     "sg_name": "Agilent33500",
-    "sg_address": "",
-    "osc_name": "Lecroy",
-    "osc_address": "",
+    "sg_address": "USB0::2391::11015::MY52701391::0::INSTR",
+    "osc_name": "LECROY,HDO6054",
+    "osc_address": "TCPIP0::192.168.1.200::INSTR",
     "host": "192.168.1.250",
     "port": "5001",
     "sampling_rate": 1000000.0
   },
   "excitation": {
     "shape": "SIN",
-    "window_type": "Blackman-Harris",
-    "frequency": 1000000.0,
-    "amplitude": 2.0,
-    "no_of_cycles_per_pulse": 11,
-    "no_of_pulses": 5,
-    "prf": 10000.8,
+    "window_type": "Hanning",
+    "frequency": 1000.0,
+    "amplitude": 7.0,
+    "no_of_cycles_per_pulse": 20,
+    "no_of_pulses": 1,
+    "prf": 1.0,
     "start_delay_s": 0.0,
     "timing_tolerance_pct": 10.0,
     "auto_preview": true
@@ -24,21 +24,21 @@
     "X": 0.0,
     "Y": 0.0,
     "Z": 0.0,
-    "highpass_cutoff_hz": 100000.0,
+    "highpass_cutoff_hz": 10000000.0,
     "filter_order": 4,
     "sound_speed_mps": 0.0,
     "mode": "INC",
-    "dry_run": true,
+    "dry_run": false,
     "live_preview": true,
-    "average_echoes": 5
+    "average_echoes": 1
   },
   "line_b_mode": {
     "depth_axis": "X",
     "scan_axis": "Z",
     "scan_length": 20.0,
     "scan_points": 10,
-    "sound_speed_mps": 1500.0,
-    "dry_run": true,
+    "sound_speed_mps": 0.0,
+    "dry_run": false,
     "live_preview": true
   },
   "b_mode": {
@@ -56,7 +56,7 @@
     "cross_points": 2,
     "dry_run": true,
     "live_update": true,
-    "scan_type": "c_mode",
+    "scan_type": "standard",
     "c_mode_gate_start_us": 4.0,
     "c_mode_gate_width_us": 1.4,
     "c_mode_metric": "Kurtosis",

@@ -3,7 +3,11 @@ from pathlib import Path
 
 import numpy as np
 
-from Signal_function import ARB_POINTS_PER_CYCLE, _window_array
+from Signal_function import (
+    ARB_POINTS_PER_CYCLE,
+    _arb_sample_count,
+    _build_windowed_sine_waveform,
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 SETTINGS_PATH = BASE_DIR.parent / "data" / "gui_settings.json"
@@ -76,13 +80,36 @@ def generate_dummy_echo(
     cycles = max(cycles, 1.0)
     frequency = max(frequency, 1e-9)
     pulse_width_sec = cycles / frequency
-    n = max(64, int(np.ceil(pulse_width_sec * sampling)))
 
-    t = np.linspace(0.0, pulse_width_sec, n, endpoint=False)
-    carrier = np.sin(2.0 * np.pi * frequency * t)
-    window = _window_array(wtype, n)
-    excitation = amplitude * carrier * window
+    # Build a more realistic A-scan record with quiet pre-trigger space, a delayed
+    # main echo, and a weaker later reflection so the envelope is visually distinct.
+    pre_trigger_sec = 1.5 * pulse_width_sec
+    echo_delay_sec = 2.0 * pulse_width_sec
+    second_echo_delay_sec = 4.2 * pulse_width_sec
+    total_duration_sec = max(6.0 * pulse_width_sec, second_echo_delay_sec + 1.5 * pulse_width_sec)
 
-    noise = np.random.normal(0.0, float(noise_std), size=n)
-    echo = -0.5 * excitation + noise
+    n_total = max(256, int(np.ceil(total_duration_sec * sampling)))
+    t = np.linspace(0.0, total_duration_sec, n_total, endpoint=False)
+    echo = np.zeros(n_total, dtype=float)
+
+    pulse_samples = min(_arb_sample_count(cycles), n_total)
+    burst = 0.5 * amplitude * _build_windowed_sine_waveform(
+        no_of_cycles_per_pulse=cycles,
+        window_type=wtype,
+        sample_count=pulse_samples,
+    )
+
+    first_start_idx = int(round((pre_trigger_sec + echo_delay_sec) * sampling))
+    second_start_idx = int(round((pre_trigger_sec + second_echo_delay_sec) * sampling))
+
+    first_end_idx = min(first_start_idx + pulse_samples, n_total)
+    if first_end_idx > first_start_idx:
+        echo[first_start_idx:first_end_idx] += -0.7 * burst[: first_end_idx - first_start_idx]
+
+    second_end_idx = min(second_start_idx + pulse_samples, n_total)
+    if second_end_idx > second_start_idx:
+        echo[second_start_idx:second_end_idx] += -0.35 * burst[: second_end_idx - second_start_idx]
+
+    noise = np.random.normal(0.0, float(noise_std), size=n_total)
+    echo = echo + noise
     return t, echo

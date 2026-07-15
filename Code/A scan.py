@@ -3,7 +3,7 @@ import json
 from pathlib import Path
 import numpy as np
 from rig_function import send_command, enable_axis, wait_until_stopped
-from scipy.signal import butter, detrend, filtfilt, hilbert, windows
+from scipy.signal import butter, detrend, hilbert, sosfiltfilt, windows
 
 try:
     from dummy_signal_generator import generate_dummy_echo as _generate_dummy_echo
@@ -100,19 +100,24 @@ def estimate_a_mode_signal(
 
     processed = detrend(trace, type="linear")
 
-    sample_rate_hz = None
+    sample_rate_hz_from_time = None
+    if time_arr.size > 1:
+        dt = float(np.median(np.diff(time_arr)))
+        if dt > 0.0:
+            sample_rate_hz_from_time = 1.0 / dt
+
+    sample_rate_hz_from_input = None
     if sampling_rate_hz is not None:
         try:
-            sample_rate_hz = float(sampling_rate_hz)
+            sample_rate_hz_from_input = float(sampling_rate_hz)
         except Exception:
-            sample_rate_hz = None
+            sample_rate_hz_from_input = None
+
+    # Prefer the actual sample spacing from the trace when available. The passed-in
+    # UI/config sampling rate can drift from the scope's effective time axis.
+    sample_rate_hz = sample_rate_hz_from_time
     if sample_rate_hz is None or sample_rate_hz <= 0.0:
-        if time_arr.size > 1:
-            dt = float(np.median(np.diff(time_arr)))
-        else:
-            dt = 0.0
-        if dt > 0.0:
-            sample_rate_hz = 1.0 / dt
+        sample_rate_hz = sample_rate_hz_from_input
 
     if sample_rate_hz is not None and sample_rate_hz > 0.0:
         nyquist_hz = 0.5 * sample_rate_hz
@@ -123,8 +128,8 @@ def estimate_a_mode_signal(
             pass
         elif cutoff_hz < nyquist_hz and trace.size > (3 * order + 3):
             normalized_cutoff = min(cutoff_hz / nyquist_hz, 0.95)
-            b, a = butter(order, normalized_cutoff, btype="highpass")
-            processed = filtfilt(b, a, processed)
+            sos = butter(order, normalized_cutoff, btype="highpass", output="sos")
+            processed = sosfiltfilt(sos, processed)
 
     processed = processed * windows.tukey(trace.size, alpha=0.1)
     envelope = np.abs(hilbert(processed))

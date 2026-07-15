@@ -10,27 +10,95 @@ from Setup import OSC_ADDRESS, SIGNAL_PARAMS
 
 # Module-level oscilloscope handle — opened once per scan session.
 _osc = None
+_osc_address = None
 
 
-def open_oscilloscope(address=None):
+def _osc_resource_targets(address):
+    target = str(address or OSC_ADDRESS).strip()
+    candidates = [target]
+    upper_target = target.upper()
+
+    if upper_target.startswith("TCPIP") and upper_target.endswith("::INSTR"):
+        parts = target.split("::")
+        if len(parts) == 3:
+            host = parts[1]
+            candidates.append(f"TCPIP0::{host}::inst0::INSTR")
+            candidates.append(f"TCPIP::{host}::inst0::INSTR")
+            candidates.append(f"TCPIP::{host}::INSTR")
+
+    deduped = []
+    seen = set()
+    for candidate in candidates:
+        key = candidate.strip()
+        if key and key not in seen:
+            seen.add(key)
+            deduped.append(key)
+    return deduped
+
+
+def _osc_resource_managers(address):
+    target = str(address or OSC_ADDRESS).strip().upper()
+    backends = [None, "@py"] if target.startswith("TCPIP") else ["@py", None]
+
+    managers = []
+    for backend in backends:
+        try:
+            rm = pyvisa.ResourceManager() if backend is None else pyvisa.ResourceManager(backend)
+            managers.append((backend or "default", rm))
+        except Exception:
+            continue
+    return managers
+
+
+def open_oscilloscope(address=None, max_attempts=1, retry_delay=0.3, force_reopen=False):
     """Open a VISA connection to the oscilloscope and cache it on this module."""
-    global _osc
-    rm = pyvisa.ResourceManager()
+    global _osc, _osc_address
+
     target = address or OSC_ADDRESS
-    _osc = rm.open_resource(target)
-    _osc.timeout = 50000
-    return _osc
+    normalized_target = str(target).strip()
+    if _osc is not None and not force_reopen and str(_osc_address or "").strip() == normalized_target:
+        return _osc
+
+    if _osc is not None:
+        close_oscilloscope()
+
+    attempts = max(1, int(max_attempts))
+    last_error = None
+    error_messages = []
+    target_candidates = _osc_resource_targets(normalized_target)
+    managers = _osc_resource_managers(normalized_target)
+    if not managers:
+        raise RuntimeError("No VISA backend available for oscilloscope connection.")
+
+    for attempt in range(attempts):
+        for backend_name, rm in managers:
+            for candidate in target_candidates:
+                try:
+                    _osc = rm.open_resource(candidate, timeout=5000)
+                    _osc_address = normalized_target
+                    return _osc
+                except Exception as exc:
+                    last_error = exc
+                    _osc = None
+                    _osc_address = None
+                    error_messages.append(f"backend={backend_name}, target={candidate}, error={exc}")
+        if attempt < attempts - 1:
+            time.sleep(max(float(retry_delay), 0.0))
+
+    details = "; ".join(error_messages[-6:]) if error_messages else str(last_error)
+    raise RuntimeError(f"Unable to open oscilloscope at {normalized_target}. Attempts: {details}") from last_error
 
 
 def close_oscilloscope():
     """Close the cached oscilloscope handle."""
-    global _osc
+    global _osc, _osc_address
     if _osc is not None:
         try:
             _osc.close()
         except Exception:
             pass
         _osc = None
+    _osc_address = None
 
 
 def create_scan_folder():

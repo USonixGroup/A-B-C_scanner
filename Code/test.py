@@ -9,9 +9,10 @@ from const import data_dir
 import pandas as pd
 
 # ✅ Connect to signal generator
-sg = Agilent33500(SG_ADDRESS)
-print("✅ Signal generator connected:", sg.id)
+# sg = Agilent33500(SG_ADDRESS)
+# print("✅ Signal generator connected:", sg.id)
 
+OSC_ADDRESS =  "TCPIP0::192.168.1.200::INSTR"
 
 def configure_oscilloscope_for_burst(osc):
     def vbs(osc, cmd):
@@ -58,33 +59,34 @@ if __name__ == "__main__":
         print("✅ Connected to:", osc.query("*IDN?"))
         configure_oscilloscope_for_burst(osc)
         time.sleep(1)
-        Burst_generate(sg, **SIGNAL_PARAMS)
+        # Burst_generate(sg, **SIGNAL_PARAMS)
         print("Triggering signal generator...")
         time.sleep(1)
-        # osc.write("C1:WF? DAT1")
-        # raw_data = osc.query_binary_values("C1:WF? DAT1", datatype="B", container=np.array)
+        osc.write("C1:WF? DAT1")
+        raw_data = osc.query_binary_values("C1:WF? DAT1", datatype="B", container=np.array)
+        print(raw_data)
 
-        # scale = float(osc.query("C1:VDIV?").strip().split(" ")[1])
-        # v_offset = float(osc.query("C1:OFST?").strip().split(" ")[1])
-        # scale1 = 1/30
-        # voltages = ((raw_data - 128) * scale + v_offset - 128) * scale1
+        scale = float(osc.query("C1:VDIV?").strip().split(" ")[1])
+        v_offset = float(osc.query("C1:OFST?").strip().split(" ")[1])
+        scale1 = 1/30
+        voltages = ((raw_data - 128) * scale + v_offset - 128) * scale1
 
-        # time_div = float(osc.query("TDIV?").strip().split(" ")[1])
-        # num_points = len(raw_data)
-        # time_span = 10 * time_div  # 总时间范围（10格）
-        # # dt = time_span / num_points  # 每个点的时间间隔
-        # time_values = np.linspace(0, time_span, num_points, endpoint=False)
+        time_div = float(osc.query("TDIV?").strip().split(" ")[1])
+        num_points = len(raw_data)
+        time_span = 10 * time_div  # 总时间范围（10格）
+        # dt = time_span / num_points  # 每个点的时间间隔
+        time_values = np.linspace(0, time_span, num_points, endpoint=False)
 
-        # filename = f"test.csv"
-        # scan_folder = os.path.join(data_dir, 'data')
-        # file_path = os.path.join(data_dir, filename)
-        # df = pd.DataFrame({"Time (s)": time_values, "Amplitude (V)": voltages})
-        # df.to_csv(file_path, index=False)
-        # print(f"✅ Data saved to: {file_path}")
+        filename = f"test.csv"
+        scan_folder = os.path.join(data_dir, 'data')
+        file_path = os.path.join(data_dir, filename)
+        df = pd.DataFrame({"Time (s)": time_values, "Amplitude (V)": voltages})
+        df.to_csv(file_path, index=False)
+        print(f"Data saved to: {file_path}")
 
     except Exception as e:
-        print("❌ Error:", e)
+        print("Error:", e)
     finally:
         if "osc" in locals():
             osc.close()
-            print("✅ Connection closed.")
+            print("Connection closed.")
