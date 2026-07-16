@@ -301,13 +301,23 @@ class ScannerMainWindow(QMainWindow):
 
         sg_box = QGroupBox("Signal Generator")
         sg_form = QFormLayout(sg_box)
-        self.sg_name_edit = QLineEdit("Agilent33500")
-        # Use a generic VISA address as the fallback, not device-specific
-        self._default_sg_address = "USB0::INSTR"
+        self.sg_name_edit = QComboBox()
+        self.sg_name_edit.addItems(["Agilent33500", "Agilent33220A"])
+        self.sg_name_edit.setCurrentText("Agilent33500")
+        self.sg_name_edit.setStyleSheet("QComboBox { padding-right: 28px; }")
+        self._sg_model_addresses = {
+            "Agilent33500": "USB0::2391::11015::MY52701391::0::INSTR",
+            "Agilent33220A": "USB0::2391::1031::MY44023097::INSTR",
+        }
+        self._default_sg_address = self._sg_model_addresses["Agilent33500"]
         self.sg_address_edit = QLineEdit()
         self.sg_address_edit.setPlaceholderText("USB0::...::INSTR")
         sg_form.addRow("Name", self.sg_name_edit)
         sg_form.addRow("VISA Address", self.sg_address_edit)
+        self.sg_name_edit.currentIndexChanged.connect(
+            self._sync_sg_address_for_selected_model
+        )
+        self._sync_sg_address_for_selected_model()
         top.addWidget(sg_box, 0, 0)
 
         rig_box = QGroupBox("Rig")
@@ -1573,6 +1583,32 @@ class ScannerMainWindow(QMainWindow):
         combo.setStyleSheet("QComboBox { padding-right: 28px; }")
         return combo
 
+    def _selected_sg_model(self) -> str:
+        if not hasattr(self, "sg_name_edit"):
+            return "Agilent33500"
+        return str(self.sg_name_edit.currentText()).strip() or "Agilent33500"
+
+    def _sync_sg_address_for_selected_model(self, *_args) -> None:
+        model = self._selected_sg_model()
+        address = self._sg_model_addresses.get(model, self._default_sg_address)
+        self._default_sg_address = address
+        if hasattr(self, "sg_address_edit"):
+            self.sg_address_edit.setText(address)
+
+    def _resolve_sg_driver_class(self, model_name: str):
+        model = str(model_name).strip()
+        if model == "Agilent33500":
+            from pymeasure.instruments.agilent import Agilent33500
+
+            return Agilent33500
+        if model == "Agilent33220A":
+            from pymeasure.instruments.agilent import Agilent33220A
+
+            return Agilent33220A
+        raise ImportError(
+            f"Signal generator model '{model}' is not supported. Choose Agilent33500 or Agilent33220A."
+        )
+
     def _normalize_button_row(
         self, row: QHBoxLayout, buttons: list[QPushButton]
     ) -> None:
@@ -2146,10 +2182,10 @@ class ScannerMainWindow(QMainWindow):
             b_line = settings.get("line_b_mode", {})
             bc = settings.get("b_mode", settings.get("bc_mode", {}))
 
-            self.sg_address_edit.setText(
-                str(cfg.get("sg_address", self._default_sg_address))
+            self.sg_name_edit.setCurrentText(
+                str(cfg.get("sg_name", self._selected_sg_model()))
             )
-            self.sg_name_edit.setText(str(cfg.get("sg_name", self.sg_name_edit.text())))
+            self._sync_sg_address_for_selected_model()
             self.osc_name_edit.setText(
                 str(cfg.get("osc_name", self.osc_name_edit.text()))
             )
@@ -2372,7 +2408,7 @@ class ScannerMainWindow(QMainWindow):
     def _collect_settings_payload(self) -> dict:
         return {
             "config": {
-                "sg_name": self.sg_name_edit.text().strip(),
+                "sg_name": self._selected_sg_model(),
                 "sg_address": self.sg_address_edit.text().strip() or self._default_sg_address,
                 "osc_name": self.osc_name_edit.text().strip(),
                 "osc_address": self.osc_address_edit.text().strip(),
@@ -2468,7 +2504,6 @@ class ScannerMainWindow(QMainWindow):
 
     def _wire_settings_autosave(self) -> None:
         line_edits = [
-            self.sg_name_edit,
             self.sg_address_edit,
             self.osc_name_edit,
             self.osc_address_edit,
@@ -2517,6 +2552,7 @@ class ScannerMainWindow(QMainWindow):
             line_edit.textChanged.connect(self._schedule_settings_save)
 
         combos = [
+            self.sg_name_edit,
             self.tx_windowing_combo,
             self.b_depth_axis,
             self.b_scan_axis,
@@ -4000,11 +4036,8 @@ class ScannerMainWindow(QMainWindow):
 
             if not dry_run:
                 try:
-                    pm = importlib.import_module("pymeasure.instruments.agilent")
-                    sg_model = self.sg_name_edit.text().strip()
-                    sg_class = getattr(pm, sg_model, None)
-                    if sg_class is None:
-                        raise ImportError(f"Signal generator model '{sg_model}' not available in pymeasure.instruments.agilent")
+                    sg_model = self._selected_sg_model()
+                    sg_class = self._resolve_sg_driver_class(sg_model)
                     from Signal_function import Burst_generate
                     import rig_function
 
@@ -4607,8 +4640,8 @@ class ScannerMainWindow(QMainWindow):
         y_mm = self.move_y.value()
         z_mm = self.move_z.value()
         self.bridge.move_log.emit(
-            f"Requested relative move: ΔX={x_mm} mm, ΔY={y_mm} mm, ΔZ={z_mm} mm"
-        )
+                lambda text: self._append_log(self.cfg_output, text)
+            )
         threading.Thread(
             target=self._move_worker, args=(x_mm, y_mm, z_mm), daemon=True
         ).start()
@@ -4648,11 +4681,8 @@ class ScannerMainWindow(QMainWindow):
         else:
             try:
                 import importlib
-                pm = importlib.import_module("pymeasure.instruments.agilent")
-                sg_model = self.sg_name_edit.text().strip()
-                driver = getattr(pm, sg_model, None)
-                if driver is None:
-                    raise ImportError(f"Signal generator model '{sg_model}' not available in pymeasure.instruments.agilent")
+                sg_model = self._selected_sg_model()
+                driver = self._resolve_sg_driver_class(sg_model)
             except Exception as exc:
                 self.bridge.cfg_log.emit(
                     f"Signal generator: driver unavailable ({exc})"
@@ -4969,11 +4999,8 @@ class ScannerMainWindow(QMainWindow):
                 Burst_generate = None
             else:
                 try:
-                    pm = importlib.import_module("pymeasure.instruments.agilent")
-                    sg_model = self.sg_name_edit.text().strip()
-                    sg_class = getattr(pm, sg_model, None)
-                    if sg_class is None:
-                        raise ImportError(f"Signal generator model '{sg_model}' not available in pymeasure.instruments.agilent")
+                    sg_model = self._selected_sg_model()
+                    sg_class = self._resolve_sg_driver_class(sg_model)
                     from Signal_function import Burst_generate
 
                     sg_address = self.sg_address_edit.text().strip() or self._default_sg_address
@@ -5311,15 +5338,11 @@ class ScannerMainWindow(QMainWindow):
             dry_prf_hz = float(self.tx_prf.value())
 
             if not dry_run:
-                pm = importlib.import_module("pymeasure.instruments.agilent")
-                sg_model = self.sg_name_edit.text().strip()
-                sg_class = getattr(pm, sg_model, None)
+                sg_model = self._selected_sg_model()
+                sg_class = self._resolve_sg_driver_class(sg_model)
                 from Signal_function import Burst_generate
                 import Oscilloscope as oscmod
                 import rig_function
-
-                if sg_class is None:
-                    raise ImportError(f"Signal generator model '{sg_model}' not available in pymeasure.instruments.agilent")
                 sg_address = pg.get("sg_address") or self._default_sg_address
                 retries = max(1, int(self.test_retries.value()))
                 retry_delay = min(0.3, float(self.test_timeout.value()))
