@@ -132,6 +132,7 @@ class PlotCanvas(FigureCanvasQTAgg):
 class UiBridge(QObject):
     cfg_log = Signal(str)
     move_log = Signal(str)
+    saved_rig_position_ready = Signal(object)
     tx_log = Signal(str)
     a_mode_log = Signal(str)
     b_mode_log = Signal(str)
@@ -174,6 +175,9 @@ class ScannerMainWindow(QMainWindow):
         self._bc_c_mode_scanned = False
         self._bc_apply_unlocked = False
         self._last_bc_csv_path = None
+        self._saved_rig_position: tuple[int, int, int] | None = None
+        self._session_move_delta: tuple[int, int, int] = (0, 0, 0)
+        self._saved_position_lock = threading.Lock()
         self._is_loading_settings = False
         self._settings_save_timer = QTimer(self)
         self._settings_save_timer.setSingleShot(True)
@@ -193,6 +197,7 @@ class ScannerMainWindow(QMainWindow):
         self.bridge.move_log.connect(
             lambda text: self._append_log(self.move_output, text)
         )
+        self.bridge.saved_rig_position_ready.connect(self._apply_saved_rig_position)
         self.bridge.tx_log.connect(
             lambda text: self._append_log(self.transmit_output, text)
         )
@@ -332,7 +337,7 @@ class ScannerMainWindow(QMainWindow):
         connection_box = QGroupBox("Connection Test")
         controls = QHBoxLayout()
         self._normalize_control_row(controls)
-        self.test_button = QPushButton("Test Connections")
+        self.test_button = QPushButton("Connect to Hardware")
         self.test_button.clicked.connect(self.test_connections)
         self.test_button.setProperty("role", "primary")
         self.test_retries = QSpinBox()
@@ -410,7 +415,34 @@ class ScannerMainWindow(QMainWindow):
         row.addWidget(self.move_button)
         row.addStretch(1)
         left_layout.addLayout(row)
+
+        move_aux_button_style = (
+            "QPushButton { min-height: 34px; padding: 6px 12px; "
+            "background-color: #c9b1f7; color: #2d1b69; border: none; border-radius: 14px; font-weight: 600; }"
+            "QPushButton:hover { background-color: #b89ef0; }"
+            "QPushButton:pressed { background-color: #a98ae9; }"
+            "QPushButton:disabled { background-color: #e4d9fb; color: #9b8abf; }"
+        )
+
+        self.save_position_button = QPushButton("Save Current Position")
+        self.save_position_button.clicked.connect(self.save_current_position)
+        self.save_position_button.setStyleSheet(move_aux_button_style)
+        self.save_position_button.setFixedHeight(34)
+        self.save_position_button.setSizePolicy(
+            QSizePolicy.Expanding, QSizePolicy.Fixed
+        )
+
+        self.return_position_button = QPushButton("Return to Saved Position")
+        self.return_position_button.clicked.connect(self.return_to_saved_position)
+        self.return_position_button.setStyleSheet(move_aux_button_style)
+        self.return_position_button.setFixedHeight(34)
+        self.return_position_button.setSizePolicy(
+            QSizePolicy.Expanding, QSizePolicy.Fixed
+        )
+        self.return_position_button.setEnabled(False)
         left_layout.addStretch(1)
+        left_layout.addWidget(self.save_position_button)
+        left_layout.addWidget(self.return_position_button)
 
         log_box = QGroupBox("Move Log")
         log_layout = QVBoxLayout(log_box)
@@ -2132,6 +2164,21 @@ class ScannerMainWindow(QMainWindow):
             return data if isinstance(data, dict) else {}
         except Exception:
             return {}
+
+    def _apply_saved_rig_position(
+        self, payload: object
+    ) -> None:
+        position = None
+        if isinstance(payload, dict):
+            position = payload.get("position")
+        elif isinstance(payload, (list, tuple)) and len(payload) >= 1:
+            position = payload[0]
+
+        with self._saved_position_lock:
+            self._saved_rig_position = position
+            self._session_move_delta = (0, 0, 0)
+
+        self.return_position_button.setEnabled(position is not None)
 
     def _load_settings_into_ui(self) -> None:
         settings = self._load_settings_file()
@@ -4630,9 +4677,101 @@ class ScannerMainWindow(QMainWindow):
                 sock.connect((self.host_edit.text().strip(), self._port_value()))
                 self.bridge.move_log.emit("Connected to rig.")
                 rig_function.move_to_position(sock, x=x_p, y=y_p, z=z_p, log_func=self.bridge.move_log.emit)
+                with self._saved_position_lock:
+                    self._session_move_delta = tuple(
+                        int(current + delta)
+                        for current, delta in zip(self._session_move_delta, (x_p, y_p, z_p))
+                    )
                 self.bridge.move_log.emit("Move complete.")
         except Exception as exc:
             self.bridge.move_log.emit(f"Move failed: {exc}")
+
+    def save_current_position(self) -> None:
+        threading.Thread(target=self._save_current_position_worker, daemon=True).start()
+
+    def _save_current_position_worker(self) -> None:
+        try:
+            import rig_function
+
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.connect((self.host_edit.text().strip(), self._port_value()))
+                self.bridge.move_log.emit("Connected to rig.")
+                saved_samples = [rig_function.get_position(sock, axis) for axis in ("X", "Y", "Z")]
+                saved_position = tuple(int(sample[0]) for sample in saved_samples)
+                self.bridge.saved_rig_position_ready.emit(
+                    {
+                        "position": saved_position,
+                    }
+                )
+                self.bridge.move_log.emit(
+                    f"Saved current position: encoder={saved_position}"
+                )
+        except Exception as exc:
+            self.bridge.move_log.emit(f"Save position failed: {exc}")
+
+    def return_to_saved_position(self) -> None:
+        if self._saved_rig_position is None:
+            self.bridge.move_log.emit("No saved position available.")
+            return
+
+        threading.Thread(target=self._return_to_saved_position_worker, daemon=True).start()
+
+    def _return_to_saved_position_worker(self) -> None:
+        try:
+            import rig_function
+
+            with self._saved_position_lock:
+                saved_position = self._saved_rig_position
+                session_move_delta = self._session_move_delta
+
+            if saved_position is None:
+                self.bridge.move_log.emit("No saved position available.")
+                return
+
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.connect((self.host_edit.text().strip(), self._port_value()))
+                self.bridge.move_log.emit("Connected to rig.")
+
+                current_samples = [
+                    rig_function.get_position(sock, axis) for axis in ("X", "Y", "Z")
+                ]
+                current_position = tuple(int(sample[0]) for sample in current_samples)
+                current_pulse_position = tuple(int(sample[1]) for sample in current_samples)
+
+                self.bridge.move_log.emit(
+                    f"Current position before return: encoder={current_position}, pulse={current_pulse_position}"
+                )
+
+                if session_move_delta == (0, 0, 0):
+                    self.bridge.move_log.emit("Already at the saved position for this session.")
+                    return
+
+                correction = tuple(-delta for delta in session_move_delta)
+                self.bridge.move_log.emit(
+                    f"Returning by undoing session delta: ΔX={correction[0]}, ΔY={correction[1]}, ΔZ={correction[2]}"
+                )
+                rig_function.move_to_position(
+                    sock,
+                    x=correction[0],
+                    y=correction[1],
+                    z=correction[2],
+                    log_func=self.bridge.move_log.emit,
+                )
+
+                with self._saved_position_lock:
+                    self._session_move_delta = (0, 0, 0)
+
+                after_samples = [
+                    rig_function.get_position(sock, axis) for axis in ("X", "Y", "Z")
+                ]
+                after_position = tuple(int(sample[0]) for sample in after_samples)
+                after_pulse_position = tuple(int(sample[1]) for sample in after_samples)
+                self.bridge.move_log.emit(
+                    f"Current position after return: encoder={after_position}, pulse={after_pulse_position}"
+                )
+                self.bridge.move_log.emit("Returned to saved position.")
+        except Exception as exc:
+            self.bridge.move_log.emit(f"Return to saved position failed: {exc}")
 
     def test_connections(self) -> None:
         self.cfg_output.clear()
