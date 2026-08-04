@@ -6,6 +6,11 @@
     "osc_address": "TCPIP0::192.168.1.200::INSTR",
     "host": "192.168.1.250",
     "port": "5001",
+    "soft_home_pulses": {
+      "X": -49997,
+      "Y": -1,
+      "Z": 0
+    },
     "sampling_rate": 1000000.0
   },
   "excitation": {
@@ -21,9 +26,9 @@
     "auto_preview": false
   },
   "a_mode": {
-    "X": 0.9999999999999999,
-    "Y": 2.700000000000001,
-    "Z": -0.9999999999999999,
+    "X": 1.0,
+    "Y": 2.7,
+    "Z": -1.0,
     "highpass_cutoff_hz": 1000.0,
     "filter_order": 4,
     "sound_speed_mps": 0.0,
@@ -35,7 +40,7 @@
   "line_b_mode": {
     "depth_axis": "X",
     "scan_axis": "Y",
-    "scan_length": 7.000000000000011,
+    "scan_length": 7.0,
     "scan_points": 5,
     "sound_speed_mps": 0.0,
     "dry_run": false,
@@ -56,7 +61,7 @@
     "cross_points": 3,
     "dry_run": false,
     "live_update": true,
-    "scan_type": "pressure_field",
+    "scan_type": "standard",
     "c_mode_gate_start_us": 50.0,
     "c_mode_gate_width_us": 200.0,
     "c_mode_metric": "Mean",
