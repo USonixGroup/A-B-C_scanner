@@ -7,6 +7,7 @@ reusing the existing scan, motion, and acquisition backends from this project.
 from __future__ import annotations
 
 import contextlib
+import csv
 import importlib.util
 import io
 import json
@@ -68,7 +69,8 @@ MODE_LEFT_PANEL_WIDTH = 430
 B_MODE_LEFT_PANEL_WIDTH = 540
 PANEL_GAP = 14
 BASE_DIR = Path(__file__).resolve().parent
-SETTINGS_PATH = BASE_DIR.parent / "data" / "gui_settings.json"
+DATA_DIR = BASE_DIR / "data"
+SETTINGS_PATH = DATA_DIR / "gui_settings.json"
 
 
 class PlotCanvas(FigureCanvasQTAgg):
@@ -306,13 +308,21 @@ class ScannerMainWindow(QMainWindow):
 
         sg_box = QGroupBox("Signal Generator")
         sg_form = QFormLayout(sg_box)
-        self.sg_name_edit = QLineEdit("Agilent33500")
-        # Use a generic VISA address as the fallback, not device-specific
-        self._default_sg_address = "USB0::INSTR"
+        self._sg_model_to_visa = {
+            "Agilent33220A": "USB0::2391::1031::MY44055132::0::INSTR",
+            "Agilent33500B": "USB0::2391::11015::MY52701391::0::INSTR",
+            "Agilent33521A": "USB0::2391::5639::MY50004553::0::INSTR",
+        }
+        self.sg_name_edit = QComboBox()
+        self.sg_name_edit.addItems(list(self._sg_model_to_visa.keys()))
+        self.sg_name_edit.setCurrentText("Agilent33500B")
+        self.sg_name_edit.currentTextChanged.connect(self._on_sg_model_changed)
+        self._default_sg_address = self._sg_model_to_visa["Agilent33500B"]
         self.sg_address_edit = QLineEdit()
         self.sg_address_edit.setPlaceholderText("USB0::...::INSTR")
         sg_form.addRow("Name", self.sg_name_edit)
         sg_form.addRow("VISA Address", self.sg_address_edit)
+        self._on_sg_model_changed(self.sg_name_edit.currentText())
         top.addWidget(sg_box, 0, 0)
 
         rig_box = QGroupBox("Rig")
@@ -793,6 +803,9 @@ class ScannerMainWindow(QMainWindow):
         scan_form.addRow("Scan Axis 2", self.cross_axis)
         scan_form.addRow("Scan Axis 2 Length (mm)", self.cross_length)
         scan_form.addRow("Scan Axis 2 Points", self.cross_points)
+        self.bc_scan_algorithm_combo = QComboBox()
+        self.bc_scan_algorithm_combo.addItems(["Zigzag", "Raster"])
+        scan_form.addRow("Scanning Algorithm", self.bc_scan_algorithm_combo)
         self.depth_axis.setEnabled(False)
         self._sync_depth_axis_from_scan_axes()
         self.scan_axis.currentIndexChanged.connect(self._sync_depth_axis_from_scan_axes)
@@ -1680,6 +1693,43 @@ class ScannerMainWindow(QMainWindow):
         self.b_scan_axis.setCurrentText(selected_scan_axis)
         self.b_scan_axis.blockSignals(False)
 
+    def _build_3d_scan_point_plan(
+        self,
+        scan_steps: int,
+        cross_steps: int,
+        axis1_mm,
+        axis2_mm,
+        axis1_pulses,
+        axis2_pulses,
+        algorithm: str,
+    ) -> list[dict]:
+        plan: list[dict] = []
+        raster = str(algorithm).strip().lower() == "raster"
+
+        order = 1
+        for cross_idx in range(cross_steps):
+            forward_scan = raster or cross_idx % 2 == 0
+            scan_indices = (
+                range(scan_steps) if forward_scan else range(scan_steps - 1, -1, -1)
+            )
+            for scan_idx in scan_indices:
+                plan.append(
+                    {
+                        "order": order,
+                        "cross_idx": cross_idx,
+                        "scan_idx": scan_idx,
+                        "cross_point": cross_idx + 1,
+                        "scan_point": scan_idx + 1,
+                        "cross_mm": float(axis2_mm[cross_idx]),
+                        "scan_mm": float(axis1_mm[scan_idx]),
+                        "cross_pulse": int(axis2_pulses[cross_idx]),
+                        "scan_pulse": int(axis1_pulses[scan_idx]),
+                        "direction": "forward" if forward_scan else "reverse",
+                    }
+                )
+                order += 1
+        return plan
+
     def _append_log(self, widget: QPlainTextEdit, text: str) -> None:
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         if not widget.toPlainText().strip():
@@ -2193,10 +2243,18 @@ class ScannerMainWindow(QMainWindow):
             b_line = settings.get("line_b_mode", {})
             bc = settings.get("b_mode", settings.get("bc_mode", {}))
 
-            self.sg_address_edit.setText(
-                str(cfg.get("sg_address", self._default_sg_address))
+            saved_sg_name = self._normalize_sg_model_name(
+                str(cfg.get("sg_name", self.sg_name_edit.currentText()))
             )
-            self.sg_name_edit.setText(str(cfg.get("sg_name", self.sg_name_edit.text())))
+            self.sg_name_edit.setCurrentText(saved_sg_name)
+            self.sg_address_edit.setText(
+                str(
+                    cfg.get(
+                        "sg_address",
+                        self._sg_model_to_visa.get(saved_sg_name, self._default_sg_address),
+                    )
+                )
+            )
             self.osc_name_edit.setText(
                 str(cfg.get("osc_name", self.osc_name_edit.text()))
             )
@@ -2325,6 +2383,9 @@ class ScannerMainWindow(QMainWindow):
             self.cross_points.setValue(
                 int(bc.get("cross_points", self.cross_points.value()))
             )
+            self.bc_scan_algorithm_combo.setCurrentText(
+                str(bc.get("scan_algorithm", self.bc_scan_algorithm_combo.currentText()))
+            )
             self.dry_run_check.setChecked(
                 bool(bc.get("dry_run", self.dry_run_check.isChecked()))
             )
@@ -2419,7 +2480,7 @@ class ScannerMainWindow(QMainWindow):
     def _collect_settings_payload(self) -> dict:
         return {
             "config": {
-                "sg_name": self.sg_name_edit.text().strip(),
+                "sg_name": self.sg_name_edit.currentText().strip(),
                 "sg_address": self.sg_address_edit.text().strip() or self._default_sg_address,
                 "osc_name": self.osc_name_edit.text().strip(),
                 "osc_address": self.osc_address_edit.text().strip(),
@@ -2477,6 +2538,7 @@ class ScannerMainWindow(QMainWindow):
                 "scan_points": int(self.scan_points.value()),
                 "cross_length": float(self.cross_length.value()),
                 "cross_points": int(self.cross_points.value()),
+                "scan_algorithm": self.bc_scan_algorithm_combo.currentText(),
                 "dry_run": bool(self.dry_run_check.isChecked()),
                 "live_update": bool(self.live_update_check.isChecked()),
                 "scan_type": self._current_bc_scan_type(),
@@ -2515,7 +2577,6 @@ class ScannerMainWindow(QMainWindow):
 
     def _wire_settings_autosave(self) -> None:
         line_edits = [
-            self.sg_name_edit,
             self.sg_address_edit,
             self.osc_name_edit,
             self.osc_address_edit,
@@ -2564,6 +2625,7 @@ class ScannerMainWindow(QMainWindow):
             line_edit.textChanged.connect(self._schedule_settings_save)
 
         combos = [
+            self.sg_name_edit,
             self.tx_windowing_combo,
             self.b_depth_axis,
             self.b_scan_axis,
@@ -2576,6 +2638,7 @@ class ScannerMainWindow(QMainWindow):
             self.bc_pf_mode_extra_combo,
             self.bc_pf_filter_type_combo,
             self.bc_c_mode_metric_combo,
+            self.bc_scan_algorithm_combo,
         ]
         for widget in combos:
             widget.currentIndexChanged.connect(self._schedule_settings_save)
@@ -2602,6 +2665,27 @@ class ScannerMainWindow(QMainWindow):
             except ValueError:
                 continue
         return fallback
+
+    def _normalize_sg_model_name(self, model_name: str) -> str:
+        name = str(model_name).strip()
+        if not name:
+            return self.sg_name_edit.currentText().strip() or "Agilent33500B"
+        if name == "Agilent33500":
+            return "Agilent33500B"
+        if name in self._sg_model_to_visa:
+            return name
+        return self.sg_name_edit.currentText().strip() or "Agilent33500B"
+
+    def _on_sg_model_changed(self, model_name: str) -> None:
+        normalized = self._normalize_sg_model_name(model_name)
+        if normalized != model_name and self.sg_name_edit.currentText() != normalized:
+            self.sg_name_edit.blockSignals(True)
+            self.sg_name_edit.setCurrentText(normalized)
+            self.sg_name_edit.blockSignals(False)
+        if getattr(self, "_is_loading_settings", False):
+            return
+        target_visa = self._sg_model_to_visa.get(normalized, self._default_sg_address)
+        self.sg_address_edit.setText(target_visa)
 
     def _format_hz_for_log(self, value_hz: float | None) -> str:
         if value_hz is None:
@@ -2958,11 +3042,38 @@ class ScannerMainWindow(QMainWindow):
         loaded_points = 0
         missing_points = 0
 
+        manifest_index: dict[tuple[int, int], str] = {}
+        manifest_path = os.path.join(scan_folder, "point_manifest.csv")
+        if os.path.exists(manifest_path):
+            try:
+                with open(manifest_path, "r", encoding="utf-8", newline="") as mf:
+                    reader = csv.DictReader(mf)
+                    for row in reader:
+                        row_idx = int(str(row.get("row_index", "")).strip())
+                        col_idx = int(str(row.get("col_index", "")).strip())
+                        filename = str(row.get("measurement_csv", "")).strip()
+                        if row_idx > 0 and col_idx > 0 and filename:
+                            manifest_index[(row_idx, col_idx)] = filename
+            except Exception as manifest_exc:
+                self.bridge.bc_log.emit(
+                    f"Pressure-field manifest parse warning: {manifest_exc}"
+                )
+
         for axis2_idx in range(1, cross_steps + 1):
             for axis1_idx in range(1, scan_steps + 1):
-                csv_path = os.path.join(
-                    scan_folder, f"row_{axis1_idx}_col_{axis2_idx}.csv"
-                )
+                csv_name = manifest_index.get((axis2_idx, axis1_idx), "")
+                csv_path = os.path.join(scan_folder, csv_name) if csv_name else ""
+                if not csv_path or not os.path.exists(csv_path):
+                    csv_path = os.path.join(
+                        scan_folder, f"point_*_r{axis2_idx:03d}_c{axis1_idx:03d}.csv"
+                    )
+                    matches = sorted(Path(scan_folder).glob(os.path.basename(csv_path)))
+                    if matches:
+                        csv_path = str(matches[-1])
+                    else:
+                        csv_path = os.path.join(
+                            scan_folder, f"row_{axis1_idx}_col_{axis2_idx}.csv"
+                        )
                 if not os.path.exists(csv_path):
                     missing_points += 1
                     continue
@@ -3085,11 +3196,38 @@ class ScannerMainWindow(QMainWindow):
         loaded_points = 0
         missing_points = 0
 
+        manifest_index: dict[tuple[int, int], str] = {}
+        manifest_path = os.path.join(scan_folder, "point_manifest.csv")
+        if os.path.exists(manifest_path):
+            try:
+                with open(manifest_path, "r", encoding="utf-8", newline="") as mf:
+                    reader = csv.DictReader(mf)
+                    for row in reader:
+                        row_idx = int(str(row.get("row_index", "")).strip())
+                        col_idx = int(str(row.get("col_index", "")).strip())
+                        filename = str(row.get("measurement_csv", "")).strip()
+                        if row_idx > 0 and col_idx > 0 and filename:
+                            manifest_index[(row_idx, col_idx)] = filename
+            except Exception as manifest_exc:
+                self.bridge.bc_log.emit(
+                    f"C-Mode manifest parse warning: {manifest_exc}"
+                )
+
         for axis2_idx in range(1, cross_steps + 1):
             for axis1_idx in range(1, scan_steps + 1):
-                csv_path = os.path.join(
-                    scan_folder, f"row_{axis1_idx}_col_{axis2_idx}.csv"
-                )
+                csv_name = manifest_index.get((axis2_idx, axis1_idx), "")
+                csv_path = os.path.join(scan_folder, csv_name) if csv_name else ""
+                if not csv_path or not os.path.exists(csv_path):
+                    csv_path = os.path.join(
+                        scan_folder, f"point_*_r{axis2_idx:03d}_c{axis1_idx:03d}.csv"
+                    )
+                    matches = sorted(Path(scan_folder).glob(os.path.basename(csv_path)))
+                    if matches:
+                        csv_path = str(matches[-1])
+                    else:
+                        csv_path = os.path.join(
+                            scan_folder, f"row_{axis1_idx}_col_{axis2_idx}.csv"
+                        )
                 if not os.path.exists(csv_path):
                     missing_points += 1
                     continue
@@ -3698,7 +3836,7 @@ class ScannerMainWindow(QMainWindow):
         filename, _ = QFileDialog.getSaveFileName(
             self,
             "Export A-mode Matrix",
-            str(BASE_DIR.parent / "data" / "a_mode_matrix.txt"),
+            str(DATA_DIR / "a_mode_matrix.txt"),
             "Text files (*.txt);;CSV files (*.csv);;All files (*.*)",
         )
         if not filename:
@@ -3741,7 +3879,7 @@ class ScannerMainWindow(QMainWindow):
         filename, _ = QFileDialog.getSaveFileName(
             self,
             title,
-            str(BASE_DIR.parent / "data" / default_filename),
+            str(DATA_DIR / default_filename),
             "Text files (*.txt);;All files (*.*)",
         )
         if not filename:
@@ -3801,7 +3939,7 @@ class ScannerMainWindow(QMainWindow):
         filename, _ = QFileDialog.getSaveFileName(
             self,
             "Export 3D-Mode Data",
-            str(BASE_DIR.parent / "data" / suggested_name),
+            str(DATA_DIR / suggested_name),
             "CSV files (*.csv);;Text files (*.txt);;All files (*.*)",
         )
         if not filename:
@@ -3835,6 +3973,7 @@ class ScannerMainWindow(QMainWindow):
             "scan_points": int(self.scan_points.value()),
             "cross_length": float(self.cross_length.value()),
             "cross_points": int(self.cross_points.value()),
+            "scan_algorithm": self.bc_scan_algorithm_combo.currentText(),
         }
         scan_step_mm = compute_step(scan["scan_length"], scan["scan_points"])
         cross_step_mm = compute_step(scan["cross_length"], scan["cross_points"])
@@ -4048,8 +4187,13 @@ class ScannerMainWindow(QMainWindow):
             if not dry_run:
                 try:
                     pm = importlib.import_module("pymeasure.instruments.agilent")
-                    sg_model = self.sg_name_edit.text().strip()
-                    sg_class = getattr(pm, sg_model, None)
+                    sg_model = self.sg_name_edit.currentText().strip()
+                    sg_lookup = {
+                        "Agilent33500B": "Agilent33500",
+                        "Agilent33521A": "Agilent33500",
+                        "Agilent33220A": "Agilent33220A",
+                    }.get(sg_model, sg_model)
+                    sg_class = getattr(pm, sg_lookup, None)
                     if sg_class is None:
                         raise ImportError(f"Signal generator model '{sg_model}' not available in pymeasure.instruments.agilent")
                     from Signal_function import Burst_generate
@@ -4152,7 +4296,7 @@ class ScannerMainWindow(QMainWindow):
                     )
                     return
 
-                b_data_dir = BASE_DIR.parent / "data"
+                b_data_dir = DATA_DIR
                 b_data_dir.mkdir(exist_ok=True)
                 existing = [
                     d
@@ -4166,7 +4310,7 @@ class ScannerMainWindow(QMainWindow):
                 b_scan_folder.mkdir(parents=True, exist_ok=True)
             else:
                 Burst_generate = None
-                b_data_dir = BASE_DIR.parent / "data"
+                b_data_dir = DATA_DIR
                 b_data_dir.mkdir(exist_ok=True)
                 existing = [
                     d
@@ -4419,7 +4563,7 @@ class ScannerMainWindow(QMainWindow):
         filename, _ = QFileDialog.getSaveFileName(
             self,
             "Export B-mode Matrix",
-            str(BASE_DIR.parent / "data" / "b_mode_matrix.txt"),
+            str(DATA_DIR / "b_mode_matrix.txt"),
             "Text files (*.txt);;CSV files (*.csv);;All files (*.*)",
         )
         if not filename:
@@ -4788,8 +4932,13 @@ class ScannerMainWindow(QMainWindow):
             try:
                 import importlib
                 pm = importlib.import_module("pymeasure.instruments.agilent")
-                sg_model = self.sg_name_edit.text().strip()
-                driver = getattr(pm, sg_model, None)
+                sg_model = self.sg_name_edit.currentText().strip()
+                sg_lookup = {
+                    "Agilent33500B": "Agilent33500",
+                    "Agilent33521A": "Agilent33500",
+                    "Agilent33220A": "Agilent33220A",
+                }.get(sg_model, sg_model)
+                driver = getattr(pm, sg_lookup, None)
                 if driver is None:
                     raise ImportError(f"Signal generator model '{sg_model}' not available in pymeasure.instruments.agilent")
             except Exception as exc:
@@ -5109,8 +5258,13 @@ class ScannerMainWindow(QMainWindow):
             else:
                 try:
                     pm = importlib.import_module("pymeasure.instruments.agilent")
-                    sg_model = self.sg_name_edit.text().strip()
-                    sg_class = getattr(pm, sg_model, None)
+                    sg_model = self.sg_name_edit.currentText().strip()
+                    sg_lookup = {
+                        "Agilent33500B": "Agilent33500",
+                        "Agilent33521A": "Agilent33500",
+                        "Agilent33220A": "Agilent33220A",
+                    }.get(sg_model, sg_model)
+                    sg_class = getattr(pm, sg_lookup, None)
                     if sg_class is None:
                         raise ImportError(f"Signal generator model '{sg_model}' not available in pymeasure.instruments.agilent")
                     from Signal_function import Burst_generate
@@ -5220,6 +5374,57 @@ class ScannerMainWindow(QMainWindow):
                 f"signal_source={'dummy' if use_dummy else 'hardware'}"
             )
 
+            a_data_dir = DATA_DIR
+            a_data_dir.mkdir(exist_ok=True)
+            existing_runs = [
+                d
+                for d in os.listdir(a_data_dir)
+                if d.startswith("a_mode_scan_")
+                and os.path.isdir(a_data_dir / d)
+                and d.split("_")[-1].isdigit()
+            ]
+            next_run_id = max((int(d.split("_")[-1]) for d in existing_runs), default=0) + 1
+            a_scan_folder = a_data_dir / f"a_mode_scan_{next_run_id:03d}"
+            a_scan_folder.mkdir(parents=True, exist_ok=True)
+            self.bridge.a_mode_log.emit(f"A-mode run folder: {a_scan_folder}")
+
+            run_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            a_scan_metadata = {
+                "run_timestamp": run_timestamp,
+                "run_id": next_run_id,
+                "mode": params["mode"],
+                "x_mm": params["X"],
+                "y_mm": params["Y"],
+                "z_mm": params["Z"],
+                "frequency_hz": frequency,
+                "amplitude_v": amplitude,
+                "cycles_per_pulse": cycles,
+                "pulse_count": pulses,
+                "prf_hz": prf_hz,
+                "window": window_fn,
+                "sampling_rate_hz": sampling_rate,
+                "highpass_cutoff_hz": cutoff_hz,
+                "filter_order": filter_order,
+                "live_preview": live_enabled,
+                "signal_source": "dummy" if use_dummy else "hardware",
+            }
+
+            def _write_wave_csv(
+                output_path: Path,
+                time_axis: object,
+                amplitude_axis: object,
+                extra_metadata: dict | None = None,
+            ) -> None:
+                metadata = dict(a_scan_metadata)
+                if extra_metadata:
+                    metadata.update(extra_metadata)
+                with open(output_path, "w", encoding="utf-8", newline="") as csv_file:
+                    for key, value in metadata.items():
+                        csv_file.write(f"# {key}: {value}\n")
+                    writer = csv.writer(csv_file)
+                    writer.writerow(["Time_s", "Amplitude_V"])
+                    writer.writerows(zip(time_axis, amplitude_axis))
+
             # Move rig once per A-mode run in hardware mode.
             if not use_dummy:
                 x_p = module.mm_to_pulse(params["X"])
@@ -5251,6 +5456,7 @@ class ScannerMainWindow(QMainWindow):
             scope_sampling_rates = []
             self.bridge.a_mode_log.emit(f"A-mode running for {pulses} pulse(s).")
             for pulse_idx in range(1, pulses + 1):
+                scope_fs_hz = None
                 if use_dummy:
                     t, y = module.generate_test_echo(
                         frequency_hz=frequency,
@@ -5280,6 +5486,19 @@ class ScannerMainWindow(QMainWindow):
                     if scope_fs_hz is not None and scope_fs_hz > 0.0:
                         scope_sampling_rates.append(float(scope_fs_hz))
                 traces.append((t, y))
+                pulse_csv = a_scan_folder / f"a_scan_pulse_{pulse_idx:03d}.csv"
+                _write_wave_csv(
+                    pulse_csv,
+                    t,
+                    y,
+                    {
+                        "pulse_index": pulse_idx,
+                        "pulse_total": pulses,
+                        "scope_sampling_rate_hz": (
+                            float(scope_fs_hz) if scope_fs_hz is not None else "n/a"
+                        ),
+                    },
+                )
                 self.bridge.a_mode_log.emit(
                     f"Captured A-mode echo {pulse_idx}/{pulses}"
                 )
@@ -5368,6 +5587,25 @@ class ScannerMainWindow(QMainWindow):
                 }
             )
 
+            avg_csv = a_scan_folder / "a_scan_average.csv"
+            with open(avg_csv, "w", encoding="utf-8", newline="") as csv_file:
+                final_meta = dict(a_scan_metadata)
+                final_meta["effective_filter_sampling_rate_hz"] = float(
+                    filter_sampling_rate_hz
+                )
+                final_meta["effective_highpass_cutoff_hz"] = float(effective_cutoff_hz)
+                for key, value in final_meta.items():
+                    csv_file.write(f"# {key}: {value}\n")
+                writer = csv.writer(csv_file)
+                writer.writerow(
+                    ["Time_s", "Average_Detrended_Amplitude_V", "A_Mode_Envelope_V"]
+                )
+                writer.writerows(zip(t_ref, avg, a_mode_signal))
+
+            self.bridge.a_mode_log.emit(
+                f"A-mode CSV files saved in run folder: {a_scan_folder}"
+            )
+
             self.bridge.a_mode_log.emit("A-mode scan finished.")
         except Exception as exc:
             self.bridge.a_mode_log.emit(f"A-mode scan failed: {exc}")
@@ -5451,8 +5689,13 @@ class ScannerMainWindow(QMainWindow):
 
             if not dry_run:
                 pm = importlib.import_module("pymeasure.instruments.agilent")
-                sg_model = self.sg_name_edit.text().strip()
-                sg_class = getattr(pm, sg_model, None)
+                sg_model = self.sg_name_edit.currentText().strip()
+                sg_lookup = {
+                    "Agilent33500B": "Agilent33500",
+                    "Agilent33521A": "Agilent33500",
+                    "Agilent33220A": "Agilent33220A",
+                }.get(sg_model, sg_model)
+                sg_class = getattr(pm, sg_lookup, None)
                 from Signal_function import Burst_generate
                 import Oscilloscope as oscmod
                 import rig_function
@@ -5520,7 +5763,7 @@ class ScannerMainWindow(QMainWindow):
                 self.bridge.bc_log.emit("Hardware connected.")
             else:
                 # Dry-run: create scan folder directly without importing Oscilloscope
-                _data_dir = BASE_DIR.parent / "data"
+                _data_dir = DATA_DIR
                 _data_dir.mkdir(exist_ok=True)
                 _existing = [
                     d
@@ -5551,6 +5794,17 @@ class ScannerMainWindow(QMainWindow):
             axis2_mm = np.linspace(0.0, float(scan["cross_length"]), cross_steps)
             axis1_pulses = np.rint(axis1_mm * MM_TO_PULSE).astype(int)
             axis2_pulses = np.rint(axis2_mm * MM_TO_PULSE).astype(int)
+            scan_algorithm_label = str(scan.get("scan_algorithm", "Zigzag")).strip() or "Zigzag"
+            scan_algorithm = scan_algorithm_label.lower()
+            point_plan = self._build_3d_scan_point_plan(
+                scan_steps,
+                cross_steps,
+                axis1_mm,
+                axis2_mm,
+                axis1_pulses,
+                axis2_pulses,
+                scan_algorithm,
+            )
             nominal_scan_step = (
                 int(axis1_pulses[1] - axis1_pulses[0]) if scan_steps > 1 else 0
             )
@@ -5563,6 +5817,7 @@ class ScannerMainWindow(QMainWindow):
                 f"cycles/pulse={pg['no_of_cycles_per_pulse']}, pulses={pg['no_of_pulses']}, "
                 f"scan_axis={scan['scan_axis']}, cross_axis={scan['cross_axis']}, depth_axis={scan['depth_axis']}, "
                 f"scan_points={scan_steps}, cross_points={cross_steps}, "
+                f"scan_algorithm={scan_algorithm_label}, "
                 f"scan_step={nominal_scan_step}, cross_step={nominal_cross_step}"
             )
             self.bridge.bc_log.emit(
@@ -5587,9 +5842,19 @@ class ScannerMainWindow(QMainWindow):
             a_mode_signals = []  # Will store (amplitude_array) for each acquisition
             acquisition_count = 0
             live_preview = bool(self.live_update_check.isChecked())
-            total_scans = scan_steps * cross_steps
+            total_scans = len(point_plan)
             c_mode_enabled = str(scan_type).strip().lower() == "c_mode"
             pressure_field_mode = str(scan_type).strip().lower() == "pressure_field"
+            measurements_subdir = (
+                "pressure_mode_measurements"
+                if pressure_field_mode
+                else "a_mode_measurements"
+            )
+            measurements_dir = Path(scan_folder) / measurements_subdir
+            measurements_dir.mkdir(parents=True, exist_ok=True)
+            self.bridge.bc_log.emit(
+                f"3D-Mode measurement folder: {measurements_dir}"
+            )
             c_mode_signal_map = np.empty((cross_steps, scan_steps), dtype=object)
             c_mode_signal_map[:, :] = None
             c_mode_metric_map = np.full((cross_steps, scan_steps), np.nan, dtype=float)
@@ -5601,203 +5866,270 @@ class ScannerMainWindow(QMainWindow):
             a_mode_filter_order = int(self.a_mode_filter_order.value())
             current_axis1_pulse = 0
             current_axis2_pulse = 0
+            point_records: list[dict] = []
 
-            for cross in range(cross_steps):
+            current_cross_idx = None
+            for point in point_plan:
                 if self.stop_event.is_set():
                     self.bridge.bc_log.emit("Scan stopped by user.")
                     break
-                self.bridge.bc_log.emit(f"Scanning row {cross + 1}/{cross_steps}")
-                target_axis2_pulse = int(axis2_pulses[cross])
-                scan_indices = (
-                    range(scan_steps) if cross % 2 == 0 else range(scan_steps - 1, -1, -1)
-                )
-                for scan_order_idx, scan_idx in enumerate(scan_indices):
-                    if self.stop_event.is_set():
-                        break
-                    axis1_idx = scan_idx + 1
-                    axis2_idx = cross + 1
-                    target_axis1_pulse = int(axis1_pulses[scan_idx])
 
-                    if rig_function and sock:
-                        delta_axis2 = target_axis2_pulse - current_axis2_pulse
-                        if delta_axis2 != 0:
-                            rig_function.send_command(
-                                sock, f"{scan['cross_axis']}{delta_axis2}"
-                            )
-                            rig_function.wait_until_stopped(sock, scan["cross_axis"])
-                            current_axis2_pulse = target_axis2_pulse
+                cross_idx = int(point["cross_idx"])
+                scan_idx = int(point["scan_idx"])
+                axis1_idx = int(point["scan_point"])
+                axis2_idx = int(point["cross_point"])
+                target_axis1_pulse = int(point["scan_pulse"])
+                target_axis2_pulse = int(point["cross_pulse"])
+                point_order = int(point["order"])
 
-                        delta_axis1 = target_axis1_pulse - current_axis1_pulse
-                        if delta_axis1 != 0:
-                            rig_function.send_command(
-                                sock, f"{scan['scan_axis']}{delta_axis1}"
-                            )
-                            rig_function.wait_until_stopped(sock, scan["scan_axis"])
-                            current_axis1_pulse = target_axis1_pulse
+                if cross_idx != current_cross_idx:
+                    current_cross_idx = cross_idx
+                    self.bridge.bc_log.emit(
+                        f"Scanning row {axis2_idx}/{cross_steps} using {scan_algorithm_label}"
+                    )
+
+                if rig_function and sock:
+                    delta_axis2 = target_axis2_pulse - current_axis2_pulse
+                    if delta_axis2 != 0:
+                        rig_function.send_command(
+                            sock, f"{scan['cross_axis']}{delta_axis2}"
+                        )
+                        rig_function.wait_until_stopped(sock, scan["cross_axis"])
+                        current_axis2_pulse = target_axis2_pulse
+
+                    delta_axis1 = target_axis1_pulse - current_axis1_pulse
+                    if delta_axis1 != 0:
+                        rig_function.send_command(
+                            sock, f"{scan['scan_axis']}{delta_axis1}"
+                        )
+                        rig_function.wait_until_stopped(sock, scan["scan_axis"])
+                        current_axis1_pulse = target_axis1_pulse
+                else:
+                    delta_axis2 = target_axis2_pulse - current_axis2_pulse
+                    delta_axis1 = target_axis1_pulse - current_axis1_pulse
+                    if delta_axis2 != 0:
+                        self.bridge.bc_log.emit(
+                            f"[Dry-run] Move {scan['cross_axis']} {delta_axis2}"
+                        )
+                        current_axis2_pulse = target_axis2_pulse
+                    if delta_axis1 != 0:
+                        self.bridge.bc_log.emit(
+                            f"[Dry-run] Move {scan['scan_axis']} {delta_axis1}"
+                        )
+                        current_axis1_pulse = target_axis1_pulse
+
+                # --- acquire and average echoes for this point ---
+                t_acq = None
+                echo_acq = None
+                t_echoes = []
+                y_echoes = []
+                scope_sampling_rates = []
+                for pulse_idx in range(1, pulses_per_point + 1):
+                    if oscmod and osc and sg and not dry_run:
+                        Burst_generate(
+                            sg,
+                            shape="SIN",
+                            frequency=dry_frequency_hz,
+                            amplitude=dry_amplitude_v,
+                            no_of_cycles_per_pulse=dry_cycles,
+                            no_of_pulses=1,
+                            prf=dry_prf_hz,
+                            window_type=dry_window_fn,
+                        )
+                        t_one, y_one, _scope_fs_hz = self._capture_a_mode_waveform(
+                            osc,
+                            dry_frequency_hz,
+                            dry_amplitude_v,
+                            dry_cycles,
+                            log_fn=self.bridge.bc_log.emit,
+                        )
+                        if _scope_fs_hz is not None and np.isfinite(_scope_fs_hz) and _scope_fs_hz > 0.0:
+                            scope_sampling_rates.append(float(_scope_fs_hz))
                     else:
-                        delta_axis2 = target_axis2_pulse - current_axis2_pulse
-                        delta_axis1 = target_axis1_pulse - current_axis1_pulse
-                        if delta_axis2 != 0:
-                            self.bridge.bc_log.emit(
-                                f"[Dry-run] Move {scan['cross_axis']} {delta_axis2}"
-                            )
-                            current_axis2_pulse = target_axis2_pulse
-                        if delta_axis1 != 0:
-                            self.bridge.bc_log.emit(
-                                f"[Dry-run] Move {scan['scan_axis']} {delta_axis1}"
-                            )
-                            current_axis1_pulse = target_axis1_pulse
-                    # --- acquire and average echoes for this point ---
-                    t_acq = None
-                    echo_acq = None
-                    t_echoes = []
-                    y_echoes = []
-                    scope_sampling_rates = []
-                    for pulse_idx in range(1, pulses_per_point + 1):
-                        if oscmod and osc and sg and not dry_run:
-                            Burst_generate(
-                                sg,
-                                shape="SIN",
-                                frequency=dry_frequency_hz,
-                                amplitude=dry_amplitude_v,
-                                no_of_cycles_per_pulse=dry_cycles,
-                                no_of_pulses=1,
-                                prf=dry_prf_hz,
-                                window_type=dry_window_fn,
-                            )
-                            t_one, y_one, _scope_fs_hz = self._capture_a_mode_waveform(
-                                osc,
-                                dry_frequency_hz,
-                                dry_amplitude_v,
-                                dry_cycles,
-                                log_fn=self.bridge.bc_log.emit,
-                            )
-                            if _scope_fs_hz is not None and np.isfinite(_scope_fs_hz) and _scope_fs_hz > 0.0:
-                                scope_sampling_rates.append(float(_scope_fs_hz))
-                        else:
-                            t_one, y_one = a_scan_module.generate_test_echo(
-                                frequency_hz=dry_frequency_hz,
-                                amplitude_v=dry_amplitude_v,
-                                no_of_cycles_per_pulse=dry_cycles,
-                                window_type=dry_window_fn,
-                                sampling_rate_hz=sampling_rate,
-                            )
-                        t_echoes.append(np.asarray(t_one, dtype=float))
-                        y_echoes.append(np.asarray(y_one, dtype=float))
-                        self.bridge.bc_log.emit(
-                            f"Captured echo {pulse_idx}/{pulses_per_point} at row {axis1_idx}, col {axis2_idx}"
+                        t_one, y_one = a_scan_module.generate_test_echo(
+                            frequency_hz=dry_frequency_hz,
+                            amplitude_v=dry_amplitude_v,
+                            no_of_cycles_per_pulse=dry_cycles,
+                            window_type=dry_window_fn,
+                            sampling_rate_hz=sampling_rate,
                         )
+                    t_echoes.append(np.asarray(t_one, dtype=float))
+                    y_echoes.append(np.asarray(y_one, dtype=float))
+                    self.bridge.bc_log.emit(
+                        f"Captured echo {pulse_idx}/{pulses_per_point} at row {axis2_idx}, col {axis1_idx}"
+                    )
 
-                    if y_echoes:
-                        min_len = min(e.size for e in y_echoes)
-                        t_acq = t_echoes[0][:min_len]
-                        stack = np.vstack(
-                            [self._detrend_signal(e[:min_len]) for e in y_echoes]
-                        )
-                        if pulses_per_point > 1:
-                            echo_acq = np.mean(stack, axis=0)
-                        else:
-                            echo_acq = stack[0].copy()
-
-                        config_sampling_rate_hz = float(sampling_rate)
-                        if scope_sampling_rates:
-                            filter_sampling_rate_hz = float(
-                                np.median(np.asarray(scope_sampling_rates, dtype=float))
-                            )
-                            pct = (
-                                abs(filter_sampling_rate_hz - config_sampling_rate_hz)
-                                / max(config_sampling_rate_hz, 1e-12)
-                                * 100.0
-                            )
-                            self.bridge.bc_log.emit(
-                                f"3D-mode filtering: Config fs={config_sampling_rate_hz/1e6:.6f} MS/s, "
-                                f"scope measured fs={filter_sampling_rate_hz/1e6:.6f} MS/s (delta={pct:.2f}%)."
-                            )
-                        else:
-                            filter_sampling_rate_hz = config_sampling_rate_hz
-                        effective_cutoff_hz = a_mode_cutoff_hz
-                        if filter_sampling_rate_hz > 0.0:
-                            nyquist_hz = 0.5 * filter_sampling_rate_hz
-                            if a_mode_cutoff_hz >= nyquist_hz:
-                                self.bridge.bc_log.emit(
-                                    f"3D-mode filtering ERROR: cutoff={a_mode_cutoff_hz/1000.0:.3f} kHz is >= Nyquist={nyquist_hz/1000.0:.3f} kHz. High-pass filter is disabled."
-                                )
-                                self.bridge.bc_log.emit(
-                                    "3D-mode filtering note: filtering is only meaningful when cutoff is much smaller than Nyquist frequency."
-                                )
-                                effective_cutoff_hz = 0.0
-                            elif a_mode_cutoff_hz >= 0.8 * nyquist_hz:
-                                self.bridge.bc_log.emit(
-                                    f"3D-mode filtering WARNING: cutoff={a_mode_cutoff_hz/1000.0:.3f} kHz is close to Nyquist={nyquist_hz/1000.0:.3f} kHz; filtering is meaningful when cutoff is much smaller than Nyquist."
-                                )
-
-                        csv_path = os.path.join(
-                            scan_folder, f"row_{axis1_idx}_col_{axis2_idx}.csv"
-                        )
-                        with open(csv_path, "w", encoding="utf-8") as _f:
-                            _f.write("Time (s),Amplitude (V)\n")
-                            for _t, _v in zip(t_acq, echo_acq):
-                                _f.write(f"{_t:.10e},{_v:.10e}\n")
-                        self.bridge.bc_plot_csv.emit(csv_path)
-                        self.bridge.bc_log.emit(
-                            f"Saved averaged echo: row {axis1_idx}, col {axis2_idx}"
-                        )
-
-                        if c_mode_enabled:
-                            try:
-                                envelope = np.asarray(
-                                    a_scan_module.estimate_a_mode_signal(
-                                        t_acq,
-                                        echo_acq,
-                                        highpass_cutoff_hz=effective_cutoff_hz,
-                                        filter_order=a_mode_filter_order,
-                                        sampling_rate_hz=filter_sampling_rate_hz,
-                                    ),
-                                    dtype=float,
-                                )
-                                n_env = min(t_acq.size, envelope.size)
-                                t_env = np.asarray(t_acq[:n_env], dtype=float)
-                                env = np.asarray(envelope[:n_env], dtype=float)
-                                gate_end_s = c_mode_gate_start_s + c_mode_gate_width_s
-                                gate_mask = (t_env >= c_mode_gate_start_s) & (t_env <= gate_end_s)
-                                gated_env = env[gate_mask]
-                                r = axis2_idx - 1
-                                c = axis1_idx - 1
-                                c_mode_signal_map[r, c] = np.array(gated_env, copy=True)
-                                c_mode_metric_map[r, c] = self._compute_pressure_field_metric(
-                                    gated_env, c_mode_metric_name
-                                )
-                            except Exception as c_exc:
-                                self.bridge.bc_log.emit(
-                                    f"C-Mode metric failed at row {axis1_idx}, col {axis2_idx}: {c_exc}"
-                                )
-
-                        a_mode_signals.append(echo_acq)
-                        acquisition_count += 1
+                if y_echoes:
+                    min_len = min(e.size for e in y_echoes)
+                    t_acq = t_echoes[0][:min_len]
+                    stack = np.vstack(
+                        [self._detrend_signal(e[:min_len]) for e in y_echoes]
+                    )
+                    if pulses_per_point > 1:
+                        echo_acq = np.mean(stack, axis=0)
                     else:
-                        self.bridge.bc_log.emit(
-                            f"Warning: No echoes captured at row {axis1_idx}, col {axis2_idx}"
-                        )
+                        echo_acq = stack[0].copy()
 
-                    # --- live preview: emit raw signal only; renderer computes envelope ---
-                    if live_preview and t_acq is not None and echo_acq is not None:
-                        current_scan_num = cross * scan_steps + scan_order_idx + 1
-                        self.bridge.bc_preview.emit(
-                            {
-                                "t": t_acq,
-                                "raw": echo_acq,
-                                "scan_idx": current_scan_num,
-                                "total_scans": total_scans,
-                                "axis1_name": scan["scan_axis"],
-                                "axis2_name": scan["cross_axis"],
-                                "axis1_idx": axis1_idx,
-                                "axis2_idx": axis2_idx,
-                                "axis1_total": scan_steps,
-                                "axis2_total": cross_steps,
-                                "scan_type": scan_type,
-                            }
+                    config_sampling_rate_hz = float(sampling_rate)
+                    if scope_sampling_rates:
+                        filter_sampling_rate_hz = float(
+                            np.median(np.asarray(scope_sampling_rates, dtype=float))
                         )
+                        pct = (
+                            abs(filter_sampling_rate_hz - config_sampling_rate_hz)
+                            / max(config_sampling_rate_hz, 1e-12)
+                            * 100.0
+                        )
+                        self.bridge.bc_log.emit(
+                            f"3D-mode filtering: Config fs={config_sampling_rate_hz/1e6:.6f} MS/s, "
+                            f"scope measured fs={filter_sampling_rate_hz/1e6:.6f} MS/s (delta={pct:.2f}%)."
+                        )
+                    else:
+                        filter_sampling_rate_hz = config_sampling_rate_hz
+                    effective_cutoff_hz = a_mode_cutoff_hz
+                    if filter_sampling_rate_hz > 0.0:
+                        nyquist_hz = 0.5 * filter_sampling_rate_hz
+                        if a_mode_cutoff_hz >= nyquist_hz:
+                            self.bridge.bc_log.emit(
+                                f"3D-mode filtering ERROR: cutoff={a_mode_cutoff_hz/1000.0:.3f} kHz is >= Nyquist={nyquist_hz/1000.0:.3f} kHz. High-pass filter is disabled."
+                            )
+                            self.bridge.bc_log.emit(
+                                "3D-mode filtering note: filtering is only meaningful when cutoff is much smaller than Nyquist frequency."
+                            )
+                            effective_cutoff_hz = 0.0
+                        elif a_mode_cutoff_hz >= 0.8 * nyquist_hz:
+                            self.bridge.bc_log.emit(
+                                f"3D-mode filtering WARNING: cutoff={a_mode_cutoff_hz/1000.0:.3f} kHz is close to Nyquist={nyquist_hz/1000.0:.3f} kHz; filtering is meaningful when cutoff is much smaller than Nyquist."
+                            )
+
+                    csv_path = measurements_dir / (
+                        f"point_{point_order:04d}_r{axis2_idx:03d}_c{axis1_idx:03d}.csv"
+                    )
+                    with open(csv_path, "w", encoding="utf-8") as _f:
+                        _f.write(f"# algorithm: {scan_algorithm_label}\n")
+                        _f.write(f"# point_order: {point_order}\n")
+                        _f.write(f"# row_axis (Axis 2): {scan['cross_axis']}\n")
+                        _f.write(f"# column_axis (Axis 1): {scan['scan_axis']}\n")
+                        _f.write(f"# cross_point: {axis2_idx}\n")
+                        _f.write(f"# scan_point: {axis1_idx}\n")
+                        _f.write(f"# cross_mm: {point['cross_mm']:.6f}\n")
+                        _f.write(f"# scan_mm: {point['scan_mm']:.6f}\n")
+                        _f.write(f"# cross_pulse: {target_axis2_pulse}\n")
+                        _f.write(f"# scan_pulse: {target_axis1_pulse}\n")
+                        _f.write("Time (s),Amplitude (V)\n")
+                        for _t, _v in zip(t_acq, echo_acq):
+                            _f.write(f"{_t:.10e},{_v:.10e}\n")
+                    self.bridge.bc_plot_csv.emit(str(csv_path))
+                    self.bridge.bc_log.emit(
+                        f"Saved averaged echo: point {point_order}/{total_scans} (row {axis2_idx}, col {axis1_idx}, {scan_algorithm_label})"
+                    )
+
+                    point_records.append(
+                        {
+                            "point_order": point_order,
+                            "row_index": axis2_idx,
+                            "col_index": axis1_idx,
+                            "row_axis_role": "axis_2",
+                            "row_axis_name": scan["cross_axis"],
+                            "col_axis_role": "axis_1",
+                            "col_axis_name": scan["scan_axis"],
+                            "direction": point["direction"],
+                            "algorithm": scan_algorithm_label,
+                            "scan_axis": scan["scan_axis"],
+                            "cross_axis": scan["cross_axis"],
+                            "scan_mm": f"{point['scan_mm']:.9f}",
+                            "cross_mm": f"{point['cross_mm']:.9f}",
+                            "scan_pulse": target_axis1_pulse,
+                            "cross_pulse": target_axis2_pulse,
+                            "measurement_csv": str(
+                                Path(csv_path).relative_to(Path(scan_folder)).as_posix()
+                            ),
+                        }
+                    )
+
+                    if c_mode_enabled:
+                        try:
+                            envelope = np.asarray(
+                                a_scan_module.estimate_a_mode_signal(
+                                    t_acq,
+                                    echo_acq,
+                                    highpass_cutoff_hz=effective_cutoff_hz,
+                                    filter_order=a_mode_filter_order,
+                                    sampling_rate_hz=filter_sampling_rate_hz,
+                                ),
+                                dtype=float,
+                            )
+                            n_env = min(t_acq.size, envelope.size)
+                            t_env = np.asarray(t_acq[:n_env], dtype=float)
+                            env = np.asarray(envelope[:n_env], dtype=float)
+                            gate_end_s = c_mode_gate_start_s + c_mode_gate_width_s
+                            gate_mask = (t_env >= c_mode_gate_start_s) & (t_env <= gate_end_s)
+                            gated_env = env[gate_mask]
+                            r = axis2_idx - 1
+                            c = axis1_idx - 1
+                            c_mode_signal_map[r, c] = np.array(gated_env, copy=True)
+                            c_mode_metric_map[r, c] = self._compute_pressure_field_metric(
+                                gated_env, c_mode_metric_name
+                            )
+                        except Exception as c_exc:
+                            self.bridge.bc_log.emit(
+                                f"C-Mode metric failed at row {axis2_idx}, col {axis1_idx}: {c_exc}"
+                            )
+
+                    a_mode_signals.append(echo_acq)
+                    acquisition_count += 1
+                else:
+                    self.bridge.bc_log.emit(
+                        f"Warning: No echoes captured at row {axis2_idx}, col {axis1_idx}"
+                    )
+
+                # --- live preview: emit raw signal only; renderer computes envelope ---
+                if live_preview and t_acq is not None and echo_acq is not None:
+                    self.bridge.bc_preview.emit(
+                        {
+                            "t": t_acq,
+                            "raw": echo_acq,
+                            "scan_idx": point_order,
+                            "total_scans": total_scans,
+                            "axis1_name": scan["scan_axis"],
+                            "axis2_name": scan["cross_axis"],
+                            "axis1_idx": axis1_idx,
+                            "axis2_idx": axis2_idx,
+                            "axis1_total": scan_steps,
+                            "axis2_total": cross_steps,
+                            "scan_type": scan_type,
+                            "scan_algorithm": scan_algorithm_label,
+                        }
+                    )
             self.bridge.bc_log.emit("B Scan finished.")
+
+            if point_records:
+                manifest_path = os.path.join(scan_folder, "point_manifest.csv")
+                with open(manifest_path, "w", newline="", encoding="utf-8") as mf:
+                    fieldnames = [
+                        "point_order",
+                        "row_index",
+                        "col_index",
+                        "row_axis_role",
+                        "row_axis_name",
+                        "col_axis_role",
+                        "col_axis_name",
+                        "direction",
+                        "algorithm",
+                        "scan_axis",
+                        "cross_axis",
+                        "scan_mm",
+                        "cross_mm",
+                        "scan_pulse",
+                        "cross_pulse",
+                        "measurement_csv",
+                    ]
+                    writer = csv.DictWriter(mf, fieldnames=fieldnames)
+                    writer.writeheader()
+                    writer.writerows(point_records)
+                self.bridge.bc_log.emit(
+                    f"Point manifest saved: {os.path.basename(manifest_path)}"
+                )
 
             if pressure_field_mode and not self.stop_event.is_set():
                 try:
