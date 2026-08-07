@@ -71,6 +71,36 @@ PANEL_GAP = 14
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 SETTINGS_PATH = DATA_DIR / "gui_settings.json"
+LEGACY_SETTINGS_PATHS = [BASE_DIR.parent / "data" / "gui_settings.json"]
+
+
+def _read_waveform_csv(csv_path: str) -> tuple[list[float], list[float]]:
+    """Read waveform CSV files with optional metadata comment lines.
+
+    Supports files that contain leading '# key: value' rows and a textual
+    header row before numeric data.
+    """
+    x_vals: list[float] = []
+    y_vals: list[float] = []
+    with open(csv_path, "r", encoding="utf-8", newline="") as f:
+        reader = csv.reader(f)
+        for row in reader:
+            if not row:
+                continue
+            first = str(row[0]).strip()
+            if not first or first.startswith("#"):
+                continue
+            if len(row) < 2:
+                continue
+            try:
+                x = float(str(row[0]).strip())
+                y = float(str(row[1]).strip())
+            except ValueError:
+                # Skip text headers such as "Time (s),Amplitude (V)".
+                continue
+            x_vals.append(x)
+            y_vals.append(y)
+    return x_vals, y_vals
 
 
 class PlotCanvas(FigureCanvasQTAgg):
@@ -112,20 +142,23 @@ class PlotCanvas(FigureCanvasQTAgg):
 
     def plot_waveform(self, csv_path: str) -> None:
         try:
-            import pandas as pd
+            import numpy as np
 
-            df = pd.read_csv(csv_path)
-            if "Time (s)" in df.columns and "Amplitude (V)" in df.columns:
-                xcol, ycol = "Time (s)", "Amplitude (V)"
-            else:
-                xcol, ycol = df.columns[:2]
+            x_vals, y_vals = _read_waveform_csv(csv_path)
+            if not x_vals or not y_vals:
+                raise ValueError("no numeric waveform rows found")
             self.figure.clear()
             self.axes = self.figure.add_subplot(111)
             self._style_axes()
-            self.axes.plot(df[xcol], df[ycol], color="#2f80ed", linewidth=1.7)
+            self.axes.plot(
+                np.asarray(x_vals, dtype=float),
+                np.asarray(y_vals, dtype=float),
+                color="#2f80ed",
+                linewidth=1.7,
+            )
             self.axes.set_title(Path(csv_path).name, color="#1f2a37")
-            self.axes.set_xlabel(xcol, color="#415368")
-            self.axes.set_ylabel(ycol, color="#415368")
+            self.axes.set_xlabel("Time (s)", color="#415368")
+            self.axes.set_ylabel("Amplitude (V)", color="#415368")
             self.draw_idle()
         except Exception as exc:
             self.draw_placeholder(f"Plot failed: {exc}")
@@ -2206,14 +2239,44 @@ class ScannerMainWindow(QMainWindow):
         self.show_documentation()
 
     def _load_settings_file(self) -> dict:
-        if not SETTINGS_PATH.exists():
+        def _read_settings(path: Path) -> dict:
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                return data if isinstance(data, dict) else {}
+            except Exception:
+                return {}
+
+        data = _read_settings(SETTINGS_PATH) if SETTINGS_PATH.exists() else {}
+        if not data:
+            for legacy_path in LEGACY_SETTINGS_PATHS:
+                if legacy_path.exists():
+                    legacy_data = _read_settings(legacy_path)
+                    if legacy_data:
+                        return legacy_data
             return {}
-        try:
-            with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            return data if isinstance(data, dict) else {}
-        except Exception:
-            return {}
+
+        cfg = data.get("config", {}) if isinstance(data.get("config", {}), dict) else {}
+        osc_addr = str(cfg.get("osc_address", "")).strip()
+        if osc_addr:
+            return data
+
+        for legacy_path in LEGACY_SETTINGS_PATHS:
+            if not legacy_path.exists():
+                continue
+            legacy_data = _read_settings(legacy_path)
+            legacy_cfg = (
+                legacy_data.get("config", {})
+                if isinstance(legacy_data.get("config", {}), dict)
+                else {}
+            )
+            legacy_osc_addr = str(legacy_cfg.get("osc_address", "")).strip()
+            if legacy_osc_addr:
+                cfg["osc_address"] = legacy_osc_addr
+                data["config"] = cfg
+                return data
+
+        return data
 
     def _apply_saved_rig_position(
         self, payload: object
@@ -3078,7 +3141,8 @@ class ScannerMainWindow(QMainWindow):
                     missing_points += 1
                     continue
                 try:
-                    y = np.loadtxt(csv_path, delimiter=",", skiprows=1, usecols=1)
+                    _t_vals, _y_vals = _read_waveform_csv(csv_path)
+                    y = np.asarray(_y_vals, dtype=float)
                 except Exception:
                     missing_points += 1
                     continue
@@ -3232,26 +3296,17 @@ class ScannerMainWindow(QMainWindow):
                     missing_points += 1
                     continue
                 try:
-                    data = np.loadtxt(csv_path, delimiter=",", skiprows=1)
+                    t_vals, y_vals = _read_waveform_csv(csv_path)
                 except Exception:
                     missing_points += 1
                     continue
 
-                arr = np.asarray(data, dtype=float)
-                if arr.size == 0:
-                    missing_points += 1
-                    continue
-                if arr.ndim == 1:
-                    if arr.size < 2:
-                        missing_points += 1
-                        continue
-                    arr = arr.reshape(1, -1)
-                if arr.shape[1] < 2:
+                if not t_vals or not y_vals:
                     missing_points += 1
                     continue
 
-                t = np.asarray(arr[:, 0], dtype=float)
-                y = np.asarray(arr[:, 1], dtype=float)
+                t = np.asarray(t_vals, dtype=float)
+                y = np.asarray(y_vals, dtype=float)
                 if t.size == 0 or y.size == 0:
                     missing_points += 1
                     continue
