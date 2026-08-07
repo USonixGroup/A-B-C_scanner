@@ -2804,24 +2804,155 @@ class ScannerMainWindow(QMainWindow):
             self._stable_sg_address = None
         self._close_sg_handle(old)
 
+    def _to_int_or_none(self, token: str) -> int | None:
+        text = str(token).strip()
+        if not text:
+            return None
+        try:
+            if text.lower().startswith("0x"):
+                return int(text, 16)
+            return int(text, 10)
+        except Exception:
+            return None
+
+    def _build_sg_address_candidates(self, sg_address: str) -> list[str]:
+        addr = str(sg_address).strip()
+        if not addr:
+            return []
+
+        candidates: list[str] = []
+
+        def add(candidate: str) -> None:
+            normalized = str(candidate).strip()
+            if normalized and normalized not in candidates:
+                candidates.append(normalized)
+
+        add(addr)
+
+        upper_addr = addr.upper()
+        if upper_addr.endswith("::0::INSTR"):
+            add(addr[: -len("::0::INSTR")] + "::INSTR")
+        elif upper_addr.endswith("::INSTR") and not upper_addr.endswith("::0::INSTR"):
+            add(addr[: -len("::INSTR")] + "::0::INSTR")
+
+        parts = addr.split("::")
+        if len(parts) >= 5 and parts[0].upper().startswith("USB") and parts[-1].upper() == "INSTR":
+            vendor_raw = parts[1].strip()
+            product_raw = parts[2].strip()
+            serial = parts[3].strip()
+            vendor_int = self._to_int_or_none(vendor_raw)
+            product_int = self._to_int_or_none(product_raw)
+            has_interface = len(parts) >= 6 and parts[4].strip() != ""
+            interface = parts[4].strip() if has_interface else "0"
+
+            if vendor_int is not None and product_int is not None and serial:
+                vendor_hex = f"0x{vendor_int:04X}"
+                product_hex = f"0x{product_int:04X}"
+                vendor_dec = str(vendor_int)
+                product_dec = str(product_int)
+
+                add(f"{parts[0]}::{vendor_hex}::{product_hex}::{serial}::INSTR")
+                add(f"{parts[0]}::{vendor_dec}::{product_dec}::{serial}::INSTR")
+                add(f"{parts[0]}::{vendor_hex}::{product_hex}::{serial}::{interface}::INSTR")
+                add(f"{parts[0]}::{vendor_dec}::{product_dec}::{serial}::{interface}::INSTR")
+
+        return candidates
+
+    def _list_usb_visa_resources(self) -> list[str]:
+        resources: list[str] = []
+
+        def collect(resource_manager) -> None:
+            try:
+                for res in resource_manager.list_resources():
+                    text = str(res).strip()
+                    if text.upper().startswith("USB") and text not in resources:
+                        resources.append(text)
+            except Exception:
+                pass
+
+        try:
+            import pyvisa
+
+            with contextlib.suppress(Exception):
+                collect(pyvisa.ResourceManager())
+            with contextlib.suppress(Exception):
+                collect(pyvisa.ResourceManager("@py"))
+        except Exception:
+            pass
+
+        return resources
+
+    def _extract_usb_serial(self, sg_address: str) -> str | None:
+        parts = str(sg_address).strip().split("::")
+        if len(parts) >= 5 and parts[0].upper().startswith("USB"):
+            serial = parts[3].strip()
+            return serial or None
+        return None
+
+    def _augment_with_detected_usb_resource(self, sg_address: str, candidates: list[str]) -> list[str]:
+        if not str(sg_address).strip().upper().startswith("USB"):
+            return candidates
+
+        serial = self._extract_usb_serial(sg_address)
+        usb_resources = self._list_usb_visa_resources()
+        if not serial:
+            return candidates
+
+        for res in usb_resources:
+            if serial.upper() in res.upper() and res not in candidates:
+                candidates.append(res)
+        return candidates
+
+    def _resolve_sg_driver(self):
+        import importlib
+
+        pm = importlib.import_module("pymeasure.instruments.agilent")
+        sg_model = self.sg_name_edit.currentText().strip()
+        sg_lookup = {
+            "Agilent33500B": "Agilent33500",
+            "Agilent33521A": "Agilent33500",
+            "Agilent33220A": "Agilent33220A",
+        }.get(sg_model, sg_model)
+        driver = getattr(pm, sg_lookup, None)
+        if driver is None:
+            raise ImportError(
+                f"Signal generator model '{sg_model}' not available in pymeasure.instruments.agilent"
+            )
+        return driver
+
     def _acquire_cached_sg(self, sg_address: str, driver, retries: int, retry_delay: float):
         addr = str(sg_address).strip()
         stable_sg = self._get_stable_sg(addr)
         if stable_sg is not None:
             return stable_sg, False
 
+        candidates = self._build_sg_address_candidates(addr)
+        candidates = self._augment_with_detected_usb_resource(addr, candidates)
+        if not candidates:
+            candidates = [addr]
+
         last_err = None
-        for _ in range(max(1, int(retries))):
-            sg = None
-            try:
-                sg = driver(addr)
-                self._set_stable_sg(sg, addr)
-                return sg, True
-            except Exception as exc:
-                last_err = exc
-                if sg is not None:
-                    self._close_sg_handle(sg)
-                time.sleep(max(float(retry_delay), 0.0))
+        for candidate in candidates:
+            for _ in range(max(1, int(retries))):
+                sg = None
+                try:
+                    sg = driver(candidate)
+                    # Cache under the configured address so subsequent calls reuse the session.
+                    self._set_stable_sg(sg, addr)
+                    return sg, True
+                except Exception as exc:
+                    last_err = exc
+                    if sg is not None:
+                        self._close_sg_handle(sg)
+                    time.sleep(max(float(retry_delay), 0.0))
+
+        if str(addr).upper().startswith("USB"):
+            usb_resources = self._list_usb_visa_resources()
+            resources_msg = ", ".join(usb_resources) if usb_resources else "none"
+            raise RuntimeError(
+                f"Unable to open signal generator USB resource. Requested={addr}; "
+                f"tried={candidates}; detected USB VISA resources={resources_msg}; last_error={last_err}"
+            )
 
         raise last_err
 
@@ -3613,29 +3744,148 @@ class ScannerMainWindow(QMainWindow):
             raw += chunk
 
         wd_start = raw.find(b"WAVEDESC")
-        if wd_start < 0:
-            raise RuntimeError("LeCroy waveform descriptor was not found in the scope response.")
+        use_descriptor_axis = False
+        v_gain = None
+        v_off = None
+        h_int = None
+        h_off = 0.0
+        if wd_start >= 0 and len(raw) >= wd_start + 188:
+            try:
+                v_gain = float(struct.unpack("<f", raw[wd_start + 156 : wd_start + 160])[0])
+                v_off = float(struct.unpack("<f", raw[wd_start + 160 : wd_start + 164])[0])
+                h_int = float(struct.unpack("<f", raw[wd_start + 176 : wd_start + 180])[0])
+                h_off = float(struct.unpack("<d", raw[wd_start + 180 : wd_start + 188])[0])
+                use_descriptor_axis = bool(h_int and h_int > 0.0)
+            except Exception as desc_exc:
+                if callable(log_fn):
+                    log_fn(
+                        f"A-mode: WAVEDESC parse failed ({desc_exc}); falling back to SCPI timebase queries."
+                    )
+        elif callable(log_fn):
+            log_fn(
+                "A-mode: LeCroy WAVEDESC not found in response; falling back to SCPI timebase queries."
+            )
 
-        desc_len = struct.unpack("<i", raw[wd_start + 36 : wd_start + 40])[0]
-        text_len = struct.unpack("<i", raw[wd_start + 40 : wd_start + 44])[0]
-        num_points = struct.unpack("<i", raw[wd_start + 60 : wd_start + 64])[0]
-        v_gain = struct.unpack("<f", raw[wd_start + 156 : wd_start + 160])[0]
-        v_off = struct.unpack("<f", raw[wd_start + 160 : wd_start + 164])[0]
-        h_int = struct.unpack("<f", raw[wd_start + 176 : wd_start + 180])[0]
-        h_off = struct.unpack("<d", raw[wd_start + 180 : wd_start + 188])[0]
+        def _read_word_block_with_prefix_tolerance(command: str):
+            osc.write(command)
+            raw_resp = b""
+            for _ in range(6):
+                try:
+                    chunk = osc.read_raw()
+                except Exception:
+                    break
+                if not chunk:
+                    break
+                raw_resp += chunk
+                if b"#" in raw_resp:
+                    break
 
-        raw_data = osc.query_binary_values(
-            "C1:WF? DAT1", datatype="h", container=np.array
-        )
-        volts = (raw_data * v_gain) - v_off
+            hash_idx = raw_resp.find(b"#")
+            if hash_idx < 0:
+                preview = raw_resp[:80]
+                raise RuntimeError(
+                    "Scope binary block header not found in response to C1:WF? DAT1; "
+                    f"response begins with {preview!r}"
+                )
+
+            if hash_idx > 0 and callable(log_fn):
+                prefix = raw_resp[:hash_idx].decode("ascii", errors="ignore").strip()
+                if prefix:
+                    log_fn(f"A-mode: Scope preamble before binary block: {prefix}")
+
+            if hash_idx + 2 > len(raw_resp):
+                raise RuntimeError("Incomplete scope binary header (#N) received.")
+            n_digits_byte = raw_resp[hash_idx + 1 : hash_idx + 2]
+            if not n_digits_byte.isdigit():
+                raise RuntimeError(
+                    f"Invalid scope binary header after '#': {n_digits_byte!r}"
+                )
+            n_digits = int(n_digits_byte.decode("ascii"))
+
+            len_start = hash_idx + 2
+            len_end = len_start + n_digits
+            while len(raw_resp) < len_end:
+                try:
+                    chunk = osc.read_raw()
+                except Exception:
+                    chunk = b""
+                if not chunk:
+                    break
+                raw_resp += chunk
+
+            if len(raw_resp) < len_end:
+                raise RuntimeError("Incomplete scope binary length field received.")
+
+            payload_len_token = raw_resp[len_start:len_end]
+            if not payload_len_token.isdigit():
+                raise RuntimeError(
+                    f"Invalid scope payload length token: {payload_len_token!r}"
+                )
+            payload_len = int(payload_len_token.decode("ascii"))
+
+            payload_start = len_end
+            payload_end = payload_start + payload_len
+            while len(raw_resp) < payload_end:
+                try:
+                    chunk = osc.read_raw()
+                except Exception:
+                    chunk = b""
+                if not chunk:
+                    break
+                raw_resp += chunk
+
+            if len(raw_resp) < payload_end:
+                raise RuntimeError(
+                    f"Incomplete scope payload: expected {payload_len} bytes, got {max(len(raw_resp) - payload_start, 0)}"
+                )
+
+            payload = raw_resp[payload_start:payload_end]
+            if len(payload) % 2 == 1:
+                payload = payload[:-1]
+            if not payload:
+                raise RuntimeError("Scope payload is empty after parsing binary block.")
+
+            return np.frombuffer(payload, dtype="<i2")
+
+        raw_data = _read_word_block_with_prefix_tolerance("C1:WF? DAT1")
         num_points = len(raw_data)
-        t = np.arange(num_points, dtype=float) * h_int + h_off
+        if num_points <= 0:
+            raise RuntimeError("Oscilloscope returned zero waveform points.")
+
+        if v_gain is not None and v_off is not None:
+            volts = (raw_data * v_gain) - v_off
+        else:
+            v_div = self._extract_last_float(
+                str(osc.query("C1:VDIV?")).strip(), max(float(amplitude), 0.01)
+            )
+            v_offset = self._extract_last_float(
+                str(osc.query("C1:OFST?")).strip(), 0.0
+            )
+            volts = (raw_data.astype(float) * (v_div * 8.0 / 65536.0)) - v_offset
+
+        if use_descriptor_axis:
+            t = np.arange(num_points, dtype=float) * h_int + h_off
+        else:
+            t_div = self._extract_last_float(
+                str(osc.query("TDIV?")).strip(), max(burst_duration / 10.0, 1e-9)
+            )
+            h_off = self._extract_last_float(
+                str(osc.query("TRDL?")).strip(), 0.0
+            )
+            time_span = max(t_div * 10.0, 1e-12)
+            h_int = time_span / float(num_points)
+            t = np.arange(num_points, dtype=float) * h_int + h_off
+
         actual_sampling_rate = 1.0 / h_int if h_int > 0.0 else float("nan")
 
         if callable(log_fn):
             log_fn(
                 f"Scope waveform axis: points={num_points}, xzero={h_off:.9e} s, xincrement={h_int:.9e} s"
             )
+            if not use_descriptor_axis:
+                log_fn(
+                    "A-mode: Axis reconstructed from TDIV/TRDL fallback (descriptor unavailable)."
+                )
 
         if callable(log_fn):
             req_msps = sampling_rate / 1e6
@@ -4985,17 +5235,7 @@ class ScannerMainWindow(QMainWindow):
             self.bridge.cfg_log.emit("Signal generator: No address configured")
         else:
             try:
-                import importlib
-                pm = importlib.import_module("pymeasure.instruments.agilent")
-                sg_model = self.sg_name_edit.currentText().strip()
-                sg_lookup = {
-                    "Agilent33500B": "Agilent33500",
-                    "Agilent33521A": "Agilent33500",
-                    "Agilent33220A": "Agilent33220A",
-                }.get(sg_model, sg_model)
-                driver = getattr(pm, sg_lookup, None)
-                if driver is None:
-                    raise ImportError(f"Signal generator model '{sg_model}' not available in pymeasure.instruments.agilent")
+                driver = self._resolve_sg_driver()
             except Exception as exc:
                 self.bridge.cfg_log.emit(
                     f"Signal generator: driver unavailable ({exc})"
@@ -5103,6 +5343,7 @@ class ScannerMainWindow(QMainWindow):
             sg_address = self.sg_address_edit.text().strip() or self._default_sg_address
             retries = max(1, int(self.test_retries.value()))
             timeout = float(self.test_timeout.value())
+            driver = self._resolve_sg_driver()
 
             with self._sg_use_lock:
                 stable = self._get_stable_sg(sg_address)
@@ -5111,19 +5352,13 @@ class ScannerMainWindow(QMainWindow):
                     close_after_use = False
                     self.bridge.tx_log.emit("Connected to signal generator (stable cached session).")
                 else:
-                    last_err = None
-                    for _ in range(retries):
-                        try:
-                            sg = module.connect_signal_generator(sg_address)
-                            last_err = None
-                            break
-                        except Exception as conn_exc:
-                            last_err = conn_exc
-                            time.sleep(min(0.3, timeout))
-                    if sg is None:
-                        raise RuntimeError(
-                            f"Unable to connect to signal generator at {sg_address}: {last_err}"
-                        )
+                    sg, _opened_now = self._acquire_cached_sg(
+                        sg_address,
+                        driver=driver,
+                        retries=retries,
+                        retry_delay=min(0.3, timeout),
+                    )
+                    close_after_use = False
                     self.bridge.tx_log.emit("Connected to signal generator.")
 
             shape = "SIN"
@@ -5218,6 +5453,9 @@ class ScannerMainWindow(QMainWindow):
             hw_sampling_rate = self._format_hz_for_log(generation["sampling_rate_hz"])
 
             sg_address = self.sg_address_edit.text().strip() or self._default_sg_address
+            retries = max(1, int(self.test_retries.value()))
+            timeout = float(self.test_timeout.value())
+            driver = self._resolve_sg_driver()
             with self._sg_use_lock:
                 stable = self._get_stable_sg(sg_address)
                 if stable is not None:
@@ -5225,7 +5463,13 @@ class ScannerMainWindow(QMainWindow):
                     close_after_use = False
                     self.bridge.tx_log.emit("Timing test: connected to signal generator (stable cached session).")
                 else:
-                    sg = module.connect_signal_generator(sg_address)
+                    sg, _opened_now = self._acquire_cached_sg(
+                        sg_address,
+                        driver=driver,
+                        retries=retries,
+                        retry_delay=min(0.3, timeout),
+                    )
+                    close_after_use = False
                     self.bridge.tx_log.emit("Timing test: connected to signal generator.")
             self.bridge.tx_log.emit(
                 f"Timing test settings: shape={shape}, window={window_fn}, frequency={frequency_khz} kHz, "
