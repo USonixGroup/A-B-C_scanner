@@ -70,8 +70,8 @@ B_MODE_LEFT_PANEL_WIDTH = 540
 PANEL_GAP = 14
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
-SETTINGS_PATH = DATA_DIR / "gui_settings.json"
-LEGACY_SETTINGS_PATHS = [BASE_DIR.parent / "data" / "gui_settings.json"]
+SETTINGS_DIR = BASE_DIR / "settings"
+SETTINGS_PATH = SETTINGS_DIR / "gui_settings.json"
 
 
 def _read_waveform_csv(csv_path: str) -> tuple[list[float], list[float]]:
@@ -1278,14 +1278,18 @@ class ScannerMainWindow(QMainWindow):
         scan_form = QFormLayout(scan_box)
         self.b_depth_axis = self._make_axis_combo("X")
         self.b_scan_axis = self._make_axis_combo("Z")
-        self.b_scan_length = self._make_double_spin(0.1, 10000, 20.0)
+        self.b_scan_length = self._make_double_spin(-10000.0, 10000.0, 20.0)
         self.b_scan_points = self._make_spin(1, 10000, 5)
         self.b_sound_speed = self._make_double_spin(0.0, 20000.0, 1500.0)
         self.b_sound_speed.setSingleStep(1.0)
         self.b_sound_speed.setDecimals(0)
+        self.b_sound_speed.valueChanged.connect(self._on_b_mode_sound_speed_changed)
         scan_form.addRow("Depth Axis", self.b_depth_axis)
         scan_form.addRow("Scan Axis", self.b_scan_axis)
         scan_form.addRow("Scan Length (mm)", self.b_scan_length)
+        scan_form.addRow(
+            QLabel('<span style="color:#c23b3b; font-size:9pt;">Negative length scans in the negative axis direction.</span>')
+        )
         scan_form.addRow("Scan Points", self.b_scan_points)
         speed_label = QLabel(
             'Speed of Sound (m/s)<br><span style="color:#c23b3b; font-size:9pt;">0 = use time in \\mu s</span>'
@@ -2247,36 +2251,7 @@ class ScannerMainWindow(QMainWindow):
             except Exception:
                 return {}
 
-        data = _read_settings(SETTINGS_PATH) if SETTINGS_PATH.exists() else {}
-        if not data:
-            for legacy_path in LEGACY_SETTINGS_PATHS:
-                if legacy_path.exists():
-                    legacy_data = _read_settings(legacy_path)
-                    if legacy_data:
-                        return legacy_data
-            return {}
-
-        cfg = data.get("config", {}) if isinstance(data.get("config", {}), dict) else {}
-        osc_addr = str(cfg.get("osc_address", "")).strip()
-        if osc_addr:
-            return data
-
-        for legacy_path in LEGACY_SETTINGS_PATHS:
-            if not legacy_path.exists():
-                continue
-            legacy_data = _read_settings(legacy_path)
-            legacy_cfg = (
-                legacy_data.get("config", {})
-                if isinstance(legacy_data.get("config", {}), dict)
-                else {}
-            )
-            legacy_osc_addr = str(legacy_cfg.get("osc_address", "")).strip()
-            if legacy_osc_addr:
-                cfg["osc_address"] = legacy_osc_addr
-                data["config"] = cfg
-                return data
-
-        return data
+        return _read_settings(SETTINGS_PATH) if SETTINGS_PATH.exists() else {}
 
     def _apply_saved_rig_position(
         self, payload: object
@@ -2625,7 +2600,7 @@ class ScannerMainWindow(QMainWindow):
             return
         payload = self._collect_settings_payload()
         try:
-            SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
             temp_path = SETTINGS_PATH.with_suffix(".tmp")
             with open(temp_path, "w", encoding="utf-8") as f:
                 json.dump(payload, f, indent=2)
@@ -3682,6 +3657,8 @@ class ScannerMainWindow(QMainWindow):
     ):
         import numpy as np
 
+        
+
         burst_duration = max(float(cycles) / max(float(frequency), 1e-12), 1e-9)
         sampling_rate = max(
             (
@@ -3717,7 +3694,7 @@ class ScannerMainWindow(QMainWindow):
             vbs(f"app.Acquisition.C1.VerScale = {ver_scale}")
             vbs(f"app.Acquisition.Horizontal.SampleRate = {sampling_rate}")
             vbs("app.Acquisition.C1.View = true")
-            vbs('app.Acquisition.Trigger.Source = "C1"')
+            vbs('app.Acquisition.Trigger.Source = "EXT"')
             osc.write("TRIG_MODE NORM")
             self._scope_capture_config_handle_id = id(osc)
             self._scope_capture_config_signature = capture_signature
@@ -3767,85 +3744,121 @@ class ScannerMainWindow(QMainWindow):
             )
 
         def _read_word_block_with_prefix_tolerance(command: str):
-            osc.write(command)
-            raw_resp = b""
-            for _ in range(6):
-                try:
-                    chunk = osc.read_raw()
-                except Exception:
+            last_raw_resp = b""
+            last_error = None
+
+            for attempt in range(3):
+                if attempt > 0:
+                    # Re-assert comm format after warning-only replies before retrying.
+                    with contextlib.suppress(Exception):
+                        osc.write("*CLS")
+                    with contextlib.suppress(Exception):
+                        osc.write("COMM_HEADER OFF")
+                    with contextlib.suppress(Exception):
+                        osc.write("COMM_FORMAT DEF9,WORD,BIN")
+                    time.sleep(0.15)
+
+                osc.write(command)
+                raw_resp = b""
+                for _ in range(12):
+                    try:
+                        chunk = osc.read_raw()
+                    except Exception:
+                        break
+                    if not chunk:
+                        break
+                    raw_resp += chunk
+                    if b"#" in raw_resp:
+                        break
+
+                last_raw_resp = raw_resp
+                hash_idx = raw_resp.find(b"#")
+                if hash_idx < 0:
+                    upper_msg = raw_resp.upper()
+                    if (
+                        b"CURRENT REMOTE CONTROL INTERFACE" in upper_msg
+                        and attempt < 2
+                    ):
+                        if callable(log_fn):
+                            warning_text = raw_resp.decode("ascii", errors="ignore").strip()
+                            log_fn(
+                                "A-mode: Scope returned remote-interface warning; retrying waveform fetch."
+                                + (f" Message: {warning_text}" if warning_text else "")
+                            )
+                        continue
+                    preview = raw_resp[:120]
+                    last_error = RuntimeError(
+                        "Scope binary block header not found in response to C1:WF? DAT1; "
+                        f"response begins with {preview!r}"
+                    )
                     break
-                if not chunk:
-                    break
-                raw_resp += chunk
-                if b"#" in raw_resp:
-                    break
 
-            hash_idx = raw_resp.find(b"#")
-            if hash_idx < 0:
-                preview = raw_resp[:80]
-                raise RuntimeError(
-                    "Scope binary block header not found in response to C1:WF? DAT1; "
-                    f"response begins with {preview!r}"
-                )
+                if hash_idx > 0 and callable(log_fn):
+                    prefix = raw_resp[:hash_idx].decode("ascii", errors="ignore").strip()
+                    if prefix:
+                        log_fn(f"A-mode: Scope preamble before binary block: {prefix}")
 
-            if hash_idx > 0 and callable(log_fn):
-                prefix = raw_resp[:hash_idx].decode("ascii", errors="ignore").strip()
-                if prefix:
-                    log_fn(f"A-mode: Scope preamble before binary block: {prefix}")
+                if hash_idx + 2 > len(raw_resp):
+                    raise RuntimeError("Incomplete scope binary header (#N) received.")
+                n_digits_byte = raw_resp[hash_idx + 1 : hash_idx + 2]
+                if not n_digits_byte.isdigit():
+                    raise RuntimeError(
+                        f"Invalid scope binary header after '#': {n_digits_byte!r}"
+                    )
+                n_digits = int(n_digits_byte.decode("ascii"))
 
-            if hash_idx + 2 > len(raw_resp):
-                raise RuntimeError("Incomplete scope binary header (#N) received.")
-            n_digits_byte = raw_resp[hash_idx + 1 : hash_idx + 2]
-            if not n_digits_byte.isdigit():
-                raise RuntimeError(
-                    f"Invalid scope binary header after '#': {n_digits_byte!r}"
-                )
-            n_digits = int(n_digits_byte.decode("ascii"))
+                len_start = hash_idx + 2
+                len_end = len_start + n_digits
+                while len(raw_resp) < len_end:
+                    try:
+                        chunk = osc.read_raw()
+                    except Exception:
+                        chunk = b""
+                    if not chunk:
+                        break
+                    raw_resp += chunk
 
-            len_start = hash_idx + 2
-            len_end = len_start + n_digits
-            while len(raw_resp) < len_end:
-                try:
-                    chunk = osc.read_raw()
-                except Exception:
-                    chunk = b""
-                if not chunk:
-                    break
-                raw_resp += chunk
+                if len(raw_resp) < len_end:
+                    raise RuntimeError("Incomplete scope binary length field received.")
 
-            if len(raw_resp) < len_end:
-                raise RuntimeError("Incomplete scope binary length field received.")
+                payload_len_token = raw_resp[len_start:len_end]
+                if not payload_len_token.isdigit():
+                    raise RuntimeError(
+                        f"Invalid scope payload length token: {payload_len_token!r}"
+                    )
+                payload_len = int(payload_len_token.decode("ascii"))
 
-            payload_len_token = raw_resp[len_start:len_end]
-            if not payload_len_token.isdigit():
-                raise RuntimeError(
-                    f"Invalid scope payload length token: {payload_len_token!r}"
-                )
-            payload_len = int(payload_len_token.decode("ascii"))
+                payload_start = len_end
+                payload_end = payload_start + payload_len
+                while len(raw_resp) < payload_end:
+                    try:
+                        chunk = osc.read_raw()
+                    except Exception:
+                        chunk = b""
+                    if not chunk:
+                        break
+                    raw_resp += chunk
 
-            payload_start = len_end
-            payload_end = payload_start + payload_len
-            while len(raw_resp) < payload_end:
-                try:
-                    chunk = osc.read_raw()
-                except Exception:
-                    chunk = b""
-                if not chunk:
-                    break
-                raw_resp += chunk
+                if len(raw_resp) < payload_end:
+                    raise RuntimeError(
+                        f"Incomplete scope payload: expected {payload_len} bytes, got {max(len(raw_resp) - payload_start, 0)}"
+                    )
 
-            if len(raw_resp) < payload_end:
-                raise RuntimeError(
-                    f"Incomplete scope payload: expected {payload_len} bytes, got {max(len(raw_resp) - payload_start, 0)}"
-                )
+                payload = raw_resp[payload_start:payload_end]
+                if len(payload) % 2 == 1:
+                    payload = payload[:-1]
+                if not payload:
+                    raise RuntimeError("Scope payload is empty after parsing binary block.")
 
-            payload = raw_resp[payload_start:payload_end]
-            if len(payload) % 2 == 1:
-                payload = payload[:-1]
-            if not payload:
-                raise RuntimeError("Scope payload is empty after parsing binary block.")
+                return np.frombuffer(payload, dtype="<i2")
 
-            return np.frombuffer(payload, dtype="<i2")
+            if last_error is not None:
+                raise last_error
+            preview = last_raw_resp[:120]
+            raise RuntimeError(
+                "Scope binary block header not found in response to C1:WF? DAT1; "
+                f"response begins with {preview!r}"
+            )
 
         raw_data = _read_word_block_with_prefix_tolerance("C1:WF? DAT1")
         num_points = len(raw_data)
@@ -3904,6 +3917,36 @@ class ScannerMainWindow(QMainWindow):
                 )
 
         return t, volts, actual_sampling_rate
+
+    def _flush_scope_before_scan(self, osc, log_fn=None) -> None:
+        """Force a fresh trigger state before a new scan run.
+
+        This helps avoid reusing old on-screen/captured waveforms when
+        the scope remains armed from a previous run.
+        """
+        if osc is None:
+            return
+        try:
+            with contextlib.suppress(Exception):
+                osc.write("*CLS")
+            with contextlib.suppress(Exception):
+                osc.write("TRIG_MODE AUTO")
+            time.sleep(0.15)
+            with contextlib.suppress(Exception):
+                osc.write("TRIG_MODE NORM")
+            # Keep flush non-invasive: do not STOP/ARM or drain raw transport bytes,
+            # as that can interfere with the subsequent acquisition trigger sequence.
+            time.sleep(0.05)
+
+            self._scope_capture_config_handle_id = None
+            self._scope_capture_config_signature = None
+            if callable(log_fn):
+                log_fn(
+                    "Scope pre-scan flush complete (non-invasive TRIG_MODE AUTO -> NORM)."
+                )
+        except Exception as exc:
+            if callable(log_fn):
+                log_fn(f"Scope pre-scan flush skipped ({exc}).")
 
     def _render_a_mode_preview(self, payload: dict) -> None:
         import numpy as np
@@ -4055,6 +4098,25 @@ class ScannerMainWindow(QMainWindow):
         try:
             import importlib.util
             import numpy as np
+
+            if self._a_mode_last_results.get("mode") == "live":
+                t_live = np.asarray(self._a_mode_last_results.get("t", []), dtype=float)
+                y_live = np.asarray(self._a_mode_last_results.get("y", []), dtype=float)
+                if t_live.size == 0 or y_live.size == 0:
+                    return
+                self.bridge.a_preview.emit(
+                    {
+                        "mode": "live",
+                        "t": t_live,
+                        "y": y_live,
+                        "pulse_idx": int(self._a_mode_last_results.get("pulse_idx", 1)),
+                        "pulse_total": int(self._a_mode_last_results.get("pulse_total", 1)),
+                    }
+                )
+                self.bridge.a_mode_log.emit(
+                    f"A-mode axis updated using speed of sound = {float(self.a_mode_sound_speed.value()):.1f} m/s"
+                )
+                return
 
             script_path = BASE_DIR / "A scan.py"
             spec = importlib.util.spec_from_file_location("a_scan", script_path)
@@ -4297,8 +4359,74 @@ class ScannerMainWindow(QMainWindow):
             "sound_speed_mps": float(self.b_sound_speed.value()),
         }
         step_mm = compute_step(params["scan_length"], params["scan_points"])
-        params["scan_step"] = max(1, int(round(step_mm * MM_TO_PULSE)))
+        raw_step_pulses = int(round(step_mm * MM_TO_PULSE))
+        if raw_step_pulses == 0 and float(params["scan_length"]) != 0.0:
+            raw_step_pulses = 1 if float(params["scan_length"]) > 0.0 else -1
+        params["scan_step"] = raw_step_pulses
         return params
+
+    def _compute_b_mode_x_axis(self, time_axis) -> tuple[object, str]:
+        import numpy as np
+
+        t = np.asarray(time_axis, dtype=float)
+        sound_speed_mps = float(self.b_sound_speed.value())
+        if sound_speed_mps > 0.0:
+            return sound_speed_mps * t * 1000.0, "Depth (mm)"
+        return t * 1_000_000.0, r"Time ($\mu$s)"
+
+    def _on_b_mode_sound_speed_changed(self, _value: float) -> None:
+        if not self._b_mode_last_results:
+            return
+
+        time_axis = self._b_mode_last_results.get("time_axis")
+        scan_mm = self._b_mode_last_results.get("scan_mm")
+        image = self._b_mode_last_results.get("image")
+        if time_axis is None or scan_mm is None or image is None:
+            return
+
+        x_axis, x_label = self._compute_b_mode_x_axis(time_axis)
+        self._b_mode_last_results["x_axis"] = x_axis
+        self._b_mode_last_results["x_label"] = x_label
+
+        normalized = self._b_mode_last_results.get("image_normalized")
+        normalized_display = bool(
+            self._b_mode_last_results.get("normalized_display", False)
+        )
+        display_image = (
+            normalized
+            if normalized_display and normalized is not None
+            else self._b_mode_last_results.get("image_original", image)
+        )
+        if display_image is None:
+            display_image = image
+
+        mode = (
+            "b_image_live"
+            if (not self.b_start_button.isEnabled())
+            and bool(self._b_mode_last_results.get("live_enabled", False))
+            else "b_image_final"
+        )
+
+        self.bridge.b_preview.emit(
+            {
+                "mode": mode,
+                "x_axis": x_axis,
+                "x_label": x_label,
+                "scan_mm": scan_mm,
+                "image": display_image,
+                "normalized_display": normalized_display,
+                "can_toggle_normalize": normalized is not None,
+                "pulse_idx": int(self._b_mode_last_results.get("pulse_idx", 1)),
+                "pulse_total": int(self._b_mode_last_results.get("pulse_total", 1)),
+                "live_enabled": bool(
+                    self._b_mode_last_results.get("live_enabled", False)
+                ),
+            }
+        )
+
+        self.bridge.b_mode_log.emit(
+            f"B-Mode axis updated using speed of sound = {float(self.b_sound_speed.value()):.1f} m/s"
+        )
 
     def _on_b_mode_normalize_toggled(self, value: int) -> None:
         if not self._b_mode_last_results:
@@ -4574,6 +4702,11 @@ class ScannerMainWindow(QMainWindow):
                             f"B-Mode: Oscilloscope connected, but *IDN? failed: {idn_exc}"
                         )
 
+                    self._flush_scope_before_scan(
+                        osc,
+                        log_fn=self.bridge.b_mode_log.emit,
+                    )
+
                     rig_host = params["host"]
                     rig_port = params["port"]
                     self.bridge.b_mode_log.emit(
@@ -4630,11 +4763,16 @@ class ScannerMainWindow(QMainWindow):
 
             self.bridge.b_mode_log.emit(
                 f"B-Mode settings: scan_axis={params['scan_axis']}, depth_axis={params['depth_axis']}, "
-                f"scan_points={points}, scan_step={scan_step}, sound_speed={sound_speed_mps} m/s, "
+                f"scan_length={params['scan_length']} mm, scan_points={points}, scan_step={scan_step} pulses, sound_speed={sound_speed_mps} m/s, "
                 f"dry_run={dry_run}, live_preview={live_enabled}, "
                 f"echo_averages={pulses_per_point}, "
                 f"line_period={period_sec:.6f} s"
             )
+
+            if points > 1 and scan_step == 0:
+                self.bridge.b_mode_log.emit(
+                    "B-Mode note: scan length resolves to 0 pulse step; all captures will be at the same rig position."
+                )
 
             scan_mm = np.linspace(0.0, float(params["scan_length"]), points)
             x_axis = None
@@ -4754,10 +4892,7 @@ class ScannerMainWindow(QMainWindow):
                 env_axis = env_axis[:n]
 
                 if x_axis is None:
-                    if sound_speed_mps > 0:
-                        x_axis = sound_speed_mps * t_axis * 1000.0
-                    else:
-                        x_axis = t_axis * 1_000_000.0
+                    x_axis, x_label = self._compute_b_mode_x_axis(t_axis)
                     b_image = np.full((points, x_axis.size), np.nan, dtype=float)
 
                 n_use = min(x_axis.size, env_axis.size)
@@ -4765,6 +4900,19 @@ class ScannerMainWindow(QMainWindow):
                 self.bridge.b_mode_log.emit(f"Captured B-mode point {idx}/{points}")
 
                 if live_enabled and x_axis is not None and b_image is not None:
+                    self._b_mode_last_results = {
+                        "time_axis": t_axis,
+                        "x_axis": x_axis,
+                        "x_label": x_label,
+                        "scan_mm": scan_mm,
+                        "image": np.array(b_image, copy=True),
+                        "image_original": np.array(b_image, copy=True),
+                        "image_normalized": None,
+                        "live_enabled": live_enabled,
+                        "normalized_display": False,
+                        "pulse_idx": idx,
+                        "pulse_total": points,
+                    }
                     self.bridge.b_preview.emit(
                         {
                             "mode": "b_image_live",
@@ -4778,7 +4926,7 @@ class ScannerMainWindow(QMainWindow):
                         }
                     )
 
-                if idx < points and not dry_run and rig_function and motion_sock:
+                if idx < points and not dry_run and rig_function and motion_sock and scan_step != 0:
                     rig_function.send_command(
                         motion_sock, f"{params['scan_axis']}{scan_step}"
                     )
@@ -4817,6 +4965,7 @@ class ScannerMainWindow(QMainWindow):
                 )
 
             self._b_mode_last_results = {
+                "time_axis": t_axis,
                 "x_axis": x_axis,
                 "x_label": x_label,
                 "scan_mm": scan_mm,
@@ -4825,6 +4974,7 @@ class ScannerMainWindow(QMainWindow):
                 "image_normalized": normalized_image,
                 "live_enabled": live_enabled,
                 "normalized_display": False,
+                "pulse_idx": points,
                 "pulse_total": points,
             }
             self.bridge.b_preview.emit(
@@ -5631,6 +5781,11 @@ class ScannerMainWindow(QMainWindow):
                         self.bridge.a_mode_log.emit(f"A-mode: Oscilloscope connected ({idn})")
                     except Exception as idn_exc:
                         self.bridge.a_mode_log.emit(f"A-mode: Oscilloscope connected, but *IDN? failed: {idn_exc}")
+
+                    self._flush_scope_before_scan(
+                        osc,
+                        log_fn=self.bridge.a_mode_log.emit,
+                    )
                 except Exception as hw_exc:
                     self.bridge.a_mode_log.emit(
                         "A-mode hardware not detected and Dry Run is off. "
@@ -5803,6 +5958,15 @@ class ScannerMainWindow(QMainWindow):
                 )
 
                 if live_enabled:
+                    self._a_mode_last_results = {
+                        "mode": "live",
+                        "t": np.asarray(t, dtype=float),
+                        "y": np.asarray(y, dtype=float),
+                        "pulse_idx": pulse_idx,
+                        "pulse_total": pulses,
+                        "live_enabled": live_enabled,
+                        "use_dummy": use_dummy,
+                    }
                     self.bridge.a_preview.emit(
                         {
                             "mode": "live",
@@ -5865,6 +6029,7 @@ class ScannerMainWindow(QMainWindow):
                 sampling_rate_hz=filter_sampling_rate_hz,
             )
             self._a_mode_last_results = {
+                "mode": "final",
                 "t": t_ref,
                 "traces": stack,
                 "avg": avg,
@@ -5985,6 +6150,7 @@ class ScannerMainWindow(QMainWindow):
             dry_window_fn = self.tx_windowing_combo.currentText()
             pulses_per_point = max(1, int(self.tx_pulses.value()))
             dry_prf_hz = float(self.tx_prf.value())
+            pulse_width_sec = dry_cycles / max(dry_frequency_hz, 1e-12)
 
             if not dry_run:
                 pm = importlib.import_module("pymeasure.instruments.agilent")
@@ -6057,6 +6223,10 @@ class ScannerMainWindow(QMainWindow):
                     self.bridge.bc_log.emit(
                         f"3D-Mode: Opened and cached oscilloscope connection at {osc_address}."
                     )
+                self._flush_scope_before_scan(
+                    osc,
+                    log_fn=self.bridge.bc_log.emit,
+                )
                 scan_folder = oscmod.create_scan_folder()
                 self.bridge.bc_log.emit(f"Scan folder: {scan_folder}")
                 self.bridge.bc_log.emit("Hardware connected.")
@@ -6186,6 +6356,31 @@ class ScannerMainWindow(QMainWindow):
                     self.bridge.bc_log.emit(
                         f"Scanning row {axis2_idx}/{cross_steps} using {scan_algorithm_label}"
                     )
+
+                    # Raster rows should always start from the first scan-axis point.
+                    # Re-anchor to row start to prevent endpoint drift accumulating line-to-line.
+                    if scan_algorithm == "raster" and scan_idx == 0:
+                        row_start_pulse = int(axis1_pulses[0]) if scan_steps > 0 else 0
+                        if rig_function and sock:
+                            # Use the scan-relative tracker here; mixing absolute PP values
+                            # with scan-relative targets can break raster flyback direction.
+                            row_reset_delta = row_start_pulse - current_axis1_pulse
+                            if row_reset_delta != 0:
+                                rig_function.send_command(
+                                    sock, f"{scan['scan_axis']}{row_reset_delta}"
+                                )
+                                rig_function.wait_until_stopped(sock, scan["scan_axis"])
+                                current_axis1_pulse = row_start_pulse
+                                self.bridge.bc_log.emit(
+                                    f"Raster flyback complete on {scan['scan_axis']}: moved {row_reset_delta} pulse(s) to row start."
+                                )
+                        else:
+                            row_reset_delta = row_start_pulse - current_axis1_pulse
+                            if row_reset_delta != 0:
+                                self.bridge.bc_log.emit(
+                                    f"[Dry-run] Raster row start align {scan['scan_axis']} {row_reset_delta}"
+                                )
+                                current_axis1_pulse = row_start_pulse
 
                 if rig_function and sock:
                     delta_axis2 = target_axis2_pulse - current_axis2_pulse
@@ -6400,6 +6595,11 @@ class ScannerMainWindow(QMainWindow):
                             "scan_algorithm": scan_algorithm_label,
                         }
                     )
+
+                # Hold the point until the last pulse has fully completed so the
+                # next move cannot overlap the current excitation.
+                if not dry_run and pulse_width_sec > 0.0:
+                    time.sleep(pulse_width_sec)
             self.bridge.bc_log.emit("B Scan finished.")
 
             if point_records:

@@ -139,7 +139,7 @@ def configure_oscilloscope_for_burst(osc, params):
     vbs(f"app.Acquisition.Horizontal.SampleRate = {sampling_rate}")
     vbs("app.Acquisition.C1.Offset = 0")
     vbs("app.Acquisition.C1.View = true")
-    vbs('app.Acquisition.Trigger.Source = "C1"')
+    vbs('app.Acquisition.Trigger.Source = "EXT"')
     osc.write("TRIG_MODE NORM")
 
 
