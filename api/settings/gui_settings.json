@@ -57,7 +57,7 @@
     "scan_algorithm": "Zigzag",
     "dry_run": false,
     "live_update": true,
-    "scan_type": "pressure_field",
+    "scan_type": "standard",
     "c_mode_gate_start_us": 10.0,
     "c_mode_gate_width_us": 0.7,
     "c_mode_metric": "Mean",

@@ -1,10 +1,8 @@
-A/B-Scanner GUI (Code/gui_main.py)
+A/B/C-Scanner GUI (api/gui_main.py)
 ===================================
 
-Legacy scripts have been moved to `Code/legacy files/`.
-
-This file implements a simple Tkinter GUI (A/B-Scanner) to collect pulse
-generator arguments and scanning parameters and then run an A/B scan.
+This file implements a user-friendly Tkinter GUI to collect pulse
+generator arguments and scanning parameters and then run an A/B/C scan.
 
 How to run
 ----------
@@ -12,7 +10,7 @@ How to run
 From the repository root run:
 
 ```bash
-python3 -m Code.gui_main
+python3 api/gui_main.py
 ```
 
 Notes and caveats
@@ -34,7 +32,7 @@ Optional runtime dependencies
   - `tkinterweb` — embed HTML/Plotly output directly inside the Tk window
   - `pymeasure`, `pyvisa` — instrument drivers used when running real hardware scans
 
-If these are missing the GUI will still run; some features will fallback or be disabled with a friendly message.
+If these are missing the GUI will still run; some features will fallback or be disabled with a warning/error message.
 
 Open-source / License
 ---------------------
