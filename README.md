@@ -14,10 +14,9 @@ The software supports:
 
 | Item | Value |
 | --- | --- |
-| GitHub release | **Unreleased** — no GitHub release or version tag has been published yet |
-| Main-branch version | **main@8b089f2** |
-| Main-branch commit | [`8b089f28e747a760e27b85275c479c162de33d80`](https://github.com/USonixGroup/A-B-C_scanner/commit/8b089f28e747a760e27b85275c479c162de33d80) |
-| Main-branch commit date | 5 October 2025 |
+| GitHub release | **Release 1** |
+| Main-branch version | **v1.0.0** |
+| Main-branch release date | August 2026 |
 
 These values describe the current published `main` branch on GitHub. Development branches or local working copies may contain newer changes. Once a tagged release is published, the release tag should replace the commit-based version throughout the application and documentation.
 
@@ -181,7 +180,6 @@ api/
   settings/                Persisted application settings
   docs/                    Additional generated/notebook documentation
 data/                      Scan output created at runtime
-Code/                      Legacy code and example acquisition data
 command/                   Hardware command notes
 environment.yml            Conda environment definition
 requirements.txt           pip dependencies

@@ -75,11 +75,11 @@ DATA_DIR = PROJECT_ROOT / "data"
 SETTINGS_DIR = API_ROOT / "settings"
 SETTINGS_PATH = SETTINGS_DIR / "gui_settings.json"
 
-# Published repository state. GitHub currently has no tagged release; this
-# identifies the authoritative commit on the default (main) branch.
-APP_RELEASE = "Unreleased"
-APP_VERSION = "main@8b089f2"
-APP_VERSION_DATE = "5 October 2025"
+# Published repository state.
+APP_TAG = "v1.0.0"
+APP_RELEASE = "Release 1"
+APP_VERSION = "v1.0.0"
+APP_VERSION_DATE = "August 2026"
 PROJECT_URL = "https://github.com/USonixGroup/A-B-C_scanner"
 
 
@@ -2205,7 +2205,8 @@ class ScannerMainWindow(QMainWindow):
                 layout = QVBoxLayout(self)
                 label = QLabel(
                     "<h2>A/B/C Ultrasound Scanner</h2>"
-                    f"<p><b>Release:</b> {APP_RELEASE}<br>"
+                    f"<p><b>Tag:</b> {APP_TAG}<br>"
+                    f"<b>Release:</b> {APP_RELEASE}<br>"
                     f"<b>Version:</b> {APP_VERSION}<br>"
                     f"<b>Main-branch date:</b> {APP_VERSION_DATE}</p>"
                     "<p>Developed by Anqi Yang and Reza Haqshenas at the "
