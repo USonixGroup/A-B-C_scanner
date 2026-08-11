@@ -1,0 +1,23 @@
+cff-version: 1.2.0
+message: >-
+  If you use this software, its source code, or this repository in research,
+  please cite it using the metadata below and acknowledge the UCL Ultrasonics
+  Group, UCL Mechanical Engineering.
+title: A/B/C Ultrasound Scanner
+type: software
+version: main@8b089f2
+authors:
+  - name: UCL Ultrasonics Group, UCL Mechanical Engineering
+repository-code: https://github.com/USonixGroup/A-B-C_scanner
+url: https://github.com/USonixGroup/A-B-C_scanner
+license: Apache-2.0
+copyright: UCL Ultrasonics Group, UCL Mechanical Engineering
+
+preferred-citation:
+  type: software
+  title: A/B/C Ultrasound Scanner
+  version: main@8b089f2
+  authors:
+    - name: UCL Ultrasonics Group, UCL Mechanical Engineering
+  year: 2026
+  url: https://github.com/USonixGroup/A-B-C_scanner

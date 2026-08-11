@@ -1,0 +1,18 @@
+A/B/C Ultrasound Scanner
+Copyright 2026 UCL Ultrasonics Group, UCL Mechanical Engineering
+
+This product is developed and maintained by the UCL Ultrasonics Group,
+Department of Mechanical Engineering, University College London (UCL).
+
+Redistributions must retain this attribution notice in accordance with
+Section 4(d) of the Apache License, Version 2.0.
+
+If this software, its source code, or this repository contributes to a
+publication, presentation, thesis, report, dataset, or other research output,
+please cite the software using the citation metadata in CITATION.cff and
+acknowledge:
+
+  UCL Ultrasonics Group, UCL Mechanical Engineering
+
+Project repository:
+https://github.com/USonixGroup/A-B-C_scanner
