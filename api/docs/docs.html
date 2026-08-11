@@ -7796,499 +7796,443 @@ a.anchor-link {
 <!-- End of mermaid configuration --></head>
 <body class="jp-Notebook" data-jp-theme-light="true" data-jp-theme-name="JupyterLab Light">
 <main>
-<div class="jp-Cell jp-MarkdownCell jp-Notebook-cell" id="cell-id=20c66ed3">
+<div class="jp-Cell jp-MarkdownCell jp-Notebook-cell" id="cell-id=overview">
 <div class="jp-Cell-inputWrapper" tabindex="0">
 <div class="jp-Collapser jp-InputCollapser jp-Cell-inputCollapser">
 </div>
 <div class="jp-InputArea jp-Cell-inputArea"><div class="jp-RenderedHTMLCommon jp-RenderedMarkdown jp-MarkdownOutput" data-mime-type="text/markdown">
-<h1 id="Software-Documentation:-Ultrasound-Scanning-System">Software Documentation: Ultrasound Scanning System<a class="anchor-link" href="#Software-Documentation:-Ultrasound-Scanning-System">¶</a></h1><p>This document provides a comprehensive technical overview of the Ultrasound Scanning GUI, including tab functions, parameter tables, and the mathematical foundations of the system.</p>
+<h1 id="A/B/C-Ultrasound-Scanner-%E2%80%94-GUI-Documentation">A/B/C Ultrasound Scanner — GUI Documentation<a class="anchor-link" href="#A/B/C-Ultrasound-Scanner-%E2%80%94-GUI-Documentation">¶</a></h1><p>This document describes the software developed by the UCL Ultrasonics Group for ultrasound scanning. The software coordinates a three-axis positioning rig, a signal generator, and an oscilloscope for ultrasound pulse-echo or -transmission acquisition and acoustic pressure-field measurements.</p>
+<p>The GUI provides configuration, manual motion, excitation control, single-point A-mode acquisition, linear B-mode acquisition, and planar 3D acquisition with C-mode or pressure-field post-processing. The main files for the GUI application are <code>api/gui_main.py</code> and <code>api/src/pyside_gui.py</code>.</p>
+<p><strong>Release:</strong> Unreleased (the GitHub repository currently has no published releases or tags)<br/>
+<strong>Version:</strong> <code>main@8b089f2</code><br/>
+<strong>Main-branch commit:</strong> <a href="https://github.com/USonixGroup/A-B-C_scanner/commit/8b089f28e747a760e27b85275c479c162de33d80"><code>8b089f28e747a760e27b85275c479c162de33d80</code></a>, dated 5 October 2025</p>
+<p>These identifiers describe the published GitHub <code>main</code> branch. A development branch or local working copy may contain newer changes.</p>
+<blockquote>
+<p><strong>Hardware safety:</strong> The application can move motorised axes and enable an electrical output. Verify travel limits, axis directions, clearances, instrument addresses, excitation amplitude, and pulse timing before a real scan. Use <strong>Dry Run</strong> when validating a workflow.</p>
+</blockquote>
 </div>
 </div>
 </div>
 </div>
-<div class="jp-Cell jp-MarkdownCell jp-Notebook-cell" id="cell-id=2cbd7f41">
+<div class="jp-Cell jp-MarkdownCell jp-Notebook-cell" id="cell-id=launch-workflow">
 <div class="jp-Cell-inputWrapper" tabindex="0">
 <div class="jp-Collapser jp-InputCollapser jp-Cell-inputCollapser">
 </div>
 <div class="jp-InputArea jp-Cell-inputArea"><div class="jp-RenderedHTMLCommon jp-RenderedMarkdown jp-MarkdownOutput" data-mime-type="text/markdown">
-<h2 id="Step-1:-Config-Tab">Step 1: Config Tab<a class="anchor-link" href="#Step-1:-Config-Tab">¶</a></h2><p><strong>Purpose:</strong></p>
-<p>Configure hardware and system-wide settings before scanning. This includes device selection, communication parameters, and global calibration values.</p>
-<table>
-<thead>
-<tr>
-<th>Parameter Name</th>
-<th>Description</th>
-<th>Default Value</th>
-<th>Acceptable Range</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td>Device Port</td>
-<td>Serial port for hardware connection</td>
-<td>COM3</td>
-<td>Any valid serial port</td>
-</tr>
-<tr>
-<td>Baud Rate</td>
-<td>Communication speed (baud)</td>
-<td>115200</td>
-<td>9600 – 921600</td>
-</tr>
-<tr>
-<td>Calibration Factor</td>
-<td>System gain calibration</td>
-<td>1.0</td>
-<td>0.1 – 10.0</td>
-</tr>
-<tr>
-<td>Save Directory</td>
-<td>Folder for saving scan data</td>
-<td>./data</td>
-<td>Any valid path</td>
-</tr>
-</tbody>
-</table>
-</div>
-</div>
-</div>
-</div>
-<div class="jp-Cell jp-MarkdownCell jp-Notebook-cell" id="cell-id=9bd380a0">
-<div class="jp-Cell-inputWrapper" tabindex="0">
-<div class="jp-Collapser jp-InputCollapser jp-Cell-inputCollapser">
-</div>
-<div class="jp-InputArea jp-Cell-inputArea"><div class="jp-RenderedHTMLCommon jp-RenderedMarkdown jp-MarkdownOutput" data-mime-type="text/markdown">
-<h2 id="Step-2:-Move-Tab">Step 2: Move Tab<a class="anchor-link" href="#Step-2:-Move-Tab">¶</a></h2><p><strong>Purpose:</strong></p>
-<p>Manually control the scanning rig's position. Useful for setup, calibration, and moving to the desired starting point.</p>
-<table>
-<thead>
-<tr>
-<th>Parameter Name</th>
-<th>Description</th>
-<th>Default Value</th>
-<th>Acceptable Range</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td>X Position</td>
-<td>Current X-axis position (mm)</td>
-<td>0.0</td>
-<td>Hardware limits</td>
-</tr>
-<tr>
-<td>Y Position</td>
-<td>Current Y-axis position (mm)</td>
-<td>0.0</td>
-<td>Hardware limits</td>
-</tr>
-<tr>
-<td>Z Position</td>
-<td>Current Z-axis position (mm)</td>
-<td>0.0</td>
-<td>Hardware limits</td>
-</tr>
-<tr>
-<td>Step Size</td>
-<td>Increment for manual moves (mm)</td>
-<td>1.0</td>
-<td>0.01 – 10.0</td>
-</tr>
-<tr>
-<td>Home All</td>
-<td>Return all axes to home position</td>
-<td>-</td>
-<td>-</td>
-</tr>
-</tbody>
-</table>
-</div>
-</div>
-</div>
-</div>
-<div class="jp-Cell jp-MarkdownCell jp-Notebook-cell" id="cell-id=d0e05ea4">
-<div class="jp-Cell-inputWrapper" tabindex="0">
-<div class="jp-Collapser jp-InputCollapser jp-Cell-inputCollapser">
-</div>
-<div class="jp-InputArea jp-Cell-inputArea"><div class="jp-RenderedHTMLCommon jp-RenderedMarkdown jp-MarkdownOutput" data-mime-type="text/markdown">
-<h2 id="Step-3:-Pulses-Tab">Step 3: Pulses Tab<a class="anchor-link" href="#Step-3:-Pulses-Tab">¶</a></h2><p><strong>Purpose:</strong></p>
-<p>Define and configure the ultrasound pulse sequence, including timing, number of pulses, and preview/transmit options.</p>
-<table>
-<thead>
-<tr>
-<th>Parameter Name</th>
-<th>Description</th>
-<th>Default Value</th>
-<th>Acceptable Range</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td>Pulse Count</td>
-<td>Number of pulses per scan point</td>
-<td>1</td>
-<td>1 – 1000</td>
-</tr>
-<tr>
-<td>PRF (Hz)</td>
-<td>Pulse Repetition Frequency</td>
-<td>100</td>
-<td>1 – 10000</td>
-</tr>
-<tr>
-<td>Pulse Width (μs)</td>
-<td>Duration of each pulse</td>
-<td>1.0</td>
-<td>0.1 – 100.0</td>
-</tr>
-<tr>
-<td>Amplitude (V)</td>
-<td>Output voltage amplitude</td>
-<td>5.0</td>
-<td>0.1 – 100.0</td>
-</tr>
-<tr>
-<td>Preview</td>
-<td>Visualize pulse before transmission</td>
-<td>-</td>
-<td>-</td>
-</tr>
-</tbody>
-</table>
-</div>
-</div>
-</div>
-</div>
-<div class="jp-Cell jp-MarkdownCell jp-Notebook-cell" id="cell-id=4b9b5afa">
-<div class="jp-Cell-inputWrapper" tabindex="0">
-<div class="jp-Collapser jp-InputCollapser jp-Cell-inputCollapser">
-</div>
-<div class="jp-InputArea jp-Cell-inputArea"><div class="jp-RenderedHTMLCommon jp-RenderedMarkdown jp-MarkdownOutput" data-mime-type="text/markdown">
-<h2 id="Step-4:-A-Mode-Tab">Step 4: A-Mode Tab<a class="anchor-link" href="#Step-4:-A-Mode-Tab">¶</a></h2><p><strong>Purpose:</strong></p>
-<p>Configure signal processing for A-Scan (single-point) measurements. These settings directly affect B-Mode and 3D-Mode calculations, as A-Mode processing is used as a basis for further imaging.</p>
-<table>
-<thead>
-<tr>
-<th>Parameter Name</th>
-<th>Description</th>
-<th>Default Value</th>
-<th>Acceptable Range</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td>Averaging</td>
-<td>Number of A-Scans to average</td>
-<td>4</td>
-<td>1 – 128</td>
-</tr>
-<tr>
-<td>Detrend</td>
-<td>Remove DC offset from signal</td>
-<td>Enabled</td>
-<td>Enabled/Disabled</td>
-</tr>
-<tr>
-<td>Filtering</td>
-<td>Apply bandpass filter</td>
-<td>Enabled</td>
-<td>Enabled/Disabled</td>
-</tr>
-<tr>
-<td>Filter Low (MHz)</td>
-<td>Low cutoff frequency</td>
-<td>1.0</td>
-<td>0.1 – 10.0</td>
-</tr>
-<tr>
-<td>Filter High (MHz)</td>
-<td>High cutoff frequency</td>
-<td>5.0</td>
-<td>0.1 – 20.0</td>
-</tr>
-<tr>
-<td>Tukey Window</td>
-<td>Windowing parameter for edge smoothing</td>
-<td>0.25</td>
-<td>0.0 – 1.0</td>
-</tr>
-<tr>
-<td>Hilbert Transform</td>
-<td>Envelope extraction for amplitude analysis</td>
-<td>Enabled</td>
-<td>Enabled/Disabled</td>
-</tr>
-</tbody>
-</table>
-<p><strong>Note:</strong></p>
-<p>A-Mode settings (Averaging, Filtering, Tukey Window, Hilbert Transform) are used in B-Mode and 3D-Mode for envelope extraction, noise reduction, and feature enhancement. Adjust these parameters to optimize image quality in subsequent modes.</p>
-</div>
-</div>
-</div>
-</div>
-<div class="jp-Cell jp-MarkdownCell jp-Notebook-cell" id="cell-id=764135db">
-<div class="jp-Cell-inputWrapper" tabindex="0">
-<div class="jp-Collapser jp-InputCollapser jp-Cell-inputCollapser">
-</div>
-<div class="jp-InputArea jp-Cell-inputArea"><div class="jp-RenderedHTMLCommon jp-RenderedMarkdown jp-MarkdownOutput" data-mime-type="text/markdown">
-<h2 id="Step-5:-B-Mode-Tab">Step 5: B-Mode Tab<a class="anchor-link" href="#Step-5:-B-Mode-Tab">¶</a></h2><p><strong>Purpose:</strong></p>
-<p>Configure and visualize 2D cross-sectional images (B-Scans) using A-Mode data at each scan point.</p>
-<table>
-<thead>
-<tr>
-<th>Parameter Name</th>
-<th>Description</th>
-<th>Default Value</th>
-<th>Acceptable Range</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td>Scan Area (mm²)</td>
-<td>Area to scan (X × Y)</td>
-<td>10 × 10</td>
-<td>Hardware limits</td>
-</tr>
-<tr>
-<td>Step Size (mm)</td>
-<td>Distance between scan points</td>
-<td>0.5</td>
-<td>0.01 – 10.0</td>
-</tr>
-<tr>
-<td>Colormap</td>
-<td>Color mapping for image display</td>
-<td>Gray</td>
-<td>Gray, Viridis, etc.</td>
-</tr>
-<tr>
-<td>Metric</td>
-<td>Feature to display (e.g., peak, mean)</td>
-<td>Peak</td>
-<td>Peak, Mean, RMS, etc.</td>
-</tr>
-<tr>
-<td>Save Image</td>
-<td>Save B-Mode image to disk</td>
-<td>-</td>
-<td>-</td>
-</tr>
-</tbody>
-</table>
-</div>
-</div>
-</div>
-</div>
-<div class="jp-Cell jp-MarkdownCell jp-Notebook-cell" id="cell-id=dd0d0176">
-<div class="jp-Cell-inputWrapper" tabindex="0">
-<div class="jp-Collapser jp-InputCollapser jp-Cell-inputCollapser">
-</div>
-<div class="jp-InputArea jp-Cell-inputArea"><div class="jp-RenderedHTMLCommon jp-RenderedMarkdown jp-MarkdownOutput" data-mime-type="text/markdown">
-<h2 id="Step-6:-3D-Mode-Tab">Step 6: 3D-Mode Tab<a class="anchor-link" href="#Step-6:-3D-Mode-Tab">¶</a></h2><p><strong>Purpose:</strong></p>
-<p>Configure and visualize volumetric (3D) scans by stacking B-Mode slices or using A-Mode data at each 3D grid point.</p>
-<table>
-<thead>
-<tr>
-<th>Parameter Name</th>
-<th>Description</th>
-<th>Default Value</th>
-<th>Acceptable Range</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td>X Range (mm)</td>
-<td>Range of X-axis for 3D scan</td>
-<td>0 – 10</td>
-<td>Hardware limits</td>
-</tr>
-<tr>
-<td>Y Range (mm)</td>
-<td>Range of Y-axis for 3D scan</td>
-<td>0 – 10</td>
-<td>Hardware limits</td>
-</tr>
-<tr>
-<td>Z Range (mm)</td>
-<td>Range of Z-axis for 3D scan</td>
-<td>0 – 10</td>
-<td>Hardware limits</td>
-</tr>
-<tr>
-<td>Step Size (mm)</td>
-<td>Distance between 3D grid points</td>
-<td>1.0</td>
-<td>0.01 – 10.0</td>
-</tr>
-<tr>
-<td>Post-Processing</td>
-<td>Apply A-Mode/B-Mode processing to 3D data</td>
-<td>Enabled</td>
-<td>Enabled/Disabled</td>
-</tr>
-<tr>
-<td>Save Volume</td>
-<td>Save 3D data to disk</td>
-<td>-</td>
-<td>-</td>
-</tr>
-</tbody>
-</table>
-</div>
-</div>
-</div>
-</div>
-<div class="jp-Cell jp-MarkdownCell jp-Notebook-cell" id="cell-id=4a292796">
-<div class="jp-Cell-inputWrapper" tabindex="0">
-<div class="jp-Collapser jp-InputCollapser jp-Cell-inputCollapser">
-</div>
-<div class="jp-InputArea jp-Cell-inputArea"><div class="jp-RenderedHTMLCommon jp-RenderedMarkdown jp-MarkdownOutput" data-mime-type="text/markdown">
-<h2 id="Step-7:-Mathematics-&amp;-Formulations">Step 7: Mathematics &amp; Formulations<a class="anchor-link" href="#Step-7:-Mathematics-&amp;-Formulations">¶</a></h2><h3 id="Dry-Run-Mode">Dry Run Mode<a class="anchor-link" href="#Dry-Run-Mode">¶</a></h3><p><strong>Purpose:</strong> Simulate signals and movement without hardware for testing and validation.</p>
-<p>The simulated A-Scan signal $s(t)$ is generated as a sum of Gaussian-modulated sinusoids with added noise:</p>
-<p>$$
-s(t) = \sum_{i=1}^N A_i \exp\left(-\frac{(t - t_i)^2}{2\sigma^2}\right) \sin(2\pi f_i t) + \epsilon(t)
-$$</p>
-<p>where:</p>
-<ul>
-<li>$A_i$ = amplitude of the $i$-th echo</li>
-<li>$t_i$ = time-of-flight for the $i$-th echo</li>
-<li>$\sigma$ = width of the echo</li>
-<li>$f_i$ = center frequency</li>
-<li>$\epsilon(t)$ = random noise</li>
-</ul>
-<p>Movement simulation updates position as:</p>
-<p>$$
-\vec{r}_{n+1} = \vec{r}_n + \Delta \vec{r}
-$$</p>
-</div>
-</div>
-</div>
-</div>
-<div class="jp-Cell jp-MarkdownCell jp-Notebook-cell" id="cell-id=25decabd">
-<div class="jp-Cell-inputWrapper" tabindex="0">
-<div class="jp-Collapser jp-InputCollapser jp-Cell-inputCollapser">
-</div>
-<div class="jp-InputArea jp-Cell-inputArea"><div class="jp-RenderedHTMLCommon jp-RenderedMarkdown jp-MarkdownOutput" data-mime-type="text/markdown">
-<h3 id="Actual-Measurement-Model">Actual Measurement Model<a class="anchor-link" href="#Actual-Measurement-Model">¶</a></h3><p><strong>Signal Processing Chain:</strong></p>
+<h2 id="Launching-and-recommended-workflow">Launching and recommended workflow<a class="anchor-link" href="#Launching-and-recommended-workflow">¶</a></h2><p>Start the application from the repository root:</p>
+<p><code>python api/gui_main.py</code></p>
+<p>The required sequence:</p>
 <ol>
-<li><strong>Time-of-Flight (ToF) Estimation:</strong></li>
+<li>Configure and test all connections in <strong>Config</strong>.</li>
+<li>Establish a safe starting position in <strong>Move Rig</strong>.</li>
+<li>Define the waveform in <strong>Excitation Mode</strong> and preview it.</li>
+<li>Configure <strong>A-Mode</strong>, <strong>B-Mode</strong>, or <strong>3D-Mode</strong>.</li>
+<li>Run once with <strong>Dry Run</strong> enabled.</li>
+<li>Recheck the physical setup, disable Dry Run, and start hardware acquisition.</li>
+<li>Inspect the live plot and log, then export the required data.</li>
 </ol>
-<p>$$
-ToF = \arg\max_t |s(t)|
-$$</p>
+<p>Settings are saved automatically to <code>api/settings/gui_settings.json</code>. This file can contain local IP addresses and instrument identifiers.</p>
+</div>
+</div>
+</div>
+</div>
+<div class="jp-Cell jp-MarkdownCell jp-Notebook-cell" id="cell-id=config-tab">
+<div class="jp-Cell-inputWrapper" tabindex="0">
+<div class="jp-Collapser jp-InputCollapser jp-Cell-inputCollapser">
+</div>
+<div class="jp-InputArea jp-Cell-inputArea"><div class="jp-RenderedHTMLCommon jp-RenderedMarkdown jp-MarkdownOutput" data-mime-type="text/markdown">
+<h2 id="1.-Config-tab">1. Config tab<a class="anchor-link" href="#1.-Config-tab">¶</a></h2><p>The Config tab defines the three hardware connections and provides a non-motion connection test.</p>
+<table>
+<thead>
+<tr>
+<th>Group</th>
+<th>Parameter</th>
+<th>Meaning</th>
+<th>Example/default</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Signal Generator</td>
+<td>Name</td>
+<td>PyMeasure instrument model/driver</td>
+<td><code>Agilent33500B</code></td>
+</tr>
+<tr>
+<td>Signal Generator</td>
+<td>VISA Address</td>
+<td>USB or network VISA resource</td>
+<td><code>USB0::...::INSTR</code></td>
+</tr>
+<tr>
+<td>Rig</td>
+<td>Host</td>
+<td>TCP/IP address of the motion controller</td>
+<td><code>192.168.1.250</code></td>
+</tr>
+<tr>
+<td>Rig</td>
+<td>Port</td>
+<td>TCP port exposed by the controller</td>
+<td><code>5001</code></td>
+</tr>
+<tr>
+<td>Oscilloscope</td>
+<td>Name</td>
+<td>Descriptive instrument name</td>
+<td><code>Lecroy</code></td>
+</tr>
+<tr>
+<td>Oscilloscope</td>
+<td>VISA Address</td>
+<td>VISA resource used for waveform capture</td>
+<td><code>TCPIP0::...::INSTR</code></td>
+</tr>
+<tr>
+<td>Oscilloscope</td>
+<td>Sampling Rate</td>
+<td>Acquisition rate, displayed in kHz</td>
+<td>Hardware-dependent - default is 10 MHz</td>
+</tr>
+</tbody>
+</table>
+<p>The connection test attempts to reach the rig and open/query the instruments. It does not intentionally command an axis move. A successful network connection does not confirm that the rig workspace is clear or that scan directions are safe.</p>
+</div>
+</div>
+</div>
+</div>
+<div class="jp-Cell jp-MarkdownCell jp-Notebook-cell" id="cell-id=move-tab">
+<div class="jp-Cell-inputWrapper" tabindex="0">
+<div class="jp-Collapser jp-InputCollapser jp-Cell-inputCollapser">
+</div>
+<div class="jp-InputArea jp-Cell-inputArea"><div class="jp-RenderedHTMLCommon jp-RenderedMarkdown jp-MarkdownOutput" data-mime-type="text/markdown">
+<h2 id="2.-Move-Rig-tab">2. Move Rig tab<a class="anchor-link" href="#2.-Move-Rig-tab">¶</a></h2><p>Use this tab for setup and positioning. The controller communicates over TCP and reports encoder and pulse positions for the X, Y, and Z axes.</p>
+<p>The tab supports:</p>
+<ul>
+<li>incremental X/Y/Z movement in millimetres;</li>
+<li>reading the current rig position;</li>
+<li>saving a position in the current GUI session; and</li>
+<li>returning to the saved position.</li>
+</ul>
+<p>A positive value moves in the configured positive axis direction and a negative value moves in the opposite direction. Software entry ranges are not a substitute for physical travel-limit checks. Motion is monitored until the controller stops and the target position is stable.</p>
+</div>
+</div>
+</div>
+</div>
+<div class="jp-Cell jp-MarkdownCell jp-Notebook-cell" id="cell-id=excitation-tab">
+<div class="jp-Cell-inputWrapper" tabindex="0">
+<div class="jp-Collapser jp-InputCollapser jp-Cell-inputCollapser">
+</div>
+<div class="jp-InputArea jp-Cell-inputArea"><div class="jp-RenderedHTMLCommon jp-RenderedMarkdown jp-MarkdownOutput" data-mime-type="text/markdown">
+<h2 id="3.-Excitation-Mode-tab">3. Excitation Mode tab<a class="anchor-link" href="#3.-Excitation-Mode-tab">¶</a></h2><p>This tab defines the waveform shared by the acquisition modes and can preview or transmit it.</p>
+<table>
+<thead>
+<tr>
+<th>Parameter</th>
+<th>Meaning</th>
+<th>Typical default</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Shape</td>
+<td>Carrier waveform supported by the generator</td>
+<td><code>SIN</code></td>
+</tr>
+<tr>
+<td>Window</td>
+<td>Envelope applied to a finite sine burst</td>
+<td>Rectangular/None</td>
+</tr>
+<tr>
+<td>Frequency</td>
+<td>Carrier frequency</td>
+<td>1 MHz</td>
+</tr>
+<tr>
+<td>Amplitude</td>
+<td>Generator output amplitude in Vpp</td>
+<td>1 V</td>
+</tr>
+<tr>
+<td>Cycles per pulse</td>
+<td>Carrier cycles in one burst</td>
+<td>5</td>
+</tr>
+<tr>
+<td>Number of pulses</td>
+<td>Bursts in one acquisition</td>
+<td>2</td>
+</tr>
+<tr>
+<td>PRF</td>
+<td>Pulse repetition frequency</td>
+<td>100 Hz</td>
+</tr>
+<tr>
+<td>Start delay</td>
+<td>Delay before pulse generation</td>
+<td>0 s</td>
+</tr>
+</tbody>
+</table>
+<p>For carrier frequency $f_c$, cycle count $N_c$, and pulse repetition frequency $PRF$:</p>
+<p>$$T_p = \frac{N_c}{f_c}, \qquad T_r = \frac{1}{PRF}$$</p>
+<p>The pulse width must satisfy $T_p &lt; T_r$. The preview shows the requested waveform; it does not independently measure the electrical signal at the generator output. The <code>Run Timing Test</code> button runs this test and also checks with hardware limitations for the signal generator and displays the outputs.</p>
+</div>
+</div>
+</div>
+</div>
+<div class="jp-Cell jp-MarkdownCell jp-Notebook-cell" id="cell-id=a-mode">
+<div class="jp-Cell-inputWrapper" tabindex="0">
+<div class="jp-Collapser jp-InputCollapser jp-Cell-inputCollapser">
+</div>
+<div class="jp-InputArea jp-Cell-inputArea"><div class="jp-RenderedHTMLCommon jp-RenderedMarkdown jp-MarkdownOutput" data-mime-type="text/markdown">
+<h2 id="4.-A-Mode-tab">4. A-Mode tab<a class="anchor-link" href="#4.-A-Mode-tab">¶</a></h2><p>A-mode performs a single-position pulse-echo measurement. The rig first applies the requested incremental $\Delta X$, $\Delta Y$, and $\Delta Z$, then the oscilloscope captures one waveform per configured pulse. Multiple echoes can be averaged.</p>
+<table>
+<thead>
+<tr>
+<th>Parameter</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>ΔX, ΔY, ΔZ</td>
+<td>Incremental movement before acquisition, in mm</td>
+</tr>
+<tr>
+<td>Speed of Sound</td>
+<td>Converts round-trip time to depth; <code>0</code> retains a time axis</td>
+</tr>
+<tr>
+<td>High-pass Cutoff</td>
+<td>Removes low-frequency content; entered in kHz</td>
+</tr>
+<tr>
+<td>Filter Order</td>
+<td>Butterworth high-pass filter order</td>
+</tr>
+<tr>
+<td>Average Echoes</td>
+<td>Number of acquired echoes combined in the result</td>
+</tr>
+<tr>
+<td>Live Preview</td>
+<td>Updates the waveform plot during acquisition</td>
+</tr>
+<tr>
+<td>Dry Run</td>
+<td>Uses generated echoes instead of instrument data</td>
+</tr>
+</tbody>
+</table>
+<p>For sound speed $c$ and pulse-echo travel time $t$, depth is</p>
+<p>$$d = \frac{ct}{2}$$</p>
+<p>The factor of two accounts for propagation to the reflector and back. The filter cut-off must be below the Nyquist frequency $f_s/2$. A-mode runs are saved in numbered <code>data/a_mode_scan_NNN/</code> folders and can also be exported from the GUI.</p>
+</div>
+</div>
+</div>
+</div>
+<div class="jp-Cell jp-MarkdownCell jp-Notebook-cell" id="cell-id=b-mode">
+<div class="jp-Cell-inputWrapper" tabindex="0">
+<div class="jp-Collapser jp-InputCollapser jp-Cell-inputCollapser">
+</div>
+<div class="jp-InputArea jp-Cell-inputArea"><div class="jp-RenderedHTMLCommon jp-RenderedMarkdown jp-MarkdownOutput" data-mime-type="text/markdown">
+<h2 id="5.-B-Mode-tab">5. B-Mode tab<a class="anchor-link" href="#5.-B-Mode-tab">¶</a></h2><p>B-mode is a linear pulse-echo scan. The rig moves along the selected scan axis and records an A-scan at each point; the waveforms are stacked into a two-dimensional matrix. The other selected axis represents acoustic depth.</p>
+<table>
+<thead>
+<tr>
+<th>Parameter</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Depth Axis</td>
+<td>Axis represented by waveform time/depth</td>
+</tr>
+<tr>
+<td>Scan Axis</td>
+<td>Physical axis moved between acquisitions</td>
+</tr>
+<tr>
+<td>Scan Length</td>
+<td>Total commanded distance in mm; negative values reverse direction</td>
+</tr>
+<tr>
+<td>Scan Points</td>
+<td>Number of spatial acquisitions</td>
+</tr>
+<tr>
+<td>Speed of Sound</td>
+<td>Converts time to pulse-echo depth; <code>0</code> displays time</td>
+</tr>
+<tr>
+<td>Dry Run</td>
+<td>Generates synthetic A-scans without hardware acquisition</td>
+</tr>
+<tr>
+<td>Live Preview</td>
+<td>Refreshes the B-mode image as rows are acquired</td>
+</tr>
+</tbody>
+</table>
+<p>For a requested length $L$ and the implementation's point count $N$, the commanded step is calculated as</p>
+<p>$$\Delta x = \frac{L}{\max(1,N)}$$</p>
+<p>Use the export control to save the resulting B-mode matrix.</p>
+</div>
+</div>
+</div>
+</div>
+<div class="jp-Cell jp-MarkdownCell jp-Notebook-cell" id="cell-id=three-d-mode">
+<div class="jp-Cell-inputWrapper" tabindex="0">
+<div class="jp-Collapser jp-InputCollapser jp-Cell-inputCollapser">
+</div>
+<div class="jp-InputArea jp-Cell-inputArea"><div class="jp-RenderedHTMLCommon jp-RenderedMarkdown jp-MarkdownOutput" data-mime-type="text/markdown">
+<h2 id="6.-3D-Mode-tab">6. 3D-Mode tab<a class="anchor-link" href="#6.-3D-Mode-tab">¶</a></h2><p>3D mode performs a <strong>planar</strong> scan over two physical axes and records an A-scan at every grid location. Those two spatial dimensions plus waveform time/depth form the 3D dataset. It does not mechanically scan all three axes.</p>
+<table>
+<thead>
+<tr>
+<th>Parameter</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Scan Axis 1 / 2</td>
+<td>Two distinct physical motion axes</td>
+</tr>
+<tr>
+<td>Length 1 / 2</td>
+<td>Travel along each selected axis in mm</td>
+</tr>
+<tr>
+<td>Points 1 / 2</td>
+<td>Acquisition-grid dimensions</td>
+</tr>
+<tr>
+<td>Depth Axis</td>
+<td>Remaining axis, selected automatically</td>
+</tr>
+<tr>
+<td>Scanning Algorithm</td>
+<td><code>Raster</code> returns to the same edge; <code>Zigzag</code> alternates row direction</td>
+</tr>
+<tr>
+<td>Live Preview</td>
+<td>Updates the selected representation while scanning</td>
+</tr>
+<tr>
+<td>Dry Run</td>
+<td>Uses synthetic echoes and avoids instrument acquisition</td>
+</tr>
+</tbody>
+</table>
+<p>The post-processing selector provides three views of the same type of planar acquisition:</p>
+<ul>
+<li><strong>A-Mode:</strong> retains the waveform information across the grid.</li>
+<li><strong>C-Mode:</strong> applies a time gate to the envelope at every grid point, then maps Max, Mean, RMS, Kurtosis, or Energy.</li>
+<li><strong>Pressure Field Mode:</strong> maps a selected statistical feature and can optionally apply a high-pass or band-pass Butterworth filter.</li>
+</ul>
+<p>Pressure-field metrics include Max, Min, Mode, Median, Mean, RMS, Variance, Kurtosis, Skewness, Entropy, and Energy. Available colour maps include 16-bit grey, viridis, plasma, inferno, magma, cividis, turbo, and jet.</p>
+</div>
+</div>
+</div>
+</div>
+<div class="jp-Cell jp-MarkdownCell jp-Notebook-cell" id="cell-id=processing">
+<div class="jp-Cell-inputWrapper" tabindex="0">
+<div class="jp-Collapser jp-InputCollapser jp-Cell-inputCollapser">
+</div>
+<div class="jp-InputArea jp-Cell-inputArea"><div class="jp-RenderedHTMLCommon jp-RenderedMarkdown jp-MarkdownOutput" data-mime-type="text/markdown">
+<h2 id="7.-Signal-processing-and-metrics">7. Signal processing and metrics<a class="anchor-link" href="#7.-Signal-processing-and-metrics">¶</a></h2><ol>
+<li>For sampled voltage $x[n]$, the analytic-signal envelope is</li>
+</ol>
+<p>$$e[n] = |x[n] + j\,\mathcal{H}\{x[n]\}|$$</p>
+<p>where $\mathcal{H}$ is the Hilbert transform. In pulsed excitations with Number of pulses &gt; 1, the envelope is calculated for the averaged signal.</p>
 <ol start="2">
-<li><strong>Envelope Extraction (Hilbert Transform):</strong></li>
+<li>C-mode uses samples for which</li>
 </ol>
-<p>$$
-e(t) = |\mathcal{H}[s(t)]|
-$$</p>
-<p>where $\mathcal{H}[s(t)]$ is the analytic signal (Hilbert transform of $s(t)$).</p>
+<p>$$t_0 \leq t \leq t_0 + T_g$$</p>
+<p>with gate start $t_0$ and gate width $T_g$. Common reductions of a gated sequence $u_i$ are:</p>
+<p>$$\operatorname{Mean}(u)=\frac{1}{N}\sum_{i=1}^{N}u_i$$</p>
+<p>$$\operatorname{RMS}(u)=\sqrt{\frac{1}{N}\sum_{i=1}^{N}u_i^2}$$</p>
+<p>$$\operatorname{Energy}(u)=\sum_{i=1}^{N}u_i^2$$</p>
 <ol start="3">
-<li><strong>Filtering:</strong></li>
+<li><p>Filtering is implemented with Butterworth second-order sections. For a valid digital high-pass filter, $0 &lt; f_h &lt; f_s/2$; for a band-pass filter, $0 &lt; f_l &lt; f_h &lt; f_s/2$. The GUI reports and disables invalid cut-offs rather than applying an undefined filter.</p>
+</li>
+<li><p>Dry-run echoes are synthetic test signals. They are useful for checking acquisition flow, plotting, filtering, and export, but they do not validate hardware timing, acoustic calibration, sensitivity, or absolute pressure.</p>
+</li>
 </ol>
-<p>$$
-s_{filtered}(t) = s(t) * h_{BP}(t)
-$$</p>
-<p>where $h_{BP}(t)$ is the bandpass filter kernel.</p>
 </div>
 </div>
 </div>
 </div>
-<div class="jp-Cell jp-MarkdownCell jp-Notebook-cell" id="cell-id=cb29722c">
+<div class="jp-Cell jp-MarkdownCell jp-Notebook-cell" id="cell-id=data-exports">
 <div class="jp-Cell-inputWrapper" tabindex="0">
 <div class="jp-Collapser jp-InputCollapser jp-Cell-inputCollapser">
 </div>
 <div class="jp-InputArea jp-Cell-inputArea"><div class="jp-RenderedHTMLCommon jp-RenderedMarkdown jp-MarkdownOutput" data-mime-type="text/markdown">
-<h3 id="Metrics-&amp;-Field-Characterization">Metrics &amp; Field Characterization<a class="anchor-link" href="#Metrics-&amp;-Field-Characterization">¶</a></h3><p><strong>Peak-to-Peak Pressure:</strong></p>
-<p>$$
-P_{pp} = \max_t e(t) - \min_t e(t)
-$$</p>
-<p><strong>Pulse Intensity Integral (PII):</strong></p>
-<p>$$
-PII = \int_{t_0}^{t_1} [e(t)]^2 dt
-$$</p>
-<p><strong>Root Mean Square (RMS):</strong></p>
-<p>$$
-RMS = \sqrt{\frac{1}{T} \int_{t_0}^{t_1} [e(t)]^2 dt}
-$$</p>
-<p><strong>Mean Value:</strong></p>
-<p>$$
-Mean = \frac{1}{T} \int_{t_0}^{t_1} e(t) dt
-$$</p>
-<p><strong>Variance:</strong></p>
-<p>$$
-Var = \frac{1}{T} \int_{t_0}^{t_1} (e(t) - Mean)^2 dt
-$$</p>
-<p>where $T = t_1 - t_0$ is the integration window.</p>
+<h2 id="8.-Data,-previews,-and-exports">8. Data, previews, and exports<a class="anchor-link" href="#8.-Data,-previews,-and-exports">¶</a></h2><p>Runtime acquisition data are stored under the repository's <code>data/</code> directory. Numbered run folders and matrix names prevent normal scans from replacing previous results. Depending on the mode, saved artefacts include:</p>
+<ul>
+<li>waveform CSV files with time and amplitude columns;</li>
+<li>scan-point manifests and acquisition metadata;</li>
+<li>NumPy <code>.npy</code> waveform matrices; and</li>
+<li>exported plots, processed data, and tab logs selected by the user.</li>
+</ul>
+<p>Matplotlib toolbars provide plot navigation. Live preview affects display updates, not the underlying scan geometry. Do not treat voltage values as calibrated acoustic pressure unless the complete measurement chain—including hydrophone/probe sensitivity, amplification, attenuation, and frequency response—has been calibrated and applied.</p>
 </div>
 </div>
 </div>
 </div>
-<div class="jp-Cell jp-MarkdownCell jp-Notebook-cell" id="cell-id=98b320a3">
+<div class="jp-Cell jp-MarkdownCell jp-Notebook-cell" id="cell-id=library-troubleshooting">
 <div class="jp-Cell-inputWrapper" tabindex="0">
 <div class="jp-Collapser jp-InputCollapser jp-Cell-inputCollapser">
 </div>
 <div class="jp-InputArea jp-Cell-inputArea"><div class="jp-RenderedHTMLCommon jp-RenderedMarkdown jp-MarkdownOutput" data-mime-type="text/markdown">
-<h3 id="Excitation-Mode:-Window-Functions-and-Pulse-Generation">Excitation Mode: Window Functions and Pulse Generation<a class="anchor-link" href="#Excitation-Mode:-Window-Functions-and-Pulse-Generation">¶</a></h3><p><strong>Window Functions Used:</strong></p>
+<h2 id="9.-Library-modules-and-troubleshooting">9. Library modules and troubleshooting<a class="anchor-link" href="#9.-Library-modules-and-troubleshooting">¶</a></h2><p>The main source-level modules are:</p>
+<table>
+<thead>
+<tr>
+<th>Module</th>
+<th>Responsibility</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>api.src.rig_function</code></td>
+<td>Rig TCP connection, position queries, homing, and motion</td>
+</tr>
+<tr>
+<td><code>api.src.Signal_function</code></td>
+<td>Continuous, triggered, and burst waveform generation</td>
+</tr>
+<tr>
+<td><code>api.src.Oscilloscope</code></td>
+<td>VISA connection, LeCroy setup, capture, and CSV writing</td>
+</tr>
+<tr>
+<td><code>api.src.scan_utils</code></td>
+<td>Scan-step calculation</td>
+</tr>
+<tr>
+<td><code>api.src.dummy_signal_generator</code></td>
+<td>Synthetic echoes for dry runs</td>
+</tr>
+</tbody>
+</table>
+<p>Common checks:</p>
 <ul>
-<li><p><strong>Rectangular Window:</strong>
-$$ w_{rect}(t) = 1 uad 	ext{for}  0 eq t &lt; T_p $$</p>
-</li>
-<li><p><strong>Hanning (Hann) Window:</strong>
-$$ w_{hann}(t) = 0.5 eft[1 - oseft(rac{2i t}{T_p}
-ight)
-ight] uad 	ext{for}  0 eq t &lt; T_p $$</p>
-</li>
-<li><p><strong>Hamming Window:</strong>
-$$ w_{hamm}(t) = 0.54 - 0.46 oseft(rac{2i t}{T_p}
-ight) uad 	ext{for}  0 eq t &lt; T_p $$</p>
-</li>
-<li><p><strong>Tukey Window:</strong>
-$$ w_{tukey}(t) = egin{cases}
-  rac{1}{2}eft[1 + oseft(i eft(rac{2t}{lpha T_p} - 1
-ight)
-ight)
-ight], &amp; 0 eq t &lt; rac{lpha T_p}{2} \
-  1, &amp; rac{lpha T_p}{2} eq t &lt; T_p eft(1 - rac{lpha}{2}
-ight) \
-  rac{1}{2}eft[1 + oseft(i eft(rac{2t}{lpha T_p} - rac{2}{lpha} + 1
-ight)
-ight)
-ight], &amp; T_p eft(1 - rac{lpha}{2}
-ight) eq t &lt; T_p \
-nd{cases} $$
-where $lpha$ is the Tukey window shape parameter ($0 eq lpha eq 1$).</p>
-</li>
+<li>If the GUI does not start, install the dependencies and launch it from the repository root.</li>
+<li>If VISA discovery fails, confirm the configured resource string, backend/runtime, cable, and network route.</li>
+<li>If the rig is unreachable, check its host, port, subnet, and whether another client owns the connection.</li>
+<li>If filtering is rejected, keep all cut-offs below half the configured sampling rate.</li>
+<li>If hardware is unavailable, enable Dry Run to test processing and export.</li>
 </ul>
-<p><strong>Pulse Generation Equation:</strong></p>
-<p>The excitation pulse $p(t)$ is generated as:</p>
-<p>$$
-p(t) = A dot w(t) dot in(2i f_0 t)$$</p>
-<p>where:</p>
-<ul>
-<li>$A$ = amplitude</li>
-<li>$w(t)$ = selected window function (see above)</li>
-<li>$f_0$ = center frequency</li>
-<li>$T_p$ = pulse duration</li>
-</ul>
-<p><strong>Pulse Parameters:</strong></p>
-<ul>
-<li><p><strong>PRF (Pulse Repetition Frequency):</strong> Number of pulses per second. Determines the time interval between pulses:
-$$ T_{PRF} = rac{1}{PRF} $$</p>
-</li>
-<li><p><strong>Pulse Delay:</strong> Time between the start of each pulse:
-$$ t_{delay} = T_{PRF} $$</p>
-</li>
-<li><p><strong>Number of Cycles per Pulse:</strong>
-$$ N_{cycles} = f_0 dot T_p $$
-where $T_p$ is the pulse duration.</p>
-</li>
-<li><p><strong>Number of Pulses:</strong> Total pulses in a burst or scan:
-$$ N_{pulses} = 	ext{user-defined (e.g., 1–1000)} $$</p>
-</li>
-</ul>
-<p><strong>Summary:</strong></p>
-<p>The excitation signal is a windowed sinusoidal burst, repeated at intervals determined by PRF. The window function shapes the envelope of each pulse to control spectral leakage and ringing.</p>
+<p>To rebuild the HTML page consumed by the GUI after editing this notebook:</p>
+<div class="highlight"><pre><span></span>jupyter<span class="w"> </span>nbconvert<span class="w"> </span>--to<span class="w"> </span>html<span class="w"> </span>--output<span class="w"> </span>docs.html<span class="w"> </span>api/docs/documentation.ipynb
+</pre></div>
+<p>Run the command from the repository root and commit both the notebook and regenerated HTML when documentation changes must appear inside the application.</p>
 </div>
 </div>
 </div>

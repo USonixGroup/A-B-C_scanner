@@ -75,6 +75,13 @@ DATA_DIR = PROJECT_ROOT / "data"
 SETTINGS_DIR = API_ROOT / "settings"
 SETTINGS_PATH = SETTINGS_DIR / "gui_settings.json"
 
+# Published repository state. GitHub currently has no tagged release; this
+# identifies the authoritative commit on the default (main) branch.
+APP_RELEASE = "Unreleased"
+APP_VERSION = "main@8b089f2"
+APP_VERSION_DATE = "5 October 2025"
+PROJECT_URL = "https://github.com/USonixGroup/A-B-C_scanner"
+
 
 def _read_waveform_csv(csv_path: str) -> tuple[list[float], list[float]]:
     """Read waveform CSV files with optional metadata comment lines.
@@ -2187,21 +2194,33 @@ class ScannerMainWindow(QMainWindow):
 
 
     def show_about(self) -> None:
-        from PySide6.QtWidgets import QDialog, QVBoxLayout, QLabel, QHBoxLayout, QPushButton
+        from PySide6.QtWidgets import QDialog, QVBoxLayout, QLabel
         from PySide6.QtCore import Qt
         class AboutDialog(QDialog):
             def __init__(self, parent=None):
                 super().__init__(parent)
-                self.setWindowTitle("About")
+                self.setWindowTitle("About A/B/C Ultrasound Scanner")
                 self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
-                self.setFixedSize(480, 180)
+                self.setFixedSize(540, 300)
                 layout = QVBoxLayout(self)
                 label = QLabel(
-                    "Developed by Anqi Yang and Reza Haqshenas at the UCL Ultrasonics Group. This project was created with assistance from GitHub Copilot and is released as open-source software under the MIT License, 2026."
+                    "<h2>A/B/C Ultrasound Scanner</h2>"
+                    f"<p><b>Release:</b> {APP_RELEASE}<br>"
+                    f"<b>Version:</b> {APP_VERSION}<br>"
+                    f"<b>Main-branch date:</b> {APP_VERSION_DATE}</p>"
+                    "<p>Developed by Anqi Yang and Reza Haqshenas at the "
+                    "UCL Ultrasonics Group, UCL Mechanical Engineering, "
+                    "with assistance from GitHub Copilot.</p>"
+                    "<p>Copyright &copy; 2026 UCL Ultrasonics Group, "
+                    "UCL Mechanical Engineering.<br>"
+                    "Licensed under the Apache License 2.0.</p>"
+                    f'<p><a href="{PROJECT_URL}">{PROJECT_URL}</a></p>'
                 )
                 label.setWordWrap(True)
                 label.setAlignment(Qt.AlignCenter)
-                label.setStyleSheet("font-size: 13pt; padding: 18px;")
+                label.setOpenExternalLinks(True)
+                label.setTextInteractionFlags(Qt.TextBrowserInteraction)
+                label.setStyleSheet("font-size: 10.5pt; padding: 12px;")
                 layout.addWidget(label)
                 # Remove Ok button, only X at top right
                 self.setWindowFlag(Qt.WindowCloseButtonHint, True)
