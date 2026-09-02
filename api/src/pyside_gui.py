@@ -451,9 +451,9 @@ class ScannerMainWindow(QMainWindow):
 
         box = QGroupBox("Manual Rig Movement")
         form = QFormLayout(box)
-        self.move_x = self._make_double_spin(-5000, 5000, 0.0)
-        self.move_y = self._make_double_spin(-5000, 5000, 0.0)
-        self.move_z = self._make_double_spin(-5000, 5000, 0.0)
+        self.move_x = self._make_motor_position_spin()
+        self.move_y = self._make_motor_position_spin()
+        self.move_z = self._make_motor_position_spin()
         form.addRow("ΔX (mm)", self.move_x)
         form.addRow("ΔY (mm)", self.move_y)
         form.addRow("ΔZ (mm)", self.move_z)
@@ -536,7 +536,8 @@ class ScannerMainWindow(QMainWindow):
         )
         self.tx_windowing_combo.setStyleSheet("QComboBox { padding-right: 28px; }")
         self.tx_freq = self._make_double_spin(0.001, 100_000.0, 1000.0, decimals=3)
-        self.tx_amp = self._make_double_spin(0.01, 100, 1.0)
+        self.tx_amp = self._make_double_spin(0.001, 100, 1.0, decimals=3)
+        self.tx_amp.setSingleStep(1.0)
         self.tx_cycles = self._make_spin(1, 10_000, 60)
         self.tx_pulses = self._make_spin(1, 100000, 1)
         self.tx_prf = self._make_double_spin(0.1, 1_000_000, 1000.0, decimals=2)
@@ -705,9 +706,9 @@ class ScannerMainWindow(QMainWindow):
 
         pos_box = QGroupBox("A-Mode Position")
         pos_form = QFormLayout(pos_box)
-        self.a_mode_x = self._make_double_spin(-5000, 5000, 0.0)
-        self.a_mode_y = self._make_double_spin(-5000, 5000, 0.0)
-        self.a_mode_z = self._make_double_spin(-5000, 5000, 0.0)
+        self.a_mode_x = self._make_motor_position_spin()
+        self.a_mode_y = self._make_motor_position_spin()
+        self.a_mode_z = self._make_motor_position_spin()
         self.a_mode_highpass_cutoff = self._make_double_spin(
             0.0, 100_000.0, 50.0, decimals=1
         )
@@ -834,13 +835,16 @@ class ScannerMainWindow(QMainWindow):
         self.scan_axis = self._make_axis_combo("X")
         self.cross_axis = self._make_axis_combo("Z")
         self.depth_axis = self._make_axis_combo("Y")
-        self.scan_length = self._make_double_spin(0.1, 10000, 20.0)
+        self.scan_length = self._make_double_spin(-10000, 10000, 20.0, decimals=3)
         self.scan_points = self._make_spin(1, 10000, 2)
-        self.cross_length = self._make_double_spin(0.1, 10000, 20.0)
+        self.cross_length = self._make_double_spin(-10000, 10000, 20.0, decimals=3)
         self.cross_points = self._make_spin(1, 10000, 2)
         scan_form.addRow("Depth Axis", self.depth_axis)
         scan_form.addRow("Scan Axis 1", self.scan_axis)
         scan_form.addRow("Scan Axis 1 Length (mm)", self.scan_length)
+        scan_form.addRow(
+            QLabel('<span style="color:#c23b3b; font-size:9pt;">Negative length scans in the negative axis direction.</span>')
+        )
         scan_form.addRow("Scan Axis 1 Points", self.scan_points)
         scan_form.addRow("Scan Axis 2", self.cross_axis)
         scan_form.addRow("Scan Axis 2 Length (mm)", self.cross_length)
@@ -1287,7 +1291,7 @@ class ScannerMainWindow(QMainWindow):
         scan_form = QFormLayout(scan_box)
         self.b_depth_axis = self._make_axis_combo("X")
         self.b_scan_axis = self._make_axis_combo("Z")
-        self.b_scan_length = self._make_double_spin(-10000.0, 10000.0, 20.0)
+        self.b_scan_length = self._make_double_spin(-10000.0, 10000.0, 20.0, decimals=3)
         self.b_scan_points = self._make_spin(1, 10000, 5)
         self.b_sound_speed = self._make_double_spin(0.0, 20000.0, 1500.0)
         self.b_sound_speed.setSingleStep(1.0)
@@ -1652,9 +1656,15 @@ class ScannerMainWindow(QMainWindow):
     ) -> QDoubleSpinBox:
         spin = QDoubleSpinBox()
         spin.setRange(minimum, maximum)
-        spin.setDecimals(1)
+        spin.setDecimals(decimals)
         spin.setValue(value)
-        spin.setSingleStep(0.1)
+        spin.setSingleStep(10 ** -decimals)
+        return spin
+
+    def _make_motor_position_spin(self) -> QDoubleSpinBox:
+        """Create a millimetre control with a practical 0.001 mm movement increment."""
+        spin = self._make_double_spin(-5000.0, 5000.0, 0.0, decimals=3)
+        spin.setSingleStep(0.001)
         return spin
 
     def _make_axis_combo(self, default: str) -> QComboBox:
@@ -4366,8 +4376,14 @@ class ScannerMainWindow(QMainWindow):
         }
         scan_step_mm = compute_step(scan["scan_length"], scan["scan_points"])
         cross_step_mm = compute_step(scan["cross_length"], scan["cross_points"])
-        scan["scan_step"] = max(1, int(round(scan_step_mm * MM_TO_PULSE)))
-        scan["cross_step"] = max(1, int(round(cross_step_mm * MM_TO_PULSE)))
+        scan_step_pulses = int(round(scan_step_mm * MM_TO_PULSE))
+        cross_step_pulses = int(round(cross_step_mm * MM_TO_PULSE))
+        if scan_step_pulses == 0 and scan["scan_length"] != 0.0:
+            scan_step_pulses = 1 if scan["scan_length"] > 0.0 else -1
+        if cross_step_pulses == 0 and scan["cross_length"] != 0.0:
+            cross_step_pulses = 1 if scan["cross_length"] > 0.0 else -1
+        scan["scan_step"] = scan_step_pulses
+        scan["cross_step"] = cross_step_pulses
         return pg, scan
 
     def collect_b_mode_inputs(self) -> dict:

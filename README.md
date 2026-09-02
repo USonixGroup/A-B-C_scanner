@@ -104,7 +104,13 @@ The launcher imports the application from `api/src/pyside_gui.py`. Run it from t
 6. Enable live preview if required, then start the scan.
 7. Review the plot and log, and use the export controls to save processed results.
 
-Scan lengths are specified in millimetres. For B-mode, a negative scan length moves in the negative direction of the selected scan axis. In 3D mode, the two scan axes must be different; the remaining axis is used as the waveform depth axis.
+In **Excitation Mode**, amplitude accepts up to three decimal places in Vpp. The amplitude arrow controls use a `1 Vpp` increment; values such as `1.123 Vpp` can be entered directly.
+
+Scan lengths are specified in millimetres. For B-mode, a negative scan length moves in the negative direction of the selected scan axis. In 3D mode, negative lengths move in the negative direction of their respective scan axes. The two scan axes must be different; the remaining axis is used as the waveform depth axis.
+
+### Movement precision
+
+The Move Rig and A-mode X/Y/Z fields, B-mode scan length, and 3D scan-axis lengths accept three decimal places with `0.001 mm` increments. The configured conversion is 5000 pulses/mm, so one controller pulse is $0.0002\,\mathrm{mm} = 0.2\,\mathrm{\mu m} = 200\,\mathrm{nm}$. A distance of $0.0001\,\mathrm{mm}$ is $100\,\mathrm{nm}$, not $0.1\,\mathrm{nm}$, and rounds to zero pulses. The backend rounds movement requests to whole pulses because fractional controller pulses are not supported.
 
 ## Scan modes
 
