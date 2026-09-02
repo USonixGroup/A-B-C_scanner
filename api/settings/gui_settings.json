@@ -29,7 +29,7 @@
     "sound_speed_mps": 0.0,
     "mode": "INC",
     "dry_run": false,
-    "live_preview": true,
+    "live_preview": false,
     "average_echoes": 1
   },
   "line_b_mode": {
@@ -38,7 +38,7 @@
     "scan_length": 10.0,
     "scan_points": 5,
     "sound_speed_mps": 0.0,
-    "dry_run": false,
+    "dry_run": true,
     "live_preview": true
   },
   "b_mode": {
@@ -55,7 +55,7 @@
     "cross_length": 10.0,
     "cross_points": 2,
     "scan_algorithm": "Zigzag",
-    "dry_run": false,
+    "dry_run": true,
     "live_update": true,
     "scan_type": "standard",
     "c_mode_gate_start_us": 0.3,

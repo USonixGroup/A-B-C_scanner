@@ -732,7 +732,7 @@ class ScannerMainWindow(QMainWindow):
         self.a_start_button.clicked.connect(self.start_a_mode)
         self.a_start_button.setFixedHeight(34)
         self.a_start_button.setStyleSheet(
-            "QPushButton { min-width: 96px; min-height: 34px; max-width: 120px; padding: 6px 12px; "
+            "QPushButton { min-height: 34px; max-height: 34px; padding: 0px 12px; "
             "border: none; border-radius: 14px; color: #ffffff; font-weight: 700; "
             "background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #1f6fd8, stop:1 #3c92ff); }"
             "QPushButton:hover { background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #2d7de2, stop:1 #56a1ff); }"
@@ -752,6 +752,8 @@ class ScannerMainWindow(QMainWindow):
         self.a_dry_run_check.setChecked(True)
         self.a_live_preview_check = QCheckBox("Live Preview")
         self.a_live_preview_check.setChecked(True)
+        self.a_store_automatically_check = QCheckBox("Store Automatically")
+        self.a_store_automatically_check.setChecked(True)
         self.a_source_label = QLabel("Signal source: Dummy")
         self.a_source_label.setStyleSheet("color: #415368; font-size: 9pt;")
         self.a_dry_run_check.stateChanged.connect(self._update_a_mode_source_label)
@@ -769,6 +771,7 @@ class ScannerMainWindow(QMainWindow):
         action_row.addWidget(self.a_start_button)
         action_row.addWidget(self.a_dry_run_check)
         action_row.addWidget(self.a_live_preview_check)
+        action_row.addWidget(self.a_store_automatically_check)
         action_row.addWidget(self.a_source_label)
         action_row.addStretch(1)
         left_layout.addLayout(action_row)
@@ -864,13 +867,27 @@ class ScannerMainWindow(QMainWindow):
         self._normalize_control_row(options_row)
         self.dry_run_check = QCheckBox("Dry Run")
         self.live_update_check = QCheckBox("Live Preview")
+        self.store_automatically_check = QCheckBox("Store Automatically")
+        self.store_automatically_check.setChecked(True)
         self.bc_source_label = QLabel("Signal source: Hardware")
         self.bc_source_label.setStyleSheet("color: #415368; font-size: 9pt;")
         self.dry_run_check.stateChanged.connect(self._update_bc_mode_source_label)
         options_row.addWidget(self.live_update_check)
+        options_row.addWidget(self.store_automatically_check)
         options_row.addWidget(self.dry_run_check)
         options_row.addWidget(self.bc_source_label)
         controls_layout.addLayout(options_row)
+
+        self.bc_storage_warning_label = QLabel(
+            "⚠ C-Mode and Pressure Field Mode require stored readings. "
+            "Select Store Automatically to enable them."
+        )
+        self.bc_storage_warning_label.setWordWrap(True)
+        self.bc_storage_warning_label.setStyleSheet(
+            "color: #b42318; font-size: 9pt; font-weight: 600;"
+        )
+        self.bc_storage_warning_label.setVisible(False)
+        controls_layout.addWidget(self.bc_storage_warning_label)
 
         scan_type_box = QGroupBox("Post-processing and Preview")
         scan_type_layout = QVBoxLayout(scan_type_box)
@@ -1175,6 +1192,10 @@ class ScannerMainWindow(QMainWindow):
 
         self._set_bc_scan_type("standard")
         self._update_bc_pf_filter_controls()
+        self.store_automatically_check.stateChanged.connect(
+            self._update_3d_storage_availability
+        )
+        self._update_3d_storage_availability()
         self._bc_indicator_ready = False
         self.bc_scan_type_segment.installEventFilter(self)
         controls_layout.addWidget(scan_type_box)
@@ -1185,7 +1206,7 @@ class ScannerMainWindow(QMainWindow):
         self.start_button.clicked.connect(self.start_scan)
         self.start_button.setFixedHeight(34)
         self.start_button.setStyleSheet(
-            "QPushButton { min-width: 96px; min-height: 34px; max-width: 120px; padding: 6px 12px; "
+            "QPushButton { min-height: 34px; max-height: 34px; padding: 0px 12px; "
             "border: none; border-radius: 14px; color: #ffffff; font-weight: 700; "
             "background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #1f6fd8, stop:1 #3c92ff); }"
             "QPushButton:hover { background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #2d7de2, stop:1 #56a1ff); }"
@@ -1197,20 +1218,19 @@ class ScannerMainWindow(QMainWindow):
         self.stop_button.setEnabled(False)
         self.stop_button.setFixedHeight(34)
         self.stop_button.setStyleSheet(
-            "QPushButton { min-width: 84px; min-height: 34px; max-width: 96px; padding: 6px 12px; "
+            "QPushButton { min-height: 34px; max-height: 34px; padding: 0px 12px; "
             "border: none; border-radius: 14px; background: qlineargradient(x1:0, y1:0, x2:1, y2:0, "
             "stop:0 #d62839, stop:1 #f05a68); color: #ffffff; font-weight: 700; }"
             "QPushButton:hover { background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #e03a49, stop:1 #f3717d); }"
             "QPushButton:pressed { background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #b91f2f, stop:1 #de4a58); }"
             "QPushButton:disabled { background: #e8edf4; color: #95a3b5; border-color: #dde5ee; }"
         )
-        self._normalize_button_row(button_row, [self.start_button, self.stop_button])
+        button_row.setContentsMargins(0, 0, 0, 0)
         button_row.setSpacing(8)
-        for widget in [
-            self.start_button,
-            self.stop_button,
-        ]:
-            button_row.addWidget(widget)
+        self.start_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.stop_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        button_row.addWidget(self.start_button, 1)
+        button_row.addWidget(self.stop_button, 1)
         controls_layout.addLayout(button_row)
 
         log_box = QGroupBox("3D-Mode Log")
@@ -1328,7 +1348,7 @@ class ScannerMainWindow(QMainWindow):
         self.b_start_button.clicked.connect(self.start_b_mode)
         self.b_start_button.setFixedHeight(34)
         self.b_start_button.setStyleSheet(
-            "QPushButton { min-width: 96px; min-height: 34px; max-width: 120px; padding: 6px 12px; "
+            "QPushButton { min-height: 34px; max-height: 34px; padding: 0px 12px; "
             "border: none; border-radius: 14px; color: #ffffff; font-weight: 700; "
             "background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #1f6fd8, stop:1 #3c92ff); }"
             "QPushButton:hover { background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #2d7de2, stop:1 #56a1ff); }"
@@ -1338,8 +1358,9 @@ class ScannerMainWindow(QMainWindow):
         self.b_stop_button = QPushButton("Stop")
         self.b_stop_button.clicked.connect(self.stop_b_mode)
         self.b_stop_button.setEnabled(False)
+        self.b_stop_button.setFixedHeight(34)
         self.b_stop_button.setStyleSheet(
-            "QPushButton { min-width: 84px; min-height: 34px; max-width: 96px; padding: 6px 12px; "
+            "QPushButton { min-height: 34px; max-height: 34px; padding: 0px 12px; "
             "border: none; border-radius: 14px; background: qlineargradient(x1:0, y1:0, x2:1, y2:0, "
             "stop:0 #d62839, stop:1 #f05a68); color: #ffffff; font-weight: 700; }"
             "QPushButton:hover { background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #e03a49, stop:1 #f3717d); }"
@@ -1350,25 +1371,29 @@ class ScannerMainWindow(QMainWindow):
         self.b_dry_run_check.setChecked(True)
         self.b_live_preview_check = QCheckBox("Live Preview")
         self.b_live_preview_check.setChecked(True)
+        self.b_store_automatically_check = QCheckBox("Store Automatically")
+        self.b_store_automatically_check.setChecked(True)
         self.b_source_label = QLabel("Signal source: Dummy")
         self.b_source_label.setStyleSheet("color: #415368; font-size: 9pt;")
         self.b_dry_run_check.stateChanged.connect(self._update_b_mode_source_label)
-        button_row = QHBoxLayout()
-        self._normalize_button_row(
-            button_row,
-            [
-                self.b_start_button,
-                self.b_stop_button,
-            ],
-        )
-        button_row.setSpacing(8)
-        button_row.addWidget(self.b_start_button)
-        button_row.addWidget(self.b_stop_button)
-        button_row.addWidget(self.b_dry_run_check)
-        button_row.addWidget(self.b_live_preview_check)
-        button_row.addWidget(self.b_source_label)
-        button_row.addStretch(1)
-        left_layout.addLayout(button_row)
+        command_row = QHBoxLayout()
+        command_row.setContentsMargins(0, 0, 0, 0)
+        command_row.setSpacing(8)
+        command_row.setAlignment(Qt.AlignTop)
+        self.b_start_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.b_stop_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        command_row.addWidget(self.b_start_button, 1)
+        command_row.addWidget(self.b_stop_button, 1)
+        left_layout.addLayout(command_row)
+
+        options_row = QHBoxLayout()
+        self._normalize_control_row(options_row, spacing=10)
+        options_row.addWidget(self.b_dry_run_check)
+        options_row.addWidget(self.b_live_preview_check)
+        options_row.addWidget(self.b_store_automatically_check)
+        options_row.addWidget(self.b_source_label)
+        options_row.addStretch(1)
+        left_layout.addLayout(options_row)
 
         log_box = QGroupBox("B-Mode Log")
         log_layout = QVBoxLayout(log_box)
@@ -3141,6 +3166,15 @@ class ScannerMainWindow(QMainWindow):
         self._update_bc_pf_filter_controls()
         self._animate_bc_scan_type_indicator(animate=True)
 
+    def _update_3d_storage_availability(self, *_args) -> None:
+        """Keep saved-data-only 3D modes unavailable when storage is disabled."""
+        storage_enabled = self.store_automatically_check.isChecked()
+        self.bc_scan_type_c_btn.setEnabled(storage_enabled)
+        self.bc_scan_type_pf_btn.setEnabled(storage_enabled)
+        self.bc_storage_warning_label.setVisible(not storage_enabled)
+        if not storage_enabled and self._current_bc_scan_type() != "standard":
+            self._set_bc_scan_type("standard")
+
     def _update_bc_pf_filter_controls(self, *_args) -> None:
         if not hasattr(self, "bc_filter_options_stack"):
             return
@@ -4629,6 +4663,7 @@ class ScannerMainWindow(QMainWindow):
             params = self.collect_b_mode_inputs()
             dry_run = bool(self.b_dry_run_check.isChecked())
             live_enabled = bool(self.b_live_preview_check.isChecked())
+            store_automatically = bool(self.b_store_automatically_check.isChecked())
             points = int(params["scan_points"])
             scan_step = int(params["scan_step"])
             sound_speed_mps = float(params["sound_speed_mps"])
@@ -4772,20 +4807,11 @@ class ScannerMainWindow(QMainWindow):
                     )
                     return
 
-                b_data_dir = DATA_DIR
-                b_data_dir.mkdir(exist_ok=True)
-                existing = [
-                    d
-                    for d in os.listdir(b_data_dir)
-                    if d.startswith("b_mode_scan_")
-                    and os.path.isdir(b_data_dir / d)
-                    and d.split("_")[-1].isdigit()
-                ]
-                next_idx = max((int(d.split("_")[-1]) for d in existing), default=0) + 1
-                b_scan_folder = b_data_dir / f"b_mode_scan_{next_idx:03d}"
-                b_scan_folder.mkdir(parents=True, exist_ok=True)
             else:
                 Burst_generate = None
+
+            b_scan_folder = None
+            if store_automatically:
                 b_data_dir = DATA_DIR
                 b_data_dir.mkdir(exist_ok=True)
                 existing = [
@@ -4798,6 +4824,9 @@ class ScannerMainWindow(QMainWindow):
                 next_idx = max((int(d.split("_")[-1]) for d in existing), default=0) + 1
                 b_scan_folder = b_data_dir / f"b_mode_scan_{next_idx:03d}"
                 b_scan_folder.mkdir(parents=True, exist_ok=True)
+                self.bridge.b_mode_log.emit(f"B-mode run folder: {b_scan_folder}")
+            else:
+                self.bridge.b_mode_log.emit("B-mode automatic storage is disabled.")
 
             self.bridge.b_mode_log.emit(
                 f"B-Mode settings: scan_axis={params['scan_axis']}, depth_axis={params['depth_axis']}, "
@@ -4910,11 +4939,12 @@ class ScannerMainWindow(QMainWindow):
                             f"B-mode filtering WARNING: cutoff={cutoff_hz/1000.0:.3f} kHz is close to Nyquist={nyquist_hz/1000.0:.3f} kHz; filtering is meaningful when cutoff is much smaller than Nyquist."
                         )
 
-                point_csv_path = b_scan_folder / f"point_{idx:04d}.csv"
-                with open(point_csv_path, "w", encoding="utf-8") as _f:
-                    _f.write("Time (s),Amplitude (V)\n")
-                    for _t, _v in zip(t, y):
-                        _f.write(f"{_t:.10e},{_v:.10e}\n")
+                if store_automatically and b_scan_folder is not None:
+                    point_csv_path = b_scan_folder / f"point_{idx:04d}.csv"
+                    with open(point_csv_path, "w", encoding="utf-8") as _f:
+                        _f.write("Time (s),Amplitude (V)\n")
+                        for _t, _v in zip(t, y):
+                            _f.write(f"{_t:.10e},{_v:.10e}\n")
 
                 envelope = module.estimate_a_mode_signal(
                     t,
@@ -5737,6 +5767,7 @@ class ScannerMainWindow(QMainWindow):
             assert spec.loader is not None
             spec.loader.exec_module(module)
             use_dummy = bool(self.a_dry_run_check.isChecked())
+            store_automatically = bool(self.a_store_automatically_check.isChecked())
             if use_dummy:
                 self.bridge.a_mode_log.emit(
                     "A-mode test mode: using dummy signal generator echoes."
@@ -5866,24 +5897,29 @@ class ScannerMainWindow(QMainWindow):
                 f"signal_source={'dummy' if use_dummy else 'hardware'}"
             )
 
-            a_data_dir = DATA_DIR
-            a_data_dir.mkdir(exist_ok=True)
-            existing_runs = [
-                d
-                for d in os.listdir(a_data_dir)
-                if d.startswith("a_mode_scan_")
-                and os.path.isdir(a_data_dir / d)
-                and d.split("_")[-1].isdigit()
-            ]
-            next_run_id = max((int(d.split("_")[-1]) for d in existing_runs), default=0) + 1
-            a_scan_folder = a_data_dir / f"a_mode_scan_{next_run_id:03d}"
-            a_scan_folder.mkdir(parents=True, exist_ok=True)
-            self.bridge.a_mode_log.emit(f"A-mode run folder: {a_scan_folder}")
+            a_scan_folder = None
+            next_run_id = None
+            if store_automatically:
+                a_data_dir = DATA_DIR
+                a_data_dir.mkdir(exist_ok=True)
+                existing_runs = [
+                    d
+                    for d in os.listdir(a_data_dir)
+                    if d.startswith("a_mode_scan_")
+                    and os.path.isdir(a_data_dir / d)
+                    and d.split("_")[-1].isdigit()
+                ]
+                next_run_id = max((int(d.split("_")[-1]) for d in existing_runs), default=0) + 1
+                a_scan_folder = a_data_dir / f"a_mode_scan_{next_run_id:03d}"
+                a_scan_folder.mkdir(parents=True, exist_ok=True)
+                self.bridge.a_mode_log.emit(f"A-mode run folder: {a_scan_folder}")
+            else:
+                self.bridge.a_mode_log.emit("A-mode automatic storage is disabled.")
 
             run_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             a_scan_metadata = {
                 "run_timestamp": run_timestamp,
-                "run_id": next_run_id,
+                "run_id": next_run_id if next_run_id is not None else "not stored",
                 "mode": params["mode"],
                 "x_mm": params["X"],
                 "y_mm": params["Y"],
@@ -5978,19 +6014,20 @@ class ScannerMainWindow(QMainWindow):
                     if scope_fs_hz is not None and scope_fs_hz > 0.0:
                         scope_sampling_rates.append(float(scope_fs_hz))
                 traces.append((t, y))
-                pulse_csv = a_scan_folder / f"a_scan_pulse_{pulse_idx:03d}.csv"
-                _write_wave_csv(
-                    pulse_csv,
-                    t,
-                    y,
-                    {
-                        "pulse_index": pulse_idx,
-                        "pulse_total": pulses,
-                        "scope_sampling_rate_hz": (
-                            float(scope_fs_hz) if scope_fs_hz is not None else "n/a"
-                        ),
-                    },
-                )
+                if store_automatically and a_scan_folder is not None:
+                    pulse_csv = a_scan_folder / f"a_scan_pulse_{pulse_idx:03d}.csv"
+                    _write_wave_csv(
+                        pulse_csv,
+                        t,
+                        y,
+                        {
+                            "pulse_index": pulse_idx,
+                            "pulse_total": pulses,
+                            "scope_sampling_rate_hz": (
+                                float(scope_fs_hz) if scope_fs_hz is not None else "n/a"
+                            ),
+                        },
+                    )
                 self.bridge.a_mode_log.emit(
                     f"Captured A-mode echo {pulse_idx}/{pulses}"
                 )
@@ -6089,24 +6126,24 @@ class ScannerMainWindow(QMainWindow):
                 }
             )
 
-            avg_csv = a_scan_folder / "a_scan_average.csv"
-            with open(avg_csv, "w", encoding="utf-8", newline="") as csv_file:
-                final_meta = dict(a_scan_metadata)
-                final_meta["effective_filter_sampling_rate_hz"] = float(
-                    filter_sampling_rate_hz
+            if store_automatically and a_scan_folder is not None:
+                avg_csv = a_scan_folder / "a_scan_average.csv"
+                with open(avg_csv, "w", encoding="utf-8", newline="") as csv_file:
+                    final_meta = dict(a_scan_metadata)
+                    final_meta["effective_filter_sampling_rate_hz"] = float(
+                        filter_sampling_rate_hz
+                    )
+                    final_meta["effective_highpass_cutoff_hz"] = float(effective_cutoff_hz)
+                    for key, value in final_meta.items():
+                        csv_file.write(f"# {key}: {value}\n")
+                    writer = csv.writer(csv_file)
+                    writer.writerow(
+                        ["Time_s", "Average_Detrended_Amplitude_V", "A_Mode_Envelope_V"]
+                    )
+                    writer.writerows(zip(t_ref, avg, a_mode_signal))
+                self.bridge.a_mode_log.emit(
+                    f"A-mode CSV files saved in run folder: {a_scan_folder}"
                 )
-                final_meta["effective_highpass_cutoff_hz"] = float(effective_cutoff_hz)
-                for key, value in final_meta.items():
-                    csv_file.write(f"# {key}: {value}\n")
-                writer = csv.writer(csv_file)
-                writer.writerow(
-                    ["Time_s", "Average_Detrended_Amplitude_V", "A_Mode_Envelope_V"]
-                )
-                writer.writerows(zip(t_ref, avg, a_mode_signal))
-
-            self.bridge.a_mode_log.emit(
-                f"A-mode CSV files saved in run folder: {a_scan_folder}"
-            )
 
             self.bridge.a_mode_log.emit("A-mode scan finished.")
         except Exception as exc:
@@ -6136,6 +6173,12 @@ class ScannerMainWindow(QMainWindow):
             return
 
         active_scan_type = self._current_bc_scan_type()
+        if not self.store_automatically_check.isChecked() and active_scan_type != "standard":
+            self._set_bc_scan_type("standard")
+            active_scan_type = "standard"
+            self.bridge.bc_log.emit(
+                "C-Mode and Pressure Field Mode require stored readings; running A-Mode only."
+            )
         self._bc_apply_unlocked = True
         self._bc_pressure_field_cache = None
         self._bc_pressure_field_source = None
@@ -6159,6 +6202,7 @@ class ScannerMainWindow(QMainWindow):
         sock = None
         osc = None
         dry_run = self.dry_run_check.isChecked()
+        store_automatically = self.store_automatically_check.isChecked()
         import importlib
 
         try:
@@ -6265,28 +6309,35 @@ class ScannerMainWindow(QMainWindow):
                     osc,
                     log_fn=self.bridge.bc_log.emit,
                 )
-                scan_folder = oscmod.create_scan_folder()
-                self.bridge.bc_log.emit(f"Scan folder: {scan_folder}")
+                scan_folder = None
+                if store_automatically:
+                    scan_folder = oscmod.create_scan_folder()
+                    self.bridge.bc_log.emit(f"Scan folder: {scan_folder}")
                 self.bridge.bc_log.emit("Hardware connected.")
             else:
-                # Dry-run: create scan folder directly without importing Oscilloscope
-                _data_dir = DATA_DIR
-                _data_dir.mkdir(exist_ok=True)
-                _existing = [
-                    d
-                    for d in os.listdir(_data_dir)
-                    if d.startswith("scan_") and os.path.isdir(_data_dir / d)
-                ]
-                _nums = [
-                    int(d.split("_")[1]) for d in _existing if d.split("_")[1].isdigit()
-                ]
-                _next = max(_nums, default=0) + 1
-                scan_folder = str(_data_dir / f"scan_{_next:03d}")
-                os.makedirs(scan_folder, exist_ok=True)
-                self.bridge.bc_log.emit(f"[Dry-run] Scan folder: {scan_folder}")
+                scan_folder = None
+                if store_automatically:
+                    # Dry-run: create scan folder directly without importing Oscilloscope.
+                    _data_dir = DATA_DIR
+                    _data_dir.mkdir(exist_ok=True)
+                    _existing = [
+                        d
+                        for d in os.listdir(_data_dir)
+                        if d.startswith("scan_") and os.path.isdir(_data_dir / d)
+                    ]
+                    _nums = [
+                        int(d.split("_")[1]) for d in _existing if d.split("_")[1].isdigit()
+                    ]
+                    _next = max(_nums, default=0) + 1
+                    scan_folder = str(_data_dir / f"scan_{_next:03d}")
+                    os.makedirs(scan_folder, exist_ok=True)
+                    self.bridge.bc_log.emit(f"[Dry-run] Scan folder: {scan_folder}")
                 self.bridge.bc_log.emit(
                     "[Dry-run] Using dummy_signal_generator.py for acquisition."
                 )
+
+            if not store_automatically:
+                self.bridge.bc_log.emit("3D-Mode automatic storage is disabled.")
 
             if rig_function and sock:
                 rig_function.send_command(sock, "INC")
@@ -6357,11 +6408,13 @@ class ScannerMainWindow(QMainWindow):
                 if pressure_field_mode
                 else "a_mode_measurements"
             )
-            measurements_dir = Path(scan_folder) / measurements_subdir
-            measurements_dir.mkdir(parents=True, exist_ok=True)
-            self.bridge.bc_log.emit(
-                f"3D-Mode measurement folder: {measurements_dir}"
-            )
+            measurements_dir = None
+            if store_automatically and scan_folder is not None:
+                measurements_dir = Path(scan_folder) / measurements_subdir
+                measurements_dir.mkdir(parents=True, exist_ok=True)
+                self.bridge.bc_log.emit(
+                    f"3D-Mode measurement folder: {measurements_dir}"
+                )
             c_mode_signal_map = np.empty((cross_steps, scan_steps), dtype=object)
             c_mode_signal_map[:, :] = None
             c_mode_metric_map = np.full((cross_steps, scan_steps), np.nan, dtype=float)
@@ -6534,30 +6587,30 @@ class ScannerMainWindow(QMainWindow):
                                 f"3D-mode filtering WARNING: cutoff={a_mode_cutoff_hz/1000.0:.3f} kHz is close to Nyquist={nyquist_hz/1000.0:.3f} kHz; filtering is meaningful when cutoff is much smaller than Nyquist."
                             )
 
-                    csv_path = measurements_dir / (
-                        f"point_{point_order:04d}_r{axis2_idx:03d}_c{axis1_idx:03d}.csv"
-                    )
-                    with open(csv_path, "w", encoding="utf-8") as _f:
-                        _f.write(f"# algorithm: {scan_algorithm_label}\n")
-                        _f.write(f"# point_order: {point_order}\n")
-                        _f.write(f"# row_axis (Axis 2): {scan['cross_axis']}\n")
-                        _f.write(f"# column_axis (Axis 1): {scan['scan_axis']}\n")
-                        _f.write(f"# cross_point: {axis2_idx}\n")
-                        _f.write(f"# scan_point: {axis1_idx}\n")
-                        _f.write(f"# cross_mm: {point['cross_mm']:.6f}\n")
-                        _f.write(f"# scan_mm: {point['scan_mm']:.6f}\n")
-                        _f.write(f"# cross_pulse: {target_axis2_pulse}\n")
-                        _f.write(f"# scan_pulse: {target_axis1_pulse}\n")
-                        _f.write("Time (s),Amplitude (V)\n")
-                        for _t, _v in zip(t_acq, echo_acq):
-                            _f.write(f"{_t:.10e},{_v:.10e}\n")
-                    self.bridge.bc_plot_csv.emit(str(csv_path))
-                    self.bridge.bc_log.emit(
-                        f"Saved averaged echo: point {point_order}/{total_scans} (row {axis2_idx}, col {axis1_idx}, {scan_algorithm_label})"
-                    )
-
-                    point_records.append(
-                        {
+                    if store_automatically and measurements_dir is not None and scan_folder is not None:
+                        csv_path = measurements_dir / (
+                            f"point_{point_order:04d}_r{axis2_idx:03d}_c{axis1_idx:03d}.csv"
+                        )
+                        with open(csv_path, "w", encoding="utf-8") as _f:
+                            _f.write(f"# algorithm: {scan_algorithm_label}\n")
+                            _f.write(f"# point_order: {point_order}\n")
+                            _f.write(f"# row_axis (Axis 2): {scan['cross_axis']}\n")
+                            _f.write(f"# column_axis (Axis 1): {scan['scan_axis']}\n")
+                            _f.write(f"# cross_point: {axis2_idx}\n")
+                            _f.write(f"# scan_point: {axis1_idx}\n")
+                            _f.write(f"# cross_mm: {point['cross_mm']:.6f}\n")
+                            _f.write(f"# scan_mm: {point['scan_mm']:.6f}\n")
+                            _f.write(f"# cross_pulse: {target_axis2_pulse}\n")
+                            _f.write(f"# scan_pulse: {target_axis1_pulse}\n")
+                            _f.write("Time (s),Amplitude (V)\n")
+                            for _t, _v in zip(t_acq, echo_acq):
+                                _f.write(f"{_t:.10e},{_v:.10e}\n")
+                        self.bridge.bc_plot_csv.emit(str(csv_path))
+                        self.bridge.bc_log.emit(
+                            f"Saved averaged echo: point {point_order}/{total_scans} (row {axis2_idx}, col {axis1_idx}, {scan_algorithm_label})"
+                        )
+                        point_records.append(
+                            {
                             "point_order": point_order,
                             "row_index": axis2_idx,
                             "col_index": axis1_idx,
@@ -6576,8 +6629,8 @@ class ScannerMainWindow(QMainWindow):
                             "measurement_csv": str(
                                 Path(csv_path).relative_to(Path(scan_folder)).as_posix()
                             ),
-                        }
-                    )
+                            }
+                        )
 
                     if c_mode_enabled:
                         try:
@@ -6640,7 +6693,7 @@ class ScannerMainWindow(QMainWindow):
                     time.sleep(pulse_width_sec)
             self.bridge.bc_log.emit("B Scan finished.")
 
-            if point_records:
+            if store_automatically and scan_folder is not None and point_records:
                 manifest_path = os.path.join(scan_folder, "point_manifest.csv")
                 with open(manifest_path, "w", newline="", encoding="utf-8") as mf:
                     fieldnames = [
@@ -6668,7 +6721,7 @@ class ScannerMainWindow(QMainWindow):
                     f"Point manifest saved: {os.path.basename(manifest_path)}"
                 )
 
-            if pressure_field_mode and not self.stop_event.is_set():
+            if pressure_field_mode and store_automatically and not self.stop_event.is_set():
                 try:
                     axis1_mm = np.linspace(0.0, float(scan["scan_length"]), scan_steps)
                     axis2_mm = np.linspace(
@@ -6692,7 +6745,7 @@ class ScannerMainWindow(QMainWindow):
                         f"Pressure-field source metadata update failed: {pf_exc}"
                     )
 
-            if c_mode_enabled and not self.stop_event.is_set():
+            if c_mode_enabled and store_automatically and not self.stop_event.is_set():
                 try:
                     axis1_mm = np.linspace(0.0, float(scan["scan_length"]), scan_steps)
                     axis2_mm = np.linspace(
@@ -6735,7 +6788,7 @@ class ScannerMainWindow(QMainWindow):
                     )
 
             # Save A-mode matrix with auto-incrementing ID
-            if a_mode_signals and acquisition_count > 0:
+            if store_automatically and a_mode_signals and acquisition_count > 0:
                 try:
                     # Find the maximum signal length
                     max_length = max(len(signal) for signal in a_mode_signals)

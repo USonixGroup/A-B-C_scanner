@@ -102,7 +102,10 @@ The launcher imports the application from `api/src/pyside_gui.py`. Run it from t
 4. Select **A-Mode**, **B-Mode**, or **3D-Mode** and define the position, axes, scan lengths, and number of points.
 5. Enable **Dry Run** to test motion/acquisition logic with generated echoes, or leave it disabled to use connected hardware.
 6. Enable live preview if required, then start the scan.
-7. Review the plot and log, and use the export controls to save processed results.
+7. Select **Store Automatically** next to **Live Preview** to save acquired readings and measurements during the scan. It is selected by default.
+8. Review the plot and log, and use the export controls to save processed results.
+
+<p style="color: #b42318;"><strong>⚠ Autosave warning:</strong> Clear <strong>Store Automatically</strong> before starting a scan only when you intentionally do not want readings and measurements written to disk. When it is selected, every acquired reading and measurement is stored automatically. When it is clear, results remain in memory for preview and manual export only. In 3D Mode, clearing it restricts the scan type to A-Mode because C-Mode and Pressure Field Mode require stored readings to construct their images.</p>
 
 In **Excitation Mode**, amplitude accepts up to three decimal places in Vpp. The amplitude arrow controls use a `1 Vpp` increment; values such as `1.123 Vpp` can be entered directly.
 
