@@ -7976,6 +7976,7 @@ a.anchor-link {
 </tr>
 </tbody>
 </table>
+<p>Amplitude accepts up to three decimal places. The arrow controls change amplitude by <code>1 Vpp</code>; enter values such as <code>1.123 Vpp</code> directly when needed.</p>
 <p>For carrier frequency $f_c$, cycle count $N_c$, and pulse repetition frequency $PRF$:</p>
 <p>$$T_p = \frac{N_c}{f_c}, \qquad T_r = \frac{1}{PRF}$$</p>
 <p>The pulse width must satisfy $T_p &lt; T_r$. The preview shows the requested waveform; it does not independently measure the electrical signal at the generator output. The <code>Run Timing Test</code> button runs this test and also checks with hardware limitations for the signal generator and displays the outputs.</p>
@@ -8022,6 +8023,10 @@ a.anchor-link {
 <td>Updates the waveform plot during acquisition</td>
 </tr>
 <tr>
+<td>Store Automatically</td>
+<td>Saves all acquired readings and measurements for the run</td>
+</tr>
+<tr>
 <td>Dry Run</td>
 <td>Uses generated echoes instead of instrument data</td>
 </tr>
@@ -8029,7 +8034,8 @@ a.anchor-link {
 </table>
 <p>For sound speed $c$ and pulse-echo travel time $t$, depth is</p>
 <p>$$d = \frac{ct}{2}$$</p>
-<p>The factor of two accounts for propagation to the reflector and back. The filter cut-off must be below the Nyquist frequency $f_s/2$. A-mode runs are saved in numbered <code>data/a_mode_scan_NNN/</code> folders and can also be exported from the GUI.</p>
+<p>The factor of two accounts for propagation to the reflector and back. The filter cut-off must be below the Nyquist frequency $f_s/2$. The A-mode Start Scan button uses the same 34 px rounded command style as the B-Mode and 3D-Mode controls.</p>
+<p style="color: #b42318;"><strong>⚠ Autosave warning:</strong> <strong>Store Automatically</strong> is selected by default. Keep it selected to save every acquired reading and measurement in a numbered `data/a_mode_scan_NNN/` folder. Clear it before starting only when you intentionally want in-memory preview and manual export without automatic files.</p>
 </div>
 </div>
 </div>
@@ -8076,11 +8082,16 @@ a.anchor-link {
 <td>Live Preview</td>
 <td>Refreshes the B-mode image as rows are acquired</td>
 </tr>
+<tr>
+<td>Store Automatically</td>
+<td>Saves all acquired readings and measurements for the run</td>
+</tr>
 </tbody>
 </table>
 <p>For a requested length $L$ and the implementation's point count $N$, the commanded step is calculated as</p>
 <p>$$\Delta x = \frac{L}{\max(1,N)}$$</p>
-<p>Use the export control to save the resulting B-mode matrix.</p>
+<p>The Start Scan and Stop buttons occupy an equal-width command row; Dry Run, Live Preview, Store Automatically, and source status occupy the row above the log.</p>
+<p style="color: #b42318;"><strong>⚠ Autosave warning:</strong> <strong>Store Automatically</strong> is selected by default. Keep it selected to save each acquired reading in a numbered `data/b_mode_scan_NNN/` folder. Clear it before starting only when you intentionally want in-memory preview and manual export without automatic files.</p>
 </div>
 </div>
 </div>
@@ -8124,6 +8135,10 @@ a.anchor-link {
 <td>Updates the selected representation while scanning</td>
 </tr>
 <tr>
+<td>Store Automatically</td>
+<td>Saves all acquired readings, manifests, matrices, and metadata for the run</td>
+</tr>
+<tr>
 <td>Dry Run</td>
 <td>Uses synthetic echoes and avoids instrument acquisition</td>
 </tr>
@@ -8136,6 +8151,8 @@ a.anchor-link {
 <li><strong>Pressure Field Mode:</strong> maps a selected statistical feature and can optionally apply a high-pass or band-pass Butterworth filter.</li>
 </ul>
 <p>Pressure-field metrics include Max, Min, Mode, Median, Mean, RMS, Variance, Kurtosis, Skewness, Entropy, and Energy. Available colour maps include 16-bit grey, viridis, plasma, inferno, magma, cividis, turbo, and jet.</p>
+<p>Both scan-axis length fields accept positive and negative values. A negative length moves along the negative direction of its selected physical axis. Start Scan and Stop Scan use the same 34 px rounded command style as the A-Mode and B-Mode controls.</p>
+<p style="color: #b42318;"><strong>⚠ Autosave warning:</strong> <strong>Store Automatically</strong> is selected by default. Keep it selected to save every grid reading, point manifest, waveform matrix, and metadata file. Clear it before starting only when you intentionally want in-memory preview and manual export without automatic files.</p>
 </div>
 </div>
 </div>
@@ -8173,14 +8190,14 @@ a.anchor-link {
 <div class="jp-Collapser jp-InputCollapser jp-Cell-inputCollapser">
 </div>
 <div class="jp-InputArea jp-Cell-inputArea"><div class="jp-RenderedHTMLCommon jp-RenderedMarkdown jp-MarkdownOutput" data-mime-type="text/markdown">
-<h2 id="8.-Data,-previews,-and-exports">8. Data, previews, and exports<a class="anchor-link" href="#8.-Data,-previews,-and-exports">¶</a></h2><p>Runtime acquisition data are stored under the repository's <code>data/</code> directory. Numbered run folders and matrix names prevent normal scans from replacing previous results. Depending on the mode, saved artefacts include:</p>
+<h2 id="8.-Data,-previews,-and-exports">8. Data, previews, and exports<a class="anchor-link" href="#8.-Data,-previews,-and-exports">¶</a></h2><p>When Store Automatically is selected, runtime acquisition data are stored under the repository's <code>data/</code> directory. Numbered run folders and matrix names prevent normal scans from replacing previous results. Depending on the mode, saved artefacts include:</p>
 <ul>
 <li>waveform CSV files with time and amplitude columns;</li>
 <li>scan-point manifests and acquisition metadata;</li>
 <li>NumPy <code>.npy</code> waveform matrices; and</li>
 <li>exported plots, processed data, and tab logs selected by the user.</li>
 </ul>
-<p>Matplotlib toolbars provide plot navigation. Live preview affects display updates, not the underlying scan geometry. Do not treat voltage values as calibrated acoustic pressure unless the complete measurement chain—including hydrophone/probe sensitivity, amplification, attenuation, and frequency response—has been calibrated and applied.</p>
+<p>When Store Automatically is clear, no automatic run folders or acquisition files are created; results remain available for preview and explicit export actions. Matplotlib toolbars provide plot navigation. Live preview affects display updates, not the underlying scan geometry. Do not treat voltage values as calibrated acoustic pressure unless the complete measurement chain—including hydrophone/probe sensitivity, amplification, attenuation, and frequency response—has been calibrated and applied.</p>
 </div>
 </div>
 </div>
