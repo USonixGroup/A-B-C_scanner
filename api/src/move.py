@@ -13,7 +13,7 @@
 
 # # ✅ Utility functions
 def mm_to_pulse(mm):
-    return int(mm * 5000)
+    return int(round(mm * 5000))
 
 
 # def main():
