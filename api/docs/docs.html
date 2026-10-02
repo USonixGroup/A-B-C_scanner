@@ -7891,8 +7891,8 @@ a.anchor-link {
 <tr>
 <td>Oscilloscope</td>
 <td>Sampling Rate</td>
-<td>Acquisition rate, displayed in kHz</td>
-<td>Hardware-dependent - default is 10 MHz</td>
+<td>Requested scope rate, entered in MHz (stored in Hz in the settings file); the scope's actual rate is used for calculations, with a warning if it differs by more than 2%</td>
+<td>Hardware-dependent - default is 1 MHz; use at least 10 times the excitation frequency</td>
 </tr>
 </tbody>
 </table>
@@ -8076,7 +8076,7 @@ a.anchor-link {
 </tr>
 <tr>
 <td>Dry Run</td>
-<td>Generates synthetic A-scans without hardware acquisition</td>
+<td>Generates synthetic A-scans at the Config-tab sampling rate without hardware acquisition</td>
 </tr>
 <tr>
 <td>Live Preview</td>
@@ -8140,7 +8140,7 @@ a.anchor-link {
 </tr>
 <tr>
 <td>Dry Run</td>
-<td>Uses synthetic echoes and avoids instrument acquisition</td>
+<td>Uses synthetic echoes at the Config-tab sampling rate and avoids instrument acquisition</td>
 </tr>
 </tbody>
 </table>
@@ -8178,7 +8178,9 @@ a.anchor-link {
 <ol start="3">
 <li><p>Filtering is implemented with Butterworth second-order sections. For a valid digital high-pass filter, $0 &lt; f_h &lt; f_s/2$; for a band-pass filter, $0 &lt; f_l &lt; f_h &lt; f_s/2$. The GUI reports and disables invalid cut-offs rather than applying an undefined filter.</p>
 </li>
-<li><p>Dry-run echoes are synthetic test signals. They are useful for checking acquisition flow, plotting, filtering, and export, but they do not validate hardware timing, acoustic calibration, sensitivity, or absolute pressure.</p>
+<li><p>Dry-run echoes are synthetic test signals: two inverted copies of the excitation burst (the second at half the amplitude of the first) plus Gaussian noise of 0.1 V standard deviation. The burst lasts cycles/frequency, uses the selected window, and is generated at exactly the Config-tab sampling rate. They are useful for checking acquisition flow, plotting, filtering, and export, but they do not validate hardware timing, acoustic calibration, sensitivity, or absolute pressure.</p>
+</li>
+<li><p>The Config-tab <strong>Sampling Rate</strong> is entered in MHz and stored in Hz in the settings file; all calculations use Hz. In hardware scans it is the rate requested from the oscilloscope, while the rate the scope actually used is read from each waveform and is used for all A-, B-, and 3D-mode filtering, envelope, gating, and Nyquist calculations. A warning is logged when it differs from the field by more than 2%. C-mode and pressure-field <strong>Apply</strong> and the 3D live preview use the rate recorded in the time axis of the stored waveforms, with the field only as a fallback.</p>
 </li>
 </ol>
 </div>
@@ -8193,7 +8195,9 @@ a.anchor-link {
 <h2 id="8.-Data,-previews,-and-exports">8. Data, previews, and exports<a class="anchor-link" href="#8.-Data,-previews,-and-exports">¶</a></h2><p>When Store Automatically is selected, runtime acquisition data are stored under the repository's <code>data/</code> directory. Numbered run folders and matrix names prevent normal scans from replacing previous results. Depending on the mode, saved artefacts include:</p>
 <ul>
 <li>waveform CSV files with time and amplitude columns;</li>
-<li>scan-point manifests and acquisition metadata;</li>
+<li>scan-point manifests (A-mode: none; B-mode and 3D: <code>point_manifest.csv</code>) and acquisition metadata;</li>
+<li>averaged CSVs at every point in A-, B-, and 3D-mode (and per-pulse CSVs in A-mode), each with header lines giving the scan mode, pulse number, and both the Config and actual sampling rates (<code>sampling_rate_config_hz</code>, <code>sampling_rate_actual_hz</code>);</li>
+<li>in B-mode and 3D, all raw single-pulse echoes in one memory-mapped float32 array <code>pulses.npy</code> (B-mode shape <code>(points, pulses, samples)</code>; 3D shape <code>(rows, columns, pulses, samples)</code>) with <code>pulses_time_s.npy</code> and <code>pulses_metadata.txt</code>; per-pulse CSVs for these modes are optional (Config tab, off by default);</li>
 <li>NumPy <code>.npy</code> waveform matrices; and</li>
 <li>exported plots, processed data, and tab logs selected by the user.</li>
 </ul>
@@ -8243,7 +8247,8 @@ a.anchor-link {
 <li>If the GUI does not start, install the dependencies and launch it from the repository root.</li>
 <li>If VISA discovery fails, confirm the configured resource string, backend/runtime, cable, and network route.</li>
 <li>If the rig is unreachable, check its host, port, subnet, and whether another client owns the connection.</li>
-<li>If filtering is rejected, keep all cut-offs below half the configured sampling rate.</li>
+<li>If filtering is rejected, keep all cut-offs below half the sampling rate (the Config field is in MHz; hardware scans use the actual scope rate).</li>
+<li>If a sampling-rate WARNING appears, the scope used a different rate from the Config field; the actual scope rate is used for the calculations.</li>
 <li>If hardware is unavailable, enable Dry Run to test processing and export.</li>
 </ul>
 <p>To rebuild the HTML page consumed by the GUI after editing this notebook:</p>

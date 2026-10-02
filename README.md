@@ -115,11 +115,23 @@ Scan lengths are specified in millimetres. For B-mode, a negative scan length mo
 
 The Move Rig and A-mode X/Y/Z fields, B-mode scan length, and 3D scan-axis lengths accept three decimal places with `0.001 mm` increments. The configured conversion is 5000 pulses/mm, so one controller pulse is $0.0002\,\mathrm{mm} = 0.2\,\mathrm{\mu m} = 200\,\mathrm{nm}$. A distance of $0.0001\,\mathrm{mm}$ is $100\,\mathrm{nm}$, not $0.1\,\mathrm{nm}$, and rounds to zero pulses. The backend rounds movement requests to whole pulses because fractional controller pulses are not supported.
 
+### Sampling rate
+
+The **Sampling Rate** field on the Config tab is entered in **MHz** (for example `100` for 100 MS/s). It is stored in `api/settings/gui_settings.json` in Hz, and all internal calculations use Hz. A blank, non-numeric, zero, or negative value is rejected with a message in the log.
+
+- **Dry Run:** synthetic echoes are generated at exactly this rate, and the same value is used for filtering.
+- **Hardware scans:** the field is the rate *requested* from the oscilloscope. The rate the scope actually used is read from each captured waveform and is used for all A-mode, B-mode, and 3D-mode filtering, envelope, gating, and Nyquist calculations. If it differs from the field by more than 2%, the log shows a `WARNING`.
+- **Saved scans:** C-mode and pressure-field **Apply**, and the 3D live preview, use the rate recorded in the time axis of each stored waveform rather than the field. A `WARNING` is logged when it differs from the field by more than 2%. The field is only a fallback when no rate can be derived from the data.
+
+Choose a rate of at least 10 times the excitation frequency. If the high-pass cut-off is at or above the Nyquist frequency ($f_s/2$), the filter is disabled and an error is logged.
+
+Dry-run echoes consist of two inverted copies of the excitation burst (the second at half the amplitude of the first) with additive Gaussian noise of 0.1 V standard deviation. The burst lasts `cycles / frequency` and uses the selected window. They are intended for checking the workflow, not for validating hardware.
+
 ## Scan modes
 
 ### A-mode
 
-The rig moves by the requested X/Y/Z increments and records the configured number of pulse echoes. Acquisitions can be averaged and high-pass filtered. When a non-zero speed of sound is supplied, the horizontal axis is converted from time to distance.
+The rig moves by the requested X/Y/Z increments and records the configured number of pulse echoes. Acquisitions can be averaged and high-pass filtered. With more than one pulse, Live Preview shows the current echo and the running average, and the final plot shows the first, last, and averaged echoes with the envelope of the average. If the echoes to be averaged have different lengths or misaligned time axes (A-, B-, and 3D-mode), the log shows an `averaging WARNING`. When a non-zero speed of sound is supplied, the horizontal axis is converted from time to distance.
 
 ### B-mode
 
@@ -133,11 +145,25 @@ The 3D workflow scans two spatial axes in a raster or zigzag pattern and capture
 - a C-mode image calculated from a user-defined time gate; or
 - a pressure-field map calculated using a selected statistical metric.
 
-Pressure-field processing can optionally apply a high-pass or band-pass Butterworth filter. Cut-off frequencies must remain below the Nyquist frequency implied by the oscilloscope sampling rate.
+Pressure-field processing can optionally apply a high-pass or band-pass Butterworth filter. Cut-off frequencies must remain below the Nyquist frequency implied by the sampling rate recorded in the stored waveforms (see [Sampling rate](#sampling-rate)).
 
 ## Data and settings
 
 Runtime data are written under `data/` using numbered folders and filenames so earlier runs are preserved. Depending on the mode, outputs include waveform CSV files, point manifests, metadata, and `.npy` matrices. The GUI also provides explicit export actions for data, figures, and logs.
+
+Every stored waveform CSV starts with `# key: value` header lines that give the scan mode (`A-mode`, `B-mode`, or `3D-mode` with its `scan_type`), the pulse number (`pulse_index` and `pulse_total`, or `average`), and both sampling rates: `sampling_rate_config_hz` (Config field) and `sampling_rate_actual_hz` (`sampling_rate_actual_source` is `scope` when reported by the oscilloscope, otherwise `time_axis`, derived from the recorded time axis). Single-pulse data hold the raw echo as acquired; averaged files hold the detrended average of all pulses at that point. With **Store Automatically** selected, each run folder contains:
+
+| Mode | Folder | Contents |
+| --- | --- | --- |
+| A-mode | `data/a_mode_scan_NNN/` | `a_scan_pulse_NNN.csv` (one per pulse) and `a_scan_average.csv` (average and envelope) |
+| B-mode | `data/b_mode_scan_NNN/` | `point_manifest.csv`, `b_mode_measurements/point_NNNN.csv` (average per point), and the raw single-pulse echoes in `pulses.npy` with `pulses_time_s.npy` and `pulses_metadata.txt` |
+| 3D, C-mode, pressure field | `data/scan_NNN/` | `point_manifest.csv`, `a_mode_measurements/` (or `pressure_mode_measurements/`) with `point_*_rRRR_cCCC.csv` (average per point), and the raw single-pulse echoes in `pulses.npy` with `pulses_time_s.npy` and `pulses_metadata.txt`; the averaged matrix `a_mode_matrix_NNN.npy` and its `_metadata.txt` are written to `data/` |
+
+The point manifests list, for every point, its position, the number of pulses averaged, the Config and actual sampling rates, the relative path of the averaged CSV, and the index of its raw echoes in `pulses.npy` (`pulse_array_index`).
+
+**Raw per-pulse array.** B-mode and 3D scans write all single-pulse echoes into one memory-mapped float32 array instead of thousands of CSV files: shape `(points, pulses, samples)` for B-mode and `(rows, columns, pulses, samples)` for 3D, where rows are Axis 2 and columns are Axis 1. The array is filled as the scan runs, unreached entries stay `NaN`, and echoes shorter than the first one are `NaN`-padded. The time axis is stored once in `pulses_time_s.npy`, and `pulses_metadata.txt` records the shape, units, scan mode, axes, and both sampling rates. Load it with `np.load("pulses.npy", mmap_mode="r")`. Tick **Also save per-pulse CSV files** on the Config tab to additionally write one CSV per pulse (`b_mode_measurements/pulses/` or `<measurements folder>/pulses/`); this is off by default because large scans create very many files. A-mode always writes its few per-pulse CSVs.
+
+**Crash safety.** Data are written as the scan progresses: each pulse (A-mode CSV or `pulses.npy` entry), each averaged point CSV, and each manifest row are saved immediately, and `pulses.npy` is flushed after every point. If a scan fails, is stopped, or the program is killed, all completed points remain on disk and the manifest lists them; the point in progress keeps the pulses already acquired (the rest is `NaN`). The 3D averaged matrix `a_mode_matrix_NNN.npy` is written when the scan ends, stops, or fails with an error, but not after a hard process kill; it can be rebuilt from the point CSVs. A-mode writes `a_scan_average.csv` at the end of the run, but the per-pulse CSVs it is computed from are already saved. The metadata text file and the A-mode and B-mode matrix exports also record the scan mode, pulse count, and both sampling rates.
 
 The application saves its current configuration to:
 
@@ -199,7 +225,8 @@ requirements.txt           pip dependencies
 - **The GUI does not start:** verify that the active environment contains `PySide6`, `matplotlib`, and `pandas`, and launch from the repository root.
 - **A VISA device is not found:** confirm its address in the Config tab, check the cable/network route, and inspect `pyvisa.ResourceManager().list_resources()` in the same environment.
 - **The rig is unreachable:** verify that the host and port are on the same reachable network and that no other process owns the controller connection.
-- **A filter is rejected:** reduce its cut-off frequency or increase the acquisition sampling rate so the cut-off is below Nyquist.
+- **A filter is rejected:** reduce its cut-off frequency or increase the acquisition sampling rate (Config tab, in MHz) so the cut-off is below Nyquist.
+- **A sampling-rate WARNING appears:** the oscilloscope used a different rate from the Config field. The actual scope rate is used for the calculations; update the field to match it, or adjust the scope timebase/memory settings.
 - **No hardware is available:** enable **Dry Run** to exercise acquisition, plotting, processing, and export with synthetic signals.
 
 ## License

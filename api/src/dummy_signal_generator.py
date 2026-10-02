@@ -5,7 +5,6 @@ import numpy as np
 
 from api.src.Signal_function import (
     ARB_POINTS_PER_CYCLE,
-    _arb_sample_count,
     _build_windowed_sine_waveform,
 )
 
@@ -86,13 +85,15 @@ def generate_dummy_echo(
     pre_trigger_sec = 1.5 * pulse_width_sec
     echo_delay_sec = 2.0 * pulse_width_sec
     second_echo_delay_sec = 4.2 * pulse_width_sec
-    total_duration_sec = max(6.0 * pulse_width_sec, second_echo_delay_sec + 1.5 * pulse_width_sec)
+    total_duration_sec = pre_trigger_sec + second_echo_delay_sec + 1.5 * pulse_width_sec
 
     n_total = max(256, int(np.ceil(total_duration_sec * sampling)))
-    t = np.linspace(0.0, total_duration_sec, n_total, endpoint=False)
+    # dt must equal 1/sampling so the filter's fs matches the time axis.
+    t = np.arange(n_total, dtype=float) / sampling
     echo = np.zeros(n_total, dtype=float)
 
-    pulse_samples = min(_arb_sample_count(cycles), n_total)
+    # Burst length in samples must follow cycles/frequency at the record's sampling rate.
+    pulse_samples = min(max(2, int(round(pulse_width_sec * sampling))), n_total)
     burst = 0.5 * amplitude * _build_windowed_sine_waveform(
         no_of_cycles_per_pulse=cycles,
         window_type=wtype,

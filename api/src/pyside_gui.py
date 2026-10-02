@@ -112,6 +112,91 @@ def _read_waveform_csv(csv_path: str) -> tuple[list[float], list[float]]:
     return x_vals, y_vals
 
 
+def _sampling_rate_from_time_axis(t) -> float | None:
+    """Actual sample rate (Hz) implied by a recorded time axis, or None if it cannot be derived."""
+    import numpy as np
+
+    arr = np.asarray(t, dtype=float)
+    if arr.size < 2:
+        return None
+    dt = float(np.median(np.diff(arr)))
+    if not np.isfinite(dt) or dt <= 0.0:
+        return None
+    return 1.0 / dt
+
+
+# Relative Config-vs-actual sampling-rate deviation that triggers a user warning.
+SAMPLING_RATE_WARN_PCT = 2.0
+
+
+def _pulse_echo_depth_mm(t, sound_speed_mps: float):
+    """Depth in mm for round-trip time t (s): d = c*t/2."""
+    return 0.5 * float(sound_speed_mps) * t * 1000.0
+
+
+class _ManifestWriter:
+    """Appends one manifest row per point and flushes it, so the manifest survives a crashed scan."""
+
+    def __init__(self, path, fieldnames: list[str]) -> None:
+        self._file = open(path, "w", newline="", encoding="utf-8")
+        self._writer = csv.DictWriter(self._file, fieldnames=fieldnames, extrasaction="ignore")
+        self._writer.writeheader()
+        self._file.flush()
+
+    def append(self, record: dict) -> None:
+        self._writer.writerow(record)
+        self._file.flush()
+
+    def close(self) -> None:
+        if not self._file.closed:
+            self._file.close()
+
+
+class _PulseArrayWriter:
+    """Writes raw per-pulse echoes into one memory-mapped float32 .npy, filled point by point.
+
+    Shape is lead_shape + (pulses, samples); samples come from the first echo written and
+    later echoes are truncated or NaN-padded to it. Unwritten entries stay NaN.
+    """
+
+    def __init__(self, path, lead_shape, pulses: int) -> None:
+        self.path = Path(path)
+        self.time_path = self.path.with_name(self.path.stem + "_time_s.npy")
+        self.lead_shape = tuple(int(n) for n in lead_shape)
+        self.pulses = int(pulses)
+        self.array = None
+        self.n_samples = 0
+        self.length_mismatch = False
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        return self.lead_shape + (self.pulses, self.n_samples)
+
+    def write(self, index: tuple[int, ...], pulse_number: int, t, y) -> None:
+        import numpy as np
+
+        y = np.asarray(y, dtype=float)
+        if self.array is None:
+            self.n_samples = int(y.size)
+            np.save(self.time_path, np.asarray(t, dtype=float)[: self.n_samples])
+            self.array = np.lib.format.open_memmap(
+                self.path, mode="w+", dtype=np.float32, shape=self.shape
+            )
+            self.array[...] = np.nan
+        n = min(self.n_samples, int(y.size))
+        if int(y.size) != self.n_samples:
+            self.length_mismatch = True
+        self.array[index + (pulse_number - 1, slice(0, n))] = y[:n]
+
+    def flush(self) -> None:
+        if self.array is not None:
+            self.array.flush()
+
+    def close(self) -> None:
+        self.flush()
+        self.array = None
+
+
 class PlotCanvas(FigureCanvasQTAgg):
     def __init__(self, title: str) -> None:
         self.figure = Figure(figsize=(5, 4), dpi=100)
@@ -380,10 +465,15 @@ class ScannerMainWindow(QMainWindow):
         self.osc_name_edit = QLineEdit("Lecroy")
         self.osc_address_edit = QLineEdit()
         self.osc_address_edit.setPlaceholderText("USB0::...::INSTR")
-        self.sampling_rate_edit = QLineEdit("1000")
+        self.sampling_rate_edit = QLineEdit("1")
+        self.save_pulse_csv_check = QCheckBox(
+            "Also save per-pulse CSV files (B-mode, 3D; creates many files)"
+        )
+        self.save_pulse_csv_check.setChecked(False)
         osc_form.addRow("Name", self.osc_name_edit)
         osc_form.addRow("VISA Address", self.osc_address_edit)
-        osc_form.addRow("Sampling Rate (kHz)", self.sampling_rate_edit)
+        osc_form.addRow("Sampling Rate (MHz)", self.sampling_rate_edit)
+        osc_form.addRow("Storage", self.save_pulse_csv_check)
         top.addWidget(osc_box, 1, 0, 1, 2)
 
         connection_box = QGroupBox("Connection Test")
@@ -2146,10 +2236,8 @@ class ScannerMainWindow(QMainWindow):
                             )
                             * 1000.0,
                             filter_order=int(self.a_mode_filter_order.value()),
-                            sampling_rate_hz=self._extract_last_float(
-                                self.sampling_rate_edit.text().strip(), 0.0
-                            )
-                            * 1000.0,
+                            sampling_rate_hz=_sampling_rate_from_time_axis(t)
+                            or self._config_sampling_rate_hz(),
                         ),
                         dtype=float,
                     )
@@ -2159,7 +2247,7 @@ class ScannerMainWindow(QMainWindow):
         # Convert time axis using speed of sound from A-mode control (same as A-Mode tab)
         sound_speed_mps = float(self.a_mode_sound_speed.value())
         if sound_speed_mps > 0.0:
-            x = t * sound_speed_mps * 1000.0
+            x = _pulse_echo_depth_mm(t, sound_speed_mps)
             x_label = "Distance (mm)"
         else:
             x = t * 1_000_000.0
@@ -2359,11 +2447,13 @@ class ScannerMainWindow(QMainWindow):
             self.host_edit.setText(str(cfg.get("host", self.host_edit.text())))
             self.port_edit.setText(str(cfg.get("port", self.port_edit.text())))
             sampling_rate_hz = self._extract_last_float(
-                str(cfg.get("sampling_rate", self.sampling_rate_edit.text())),
-                self._extract_last_float(self.sampling_rate_edit.text(), 1000.0)
-                * 1000.0,
+                str(cfg.get("sampling_rate", "")),
+                self._extract_last_float(self.sampling_rate_edit.text(), 1.0) * 1e6,
             )
-            self.sampling_rate_edit.setText(f"{sampling_rate_hz / 1000.0:g}")
+            self.sampling_rate_edit.setText(f"{sampling_rate_hz / 1e6:g}")
+            self.save_pulse_csv_check.setChecked(
+                bool(cfg.get("save_per_pulse_csv", self.save_pulse_csv_check.isChecked()))
+            )
 
             self.tx_windowing_combo.setCurrentText(
                 str(tx.get("window_type", self.tx_windowing_combo.currentText()))
@@ -2582,9 +2672,10 @@ class ScannerMainWindow(QMainWindow):
                 "host": self.host_edit.text().strip(),
                 "port": self.port_edit.text().strip(),
                 "sampling_rate": self._extract_last_float(
-                    self.sampling_rate_edit.text().strip(), 1000.0
+                    self.sampling_rate_edit.text().strip(), 1.0
                 )
-                * 1000.0,
+                * 1e6,
+                "save_per_pulse_csv": bool(self.save_pulse_csv_check.isChecked()),
             },
             "excitation": {
                 "shape": "SIN",
@@ -2739,6 +2830,7 @@ class ScannerMainWindow(QMainWindow):
             widget.currentIndexChanged.connect(self._schedule_settings_save)
 
         checks = [
+            self.save_pulse_csv_check,
             self.tx_auto_preview_check,
             self.a_dry_run_check,
             self.a_live_preview_check,
@@ -2760,6 +2852,230 @@ class ScannerMainWindow(QMainWindow):
             except ValueError:
                 continue
         return fallback
+
+    def _config_sampling_rate_hz(self) -> float:
+        """Config-tab Sampling Rate field (MHz) in Hz; raises instead of silently substituting a default."""
+        text = self.sampling_rate_edit.text().strip()
+        try:
+            rate_hz = float(text) * 1e6
+        except ValueError:
+            rate_hz = float("nan")
+        if not (0.0 < rate_hz < float("inf")):
+            raise ValueError(
+                f"Config tab Sampling Rate (MHz) must be a positive number, got {text!r}."
+            )
+        return rate_hz
+
+    def _resolve_filter_sampling_rate(
+        self, label: str, config_hz: float, actual_rates_hz, log_fn, info: bool = True
+    ) -> float:
+        """Sampling rate (Hz) for filtering: the scope's actual rate when known, else the Config value.
+
+        Logs a WARNING when the actual rate deviates from the Config field; `info=False` limits logging to that warning.
+        """
+        import numpy as np
+
+        rates = [float(r) for r in actual_rates_hz if r is not None and np.isfinite(r) and r > 0.0]
+        if not rates:
+            if info:
+                log_fn(
+                    f"{label} filtering: scope sampling rate unavailable; fs={config_hz/1e6:.6f} MS/s (Config) is used for Nyquist/cutoff calculations."
+                )
+            return float(config_hz)
+        actual_hz = float(np.median(np.asarray(rates, dtype=float)))
+        pct = abs(actual_hz - config_hz) / max(config_hz, 1e-12) * 100.0
+        if info:
+            log_fn(
+                f"{label} filtering: Config sampling rate={config_hz/1e6:.6f} MS/s, scope actual sampling rate={actual_hz/1e6:.6f} MS/s (delta={pct:.2f}%)."
+            )
+        if pct > SAMPLING_RATE_WARN_PCT:
+            log_fn(
+                f"{label} filtering WARNING: scope actual sampling rate differs from the Config field by {pct:.2f}%. "
+                "The actual scope rate is used for all filtering, envelope and gating calculations."
+            )
+        if info:
+            log_fn(
+                f"{label} filtering: fs={actual_hz/1e6:.6f} MS/s (scope actual) is used for Nyquist/cutoff calculations."
+            )
+        return actual_hz
+
+    def _warn_if_config_rate_differs(self, label: str, actual_hz: float) -> None:
+        """Warn when the rate recorded in stored data deviates from the Config field."""
+        try:
+            config_hz = self._config_sampling_rate_hz()
+        except ValueError:
+            return
+        pct = abs(actual_hz - config_hz) / max(config_hz, 1e-12) * 100.0
+        if pct > SAMPLING_RATE_WARN_PCT:
+            self.bridge.bc_log.emit(
+                f"{label} WARNING: sampling rate in the stored data is {actual_hz/1e6:.6f} MS/s but the Config field is {config_hz/1e6:.6f} MS/s "
+                f"({pct:.2f}% apart). The stored-data rate is used."
+            )
+
+    def _stored_scan_sampling_rate_hz(self, scan_folder: str) -> float | None:
+        """Sample rate (Hz) recorded in the time axis of the first stored averaged point CSV."""
+        root = Path(scan_folder)
+        candidates: list[Path] = []
+        manifest = root / "point_manifest.csv"
+        if manifest.exists():
+            try:
+                with open(manifest, "r", encoding="utf-8", newline="") as mf:
+                    for row in csv.DictReader(mf):
+                        rel = str(row.get("measurement_csv", "")).strip()
+                        if rel:
+                            candidates.append(root / rel)
+            except Exception:
+                pass
+        candidates += sorted(
+            p for p in root.rglob("point_*_r*_c*.csv") if "_pulse_" not in p.name
+        )
+        for csv_path in candidates:
+            try:
+                t_vals, _ = _read_waveform_csv(str(csv_path))
+            except Exception:
+                continue
+            fs = _sampling_rate_from_time_axis(t_vals)
+            if fs is not None:
+                return fs
+        return None
+
+    def _check_echo_alignment(self, t_echoes, y_echoes, label: str, log_fn) -> None:
+        """Warn when echoes about to be averaged differ in length or time axis."""
+        import numpy as np
+
+        if len(y_echoes) < 2:
+            return
+        sizes = [int(np.asarray(y).size) for y in y_echoes]
+        if min(sizes) != max(sizes):
+            log_fn(
+                f"{label} averaging WARNING: echo lengths differ ({min(sizes)} to {max(sizes)} samples); "
+                "all echoes are truncated to the shortest."
+            )
+        n = min(sizes)
+        t0 = np.asarray(t_echoes[0], dtype=float)[:n]
+        if n < 2:
+            return
+        dt = float(np.median(np.diff(t0)))
+        worst = max(
+            float(np.max(np.abs(np.asarray(t, dtype=float)[:n] - t0))) for t in t_echoes[1:]
+        )
+        if dt > 0.0 and worst > 0.5 * dt:
+            log_fn(
+                f"{label} averaging WARNING: echo time axes are misaligned by up to {worst * 1e6:.3f} us "
+                f"({worst / dt:.1f} samples). The first echo's time axis is used, so the average may be smeared; "
+                "check the trigger and scope timebase."
+            )
+
+    def _actual_sampling_rate(self, t, scope_fs_hz=None) -> tuple[float | None, str]:
+        """Actual sample rate of one waveform: the scope-reported rate if available, else from its time axis."""
+        import numpy as np
+
+        if scope_fs_hz is not None and np.isfinite(scope_fs_hz) and scope_fs_hz > 0.0:
+            return float(scope_fs_hz), "scope"
+        fs = _sampling_rate_from_time_axis(t)
+        # 9 significant digits drops float noise from 1/dt (e.g. 100000000.00000095).
+        return (float(f"{fs:.9g}"), "time_axis") if fs is not None else (None, "unknown")
+
+    def _summarize_actual_rates(self, actuals) -> tuple[float | None, str]:
+        """Median actual rate over (rate_hz, source) pairs; source is 'scope' only if every pair came from the scope."""
+        import numpy as np
+
+        valid = [(hz, src) for hz, src in actuals if hz is not None]
+        if not valid:
+            return None, "unknown"
+        hz = float(np.median([h for h, _ in valid]))
+        return hz, "scope" if all(s == "scope" for _, s in valid) else "time_axis"
+
+    def _waveform_metadata(
+        self,
+        *,
+        scan_mode: str,
+        data_kind: str,
+        pulse_index,
+        pulse_total: int,
+        config_hz: float,
+        actual: tuple[float | None, str],
+        extra: dict | None = None,
+    ) -> dict:
+        """Header fields common to every stored waveform CSV: mode, pulse number, config and actual sampling rate."""
+        actual_hz, actual_src = actual
+        meta = {
+            "scan_mode": scan_mode,
+            "data_kind": data_kind,
+            "pulse_index": pulse_index,
+            "pulse_total": pulse_total,
+            "sampling_rate_config_hz": float(config_hz),
+            "sampling_rate_actual_hz": float(actual_hz) if actual_hz is not None else "n/a",
+            "sampling_rate_actual_source": actual_src,
+        }
+        if extra:
+            meta.update(extra)
+        return meta
+
+    def _write_waveform_csv(self, path, metadata: dict, columns: list[str], rows) -> None:
+        """Write '# key: value' metadata lines, a column header row, then the numeric rows."""
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            for key, value in metadata.items():
+                f.write(f"# {key}: {value}\n")
+            f.write(",".join(columns) + "\n")
+            for row in rows:
+                f.write(",".join(f"{v:.10e}" for v in row) + "\n")
+
+    def _write_manifest_csv(self, path, fieldnames: list[str], records: list[dict]) -> None:
+        with open(path, "w", newline="", encoding="utf-8") as mf:
+            writer = csv.DictWriter(mf, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(records)
+
+    def _write_metadata_txt(self, path, title: str, entries) -> None:
+        """Write a title line followed by 'Key: value' lines."""
+        with open(path, "w", encoding="utf-8") as mf:
+            mf.write(f"{title}\n")
+            for key, value in entries:
+                mf.write(f"{key}: {value}\n")
+
+    def _finish_pulse_array(
+        self, writer, metadata_path, *, scan_mode: str, axes_desc: str, entries, log_fn,
+        close: bool = True,
+    ) -> None:
+        """Flush a per-pulse array and write its metadata sidecar (shape, units, time axis, rates).
+
+        With close=False the array stays open for further points (used for the early sidecar).
+        """
+        import numpy as np
+
+        if writer is None or writer.array is None:
+            return
+        shape = writer.shape
+        if close:
+            writer.close()
+        else:
+            writer.flush()
+        time_axis = np.load(writer.time_path)
+        dt = float(np.median(np.diff(time_axis))) if time_axis.size > 1 else float("nan")
+        base = [
+            ("Scan mode", scan_mode),
+            ("File", writer.path.name),
+            ("Shape", f"{shape} = {axes_desc}"),
+            ("Data type", "float32"),
+            ("Units", "volts, raw echoes as acquired (not detrended or averaged)"),
+            ("Missing data", "NaN (point not reached, or echo shorter than the first echo)"),
+            ("Time axis file", f"{writer.time_path.name} (seconds, shared by all echoes)"),
+            ("Time axis start", f"{float(time_axis[0]) if time_axis.size else 'n/a'} s"),
+            ("Time axis step", f"{dt:.9g} s"),
+            ("Pulses per point", writer.pulses),
+        ]
+        self._write_metadata_txt(
+            metadata_path, "Raw per-pulse echo array", base + list(entries)
+        )
+        if not close:
+            return
+        log_fn(f"Raw per-pulse array saved: {writer.path.name} shape={shape}")
+        if writer.length_mismatch:
+            log_fn(
+                "Raw per-pulse array WARNING: some echoes had a different length from the first one "
+                "and were truncated or NaN-padded."
+            )
 
     def _normalize_sg_model_name(self, model_name: str) -> str:
         name = str(model_name).strip()
@@ -3085,7 +3401,9 @@ class ScannerMainWindow(QMainWindow):
             return "pressure_field"
         return "standard"
 
-    def _validate_pressure_field_filter_settings(self, pg: dict) -> tuple[bool, str]:
+    def _validate_pressure_field_filter_settings(
+        self, pg: dict, sampling_rate_hz: float | None = None
+    ) -> tuple[bool, str]:
         mode = self._current_bc_scan_type()
         if mode != "pressure_field":
             return True, ""
@@ -3096,15 +3414,11 @@ class ScannerMainWindow(QMainWindow):
         if not filtering_enabled:
             return True, ""
 
-        sampling_rate_hz = (
-            self._extract_last_float(
-                self.sampling_rate_edit.text().strip(),
-                max(float(pg.get("frequency", 1.0)) * 100.0, 1e6) / 1000.0,
-            )
-            * 1000.0
-        )
-        if sampling_rate_hz <= 0.0:
-            return False, "Sampling rate must be > 0 Hz for pressure field filtering."
+        if sampling_rate_hz is None:
+            try:
+                sampling_rate_hz = self._config_sampling_rate_hz()
+            except ValueError as exc:
+                return False, str(exc)
 
         nyquist_hz = 0.5 * sampling_rate_hz
         filt_type = self.bc_pf_filter_type_combo.currentText().strip().lower()
@@ -3231,8 +3545,17 @@ class ScannerMainWindow(QMainWindow):
             )
             return
 
+        # Actual rate recorded in the stored time axes; the Config field is only a fallback.
+        source_folder = str(source.get("scan_folder", "")).strip()
+        data_fs_hz = (
+            self._stored_scan_sampling_rate_hz(source_folder) if source_folder else None
+        )
+        if data_fs_hz is not None:
+            self._warn_if_config_rate_differs("Pressure-field", data_fs_hz)
+
         ok, msg = self._validate_pressure_field_filter_settings(
-            {"frequency": float(self.freq_spin.value())}
+            {"frequency": float(self.freq_spin.value())},
+            sampling_rate_hz=data_fs_hz,
         )
         if not ok:
             self._show_error("Invalid Pressure Field Filter Settings", msg)
@@ -3253,15 +3576,14 @@ class ScannerMainWindow(QMainWindow):
             )
             return
 
-        sampling_rate_hz = (
-            self._extract_last_float(
-                self.sampling_rate_edit.text().strip(),
-                max(float(self.freq_spin.value()) * 100.0, 1e6) / 1000.0,
-            )
-            * 1000.0
-        )
         filtering_enabled = (
             self.bc_pf_mode_extra_combo.currentText().strip().lower() == "yes"
+        )
+        # Only needed (and already validated) when filtering is enabled.
+        sampling_rate_hz = (
+            data_fs_hz
+            if data_fs_hz is not None
+            else (self._config_sampling_rate_hz() if filtering_enabled else 0.0)
         )
         filter_type = self.bc_pf_filter_type_combo.currentText().strip()
         filter_order = self._line_edit_int(self.bc_pf_filter_order_spin, 4)
@@ -3328,7 +3650,7 @@ class ScannerMainWindow(QMainWindow):
                 if filtering_enabled:
                     processed = self._apply_pressure_field_filter(
                         processed,
-                        sampling_rate_hz=sampling_rate_hz,
+                        sampling_rate_hz=_sampling_rate_from_time_axis(_t_vals) or sampling_rate_hz,
                         filter_type=filter_type,
                         order=filter_order,
                         highpass_cutoff_hz=hp_cutoff_hz,
@@ -3411,13 +3733,16 @@ class ScannerMainWindow(QMainWindow):
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
 
-        sampling_rate_hz = (
-            self._extract_last_float(
-                self.sampling_rate_edit.text().strip(),
-                max(float(self.freq_spin.value()) * 100.0, 1e6) / 1000.0,
-            )
-            * 1000.0
-        )
+        # Actual rate recorded in the stored time axes; the Config field is only a fallback.
+        fallback_fs_hz = self._stored_scan_sampling_rate_hz(scan_folder)
+        if fallback_fs_hz is not None:
+            self._warn_if_config_rate_differs("C-Mode", fallback_fs_hz)
+        else:
+            try:
+                fallback_fs_hz = self._config_sampling_rate_hz()
+            except ValueError as exc:
+                self.bridge.bc_log.emit(f"Apply ignored: {exc}")
+                return
         cutoff_hz = float(self.a_mode_highpass_cutoff.value()) * 1000.0
         filter_order = int(self.a_mode_filter_order.value())
         gate_start_s = float(self.bc_c_mode_gate_start.value()) * 1e-6
@@ -3489,7 +3814,7 @@ class ScannerMainWindow(QMainWindow):
                         y,
                         highpass_cutoff_hz=cutoff_hz,
                         filter_order=filter_order,
-                        sampling_rate_hz=sampling_rate_hz,
+                        sampling_rate_hz=_sampling_rate_from_time_axis(t) or fallback_fs_hz,
                     ),
                     dtype=float,
                 )
@@ -3726,16 +4051,7 @@ class ScannerMainWindow(QMainWindow):
         
 
         burst_duration = max(float(cycles) / max(float(frequency), 1e-12), 1e-9)
-        sampling_rate = max(
-            (
-                self._extract_last_float(
-                    self.sampling_rate_edit.text().strip(),
-                    max(float(frequency) * 100.0, 1e6) / 1000.0,
-                )
-                * 1000.0
-            ),
-            1.0,
-        )
+        sampling_rate = self._config_sampling_rate_hz()
         capture_signature = (
             id(osc),
             str(self.osc_address_edit.text().strip()),
@@ -4025,7 +4341,7 @@ class ScannerMainWindow(QMainWindow):
         y_mode = np.asarray(payload.get("y_mode", []))
         sound_speed_mps = float(self.a_mode_sound_speed.value())
         if sound_speed_mps > 0.0:
-            x = t * sound_speed_mps * 1000.0
+            x = _pulse_echo_depth_mm(t, sound_speed_mps)
             x_label = "Distance (mm)"
         else:
             x = t * 1_000_000.0
@@ -4038,9 +4354,32 @@ class ScannerMainWindow(QMainWindow):
         if mode == "live":
             pulse_idx = int(payload.get("pulse_idx", 1))
             pulse_total = int(payload.get("pulse_total", 1))
-            self.a_preview_canvas.axes.plot(
-                x, y, color="#2f80ed", linewidth=1.1, alpha=0.8, zorder=2
-            )
+            y_running = np.asarray(payload.get("y_running_avg", []), dtype=float)
+            n_plot = min(x.size, y.size, y_running.size)
+            if pulse_total > 1 and n_plot > 0:
+                self.a_preview_canvas.axes.plot(
+                    x[:n_plot],
+                    self._detrend_signal(y[:n_plot]),
+                    color="#2f80ed",
+                    linewidth=1.0,
+                    alpha=0.45,
+                    zorder=2,
+                    label="Current echo",
+                )
+                self.a_preview_canvas.axes.plot(
+                    x[:n_plot],
+                    y_running[:n_plot],
+                    color="#e04b3f",
+                    linewidth=1.6,
+                    alpha=0.9,
+                    zorder=3,
+                    label=f"Running average ({pulse_idx} echo{'es' if pulse_idx != 1 else ''})",
+                )
+                self.a_preview_canvas.axes.legend(loc="best")
+            else:
+                self.a_preview_canvas.axes.plot(
+                    x, y, color="#2f80ed", linewidth=1.1, alpha=0.8, zorder=2
+                )
             self.a_preview_canvas.axes.set_title(
                 f"A-Mode Live Preview ({pulse_idx}/{pulse_total})", color="#1f2a37"
             )
@@ -4175,6 +4514,9 @@ class ScannerMainWindow(QMainWindow):
                         "mode": "live",
                         "t": t_live,
                         "y": y_live,
+                        "y_running_avg": np.asarray(
+                            self._a_mode_last_results.get("y_running_avg", []), dtype=float
+                        ),
                         "pulse_idx": int(self._a_mode_last_results.get("pulse_idx", 1)),
                         "pulse_total": int(self._a_mode_last_results.get("pulse_total", 1)),
                     }
@@ -4206,12 +4548,9 @@ class ScannerMainWindow(QMainWindow):
                 avg = detrended_traces[0].copy()
             cutoff_hz = float(self.a_mode_highpass_cutoff.value()) * 1000.0
             filter_order = int(self.a_mode_filter_order.value())
-            sampling_rate_hz = float(
-                self._a_mode_last_results.get(
-                    "filter_sampling_rate_hz",
-                    self._extract_last_float(self.sampling_rate_edit.text().strip(), 0.0)
-                    * 1000.0,
-                )
+            stored_fs_hz = self._a_mode_last_results.get("filter_sampling_rate_hz")
+            sampling_rate_hz = (
+                float(stored_fs_hz) if stored_fs_hz else self._config_sampling_rate_hz()
             )
             effective_cutoff_hz = cutoff_hz
             if sampling_rate_hz > 0.0:
@@ -4285,6 +4624,18 @@ class ScannerMainWindow(QMainWindow):
             with open(filename, "w", encoding="utf-8") as f:
                 f.write(
                     f"# Exported at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                )
+                info = self._a_mode_last_results
+                f.write("# scan_mode: A-mode\n")
+                f.write(
+                    f"# pulse_columns: AScan_1..AScan_{traces.shape[0]} are single pulses 1..{traces.shape[0]} (detrended); Average is their mean\n"
+                )
+                f.write(f"# pulse_total: {traces.shape[0]}\n")
+                f.write(
+                    f"# sampling_rate_config_hz: {info.get('config_sampling_rate_hz', 'n/a')}\n"
+                )
+                f.write(
+                    f"# sampling_rate_actual_hz: {info.get('actual_sampling_rate_hz') or 'n/a'}\n"
                 )
                 header = ["Time_s"]
                 header.extend(f"AScan_{idx + 1}" for idx in range(traces.shape[0]))
@@ -4443,7 +4794,7 @@ class ScannerMainWindow(QMainWindow):
         t = np.asarray(time_axis, dtype=float)
         sound_speed_mps = float(self.b_sound_speed.value())
         if sound_speed_mps > 0.0:
-            return sound_speed_mps * t * 1000.0, "Depth (mm)"
+            return _pulse_echo_depth_mm(t, sound_speed_mps), "Depth (mm)"
         return t * 1_000_000.0, r"Time ($\mu$s)"
 
     def _on_b_mode_sound_speed_changed(self, _value: float) -> None:
@@ -4656,6 +5007,8 @@ class ScannerMainWindow(QMainWindow):
         osc = None
         motion_sock = None
         rig_function = None
+        b_manifest_writer = None
+        b_finish_pulses = None
         try:
             import numpy as np
             import importlib
@@ -4679,13 +5032,7 @@ class ScannerMainWindow(QMainWindow):
             prf_hz = float(self.tx_prf.value())
             window_fn = self.tx_windowing_combo.currentText()
             pulses_per_point = max(1, int(self.tx_pulses.value()))
-            sampling_rate = (
-                self._extract_last_float(
-                    self.sampling_rate_edit.text().strip(),
-                    max(frequency * 100.0, 1e6) / 1000.0,
-                )
-                * 1000.0
-            )
+            sampling_rate = self._config_sampling_rate_hz()
             period_sec = 1.0 / max(prf_hz, 1e-12)
             cutoff_hz = float(self.a_mode_highpass_cutoff.value()) * 1000.0
             filter_order = int(self.a_mode_filter_order.value())
@@ -4828,6 +5175,69 @@ class ScannerMainWindow(QMainWindow):
             else:
                 self.bridge.b_mode_log.emit("B-mode automatic storage is disabled.")
 
+            b_measurements_dir = None
+            b_pulses_dir = None
+            b_point_records: list[dict] = []
+            b_all_actuals: list = []
+            b_manifest_fields = [
+                "point_index",
+                "scan_axis",
+                "depth_axis",
+                "scan_mm",
+                "scan_pulse",
+                "scan_mode",
+                "pulses_averaged",
+                "sampling_rate_config_hz",
+                "sampling_rate_actual_hz",
+                "sampling_rate_actual_source",
+                "signal_source",
+                "measurement_csv",
+                "pulse_array_index",
+                "pulse_csvs",
+            ]
+            save_pulse_csv = bool(self.save_pulse_csv_check.isChecked())
+            b_pulse_writer = None
+            if b_scan_folder is not None:
+                b_measurements_dir = b_scan_folder / "b_mode_measurements"
+                b_measurements_dir.mkdir(parents=True, exist_ok=True)
+                if save_pulse_csv:
+                    b_pulses_dir = b_measurements_dir / "pulses"
+                    b_pulses_dir.mkdir(parents=True, exist_ok=True)
+                b_pulse_writer = _PulseArrayWriter(
+                    b_scan_folder / "pulses.npy", (points,), pulses_per_point
+                )
+                b_manifest_writer = _ManifestWriter(
+                    b_scan_folder / "point_manifest.csv", b_manifest_fields
+                )
+
+                def _b_finish_pulses(close: bool = True) -> None:
+                    self._finish_pulse_array(
+                        b_pulse_writer,
+                        b_scan_folder / "pulses_metadata.txt",
+                        scan_mode="B-mode",
+                        axes_desc="(scan points, pulses, samples)",
+                        entries=[
+                            ("Scan axis", params["scan_axis"]),
+                            ("Depth axis", params["depth_axis"]),
+                            ("Point positions", "see point_manifest.csv (scan_mm, scan_pulse)"),
+                            ("Sampling rate (Config)", f"{float(sampling_rate)} Hz"),
+                            (
+                                "Sampling rate (actual, median over all pulses)",
+                                "{} Hz".format(
+                                    self._summarize_actual_rates(b_all_actuals)[0] or "n/a"
+                                ),
+                            ),
+                            ("Dry Run", dry_run),
+                        ],
+                        log_fn=self.bridge.b_mode_log.emit,
+                        close=close,
+                    )
+
+                b_finish_pulses = _b_finish_pulses
+                self.bridge.b_mode_log.emit(
+                    f"B-mode measurement folder: {b_measurements_dir}"
+                )
+
             self.bridge.b_mode_log.emit(
                 f"B-Mode settings: scan_axis={params['scan_axis']}, depth_axis={params['depth_axis']}, "
                 f"scan_length={params['scan_length']} mm, scan_points={points}, scan_step={scan_step} pulses, sound_speed={sound_speed_mps} m/s, "
@@ -4853,7 +5263,23 @@ class ScannerMainWindow(QMainWindow):
                 t_echoes = []
                 y_echoes = []
                 scope_sampling_rates = []
+                pulse_actuals = []
+                pulse_csv_rels = []
+                point_meta_extra = {
+                    "point_index": idx,
+                    "point_total": points,
+                    "scan_axis": params["scan_axis"],
+                    "depth_axis": params["depth_axis"],
+                    "scan_mm": f"{float(scan_mm[idx - 1]):.6f}",
+                    "scan_pulse": (idx - 1) * scan_step,
+                    "frequency_hz": frequency,
+                    "amplitude_vpp": amplitude_vpp,
+                    "cycles_per_pulse": cycles,
+                    "window": window_fn,
+                    "signal_source": "dummy" if dry_run else "hardware",
+                }
                 for pulse_idx in range(1, pulses_per_point + 1):
+                    _scope_fs_hz = None
                     if dry_run:
                         t_one, y_one = module.generate_test_echo(
                             frequency_hz=frequency,
@@ -4884,13 +5310,44 @@ class ScannerMainWindow(QMainWindow):
                             scope_sampling_rates.append(float(_scope_fs_hz))
                     t_echoes.append(np.asarray(t_one, dtype=float))
                     y_echoes.append(np.asarray(y_one, dtype=float))
+                    pulse_actual = self._actual_sampling_rate(t_one, _scope_fs_hz)
+                    pulse_actuals.append(pulse_actual)
+                    if b_pulse_writer is not None:
+                        b_pulse_writer.write((idx - 1,), pulse_idx, t_one, y_one)
+                    if b_pulses_dir is not None:
+                        pulse_path = b_pulses_dir / f"point_{idx:04d}_pulse_{pulse_idx:03d}.csv"
+                        self._write_waveform_csv(
+                            pulse_path,
+                            self._waveform_metadata(
+                                scan_mode="B-mode",
+                                data_kind="single pulse (raw, as acquired)",
+                                pulse_index=pulse_idx,
+                                pulse_total=pulses_per_point,
+                                config_hz=sampling_rate,
+                                actual=pulse_actual,
+                                extra=point_meta_extra,
+                            ),
+                            ["Time (s)", "Amplitude (V)"],
+                            zip(np.asarray(t_one, dtype=float), np.asarray(y_one, dtype=float)),
+                        )
+                        pulse_csv_rels.append(
+                            pulse_path.relative_to(b_scan_folder).as_posix()
+                        )
                     self.bridge.b_mode_log.emit(
                         f"Captured echo {pulse_idx}/{pulses_per_point} at point {idx}/{points}"
                     )
 
+                if b_pulse_writer is not None:
+                    b_pulse_writer.flush()
+                    if idx == 1 and b_finish_pulses is not None:
+                        b_finish_pulses(close=False)
+
                 if not y_echoes:
                     raise RuntimeError(f"No echoes captured for B-Mode point {idx}.")
 
+                self._check_echo_alignment(
+                    t_echoes, y_echoes, "B-mode", self.bridge.b_mode_log.emit
+                )
                 min_len = min(e.size for e in y_echoes)
                 t = t_echoes[0][:min_len]
                 stack = np.vstack(
@@ -4902,26 +5359,12 @@ class ScannerMainWindow(QMainWindow):
                     y = stack[0].copy()
 
                 config_sampling_rate_hz = float(sampling_rate)
-                if scope_sampling_rates:
-                    filter_sampling_rate_hz = float(
-                        np.median(np.asarray(scope_sampling_rates, dtype=float))
-                    )
-                    pct = (
-                        abs(filter_sampling_rate_hz - config_sampling_rate_hz)
-                        / max(config_sampling_rate_hz, 1e-12)
-                        * 100.0
-                    )
-                    self.bridge.b_mode_log.emit(
-                        f"B-mode filtering: Config sampling rate={config_sampling_rate_hz/1e6:.6f} MS/s, scope measured sampling rate={filter_sampling_rate_hz/1e6:.6f} MS/s (delta={pct:.2f}%)."
-                    )
-                    self.bridge.b_mode_log.emit(
-                        f"B-mode filtering: fs={filter_sampling_rate_hz/1e6:.6f} MS/s (scope actual) is used for Nyquist/cutoff calculations."
-                    )
-                else:
-                    filter_sampling_rate_hz = config_sampling_rate_hz
-                    self.bridge.b_mode_log.emit(
-                        f"B-mode filtering: scope sampling rate unavailable; fs={filter_sampling_rate_hz/1e6:.6f} MS/s (Config) is used for Nyquist/cutoff calculations."
-                    )
+                filter_sampling_rate_hz = self._resolve_filter_sampling_rate(
+                    "B-mode",
+                    config_sampling_rate_hz,
+                    scope_sampling_rates,
+                    self.bridge.b_mode_log.emit,
+                )
 
                 effective_cutoff_hz = cutoff_hz
                 if filter_sampling_rate_hz > 0.0:
@@ -4939,12 +5382,46 @@ class ScannerMainWindow(QMainWindow):
                             f"B-mode filtering WARNING: cutoff={cutoff_hz/1000.0:.3f} kHz is close to Nyquist={nyquist_hz/1000.0:.3f} kHz; filtering is meaningful when cutoff is much smaller than Nyquist."
                         )
 
-                if store_automatically and b_scan_folder is not None:
-                    point_csv_path = b_scan_folder / f"point_{idx:04d}.csv"
-                    with open(point_csv_path, "w", encoding="utf-8") as _f:
-                        _f.write("Time (s),Amplitude (V)\n")
-                        for _t, _v in zip(t, y):
-                            _f.write(f"{_t:.10e},{_v:.10e}\n")
+                b_all_actuals.extend(pulse_actuals)
+                if store_automatically and b_measurements_dir is not None:
+                    point_csv_path = b_measurements_dir / f"point_{idx:04d}.csv"
+                    point_actual = self._summarize_actual_rates(pulse_actuals)
+                    self._write_waveform_csv(
+                        point_csv_path,
+                        self._waveform_metadata(
+                            scan_mode="B-mode",
+                            data_kind=f"average of {pulses_per_point} pulse(s) (detrended)",
+                            pulse_index="average",
+                            pulse_total=pulses_per_point,
+                            config_hz=config_sampling_rate_hz,
+                            actual=point_actual,
+                            extra=point_meta_extra,
+                        ),
+                        ["Time (s)", "Amplitude (V)"],
+                        zip(t, y),
+                    )
+                    b_manifest_writer.append(
+                        {
+                            "point_index": idx,
+                            "scan_axis": params["scan_axis"],
+                            "depth_axis": params["depth_axis"],
+                            "scan_mm": point_meta_extra["scan_mm"],
+                            "scan_pulse": point_meta_extra["scan_pulse"],
+                            "scan_mode": "B-mode",
+                            "pulses_averaged": pulses_per_point,
+                            "sampling_rate_config_hz": config_sampling_rate_hz,
+                            "sampling_rate_actual_hz": (
+                                point_actual[0] if point_actual[0] is not None else "n/a"
+                            ),
+                            "sampling_rate_actual_source": point_actual[1],
+                            "signal_source": point_meta_extra["signal_source"],
+                            "measurement_csv": point_csv_path.relative_to(b_scan_folder).as_posix(),
+                            "pulse_array_index": (
+                                f"pulses.npy[{idx - 1}]" if b_pulse_writer is not None else ""
+                            ),
+                            "pulse_csvs": ";".join(pulse_csv_rels),
+                        }
+                    )
 
                 envelope = module.estimate_a_mode_signal(
                     t,
@@ -5005,8 +5482,23 @@ class ScannerMainWindow(QMainWindow):
                     if remaining > 0:
                         time.sleep(remaining)
 
+            if b_finish_pulses is not None:
+                b_finish_pulses()
+            if b_manifest_writer is not None:
+                b_manifest_writer.close()
+
             if x_axis is None or b_image is None:
                 raise RuntimeError("No B-mode echoes captured.")
+
+            self._b_mode_run_info = {
+                "pulses_averaged": pulses_per_point,
+                "config_sampling_rate_hz": float(sampling_rate),
+                "actual_sampling_rate_hz": self._summarize_actual_rates(b_all_actuals)[0],
+            }
+            if b_scan_folder is not None:
+                self.bridge.b_mode_log.emit(
+                    f"B-mode CSV files and point manifest saved in run folder: {b_scan_folder}"
+                )
 
             original_image = np.array(b_image, copy=True)
             normalized_image = None
@@ -5062,6 +5554,18 @@ class ScannerMainWindow(QMainWindow):
         except Exception as exc:
             self.bridge.b_mode_log.emit(f"B-Mode scan failed: {exc}")
         finally:
+            # Runs on every exit path so data from completed points is never left unfinalized.
+            for _store_hook in (
+                b_finish_pulses,
+                getattr(b_manifest_writer, "close", None),
+            ):
+                if _store_hook is not None:
+                    try:
+                        _store_hook()
+                    except Exception as store_exc:
+                        self.bridge.b_mode_log.emit(
+                            f"Warning: could not finalize stored B-mode data: {store_exc}"
+                        )
             if motion_sock is not None:
                 try:
                     motion_sock.close()
@@ -5103,6 +5607,18 @@ class ScannerMainWindow(QMainWindow):
             with open(filename, "w", encoding="utf-8") as f:
                 f.write(
                     f"# Exported at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                )
+                info = getattr(self, "_b_mode_run_info", None) or {}
+                f.write("# scan_mode: B-mode\n")
+                f.write(
+                    f"# pulse_index: average (each row is the envelope of the average of {info.get('pulses_averaged', 'n/a')} pulse(s))\n"
+                )
+                f.write(f"# pulse_total: {info.get('pulses_averaged', 'n/a')}\n")
+                f.write(
+                    f"# sampling_rate_config_hz: {info.get('config_sampling_rate_hz', 'n/a')}\n"
+                )
+                f.write(
+                    f"# sampling_rate_actual_hz: {info.get('actual_sampling_rate_hz') or 'n/a'}\n"
                 )
                 header = ["ScanAxis_mm"]
                 prefix = "Depth_mm" if x_label == "Depth (mm)" else "Time_us"
@@ -5875,24 +6391,18 @@ class ScannerMainWindow(QMainWindow):
             cycles = float(self.tx_cycles.value())
             prf_hz = float(self.tx_prf.value())
             window_fn = self.tx_windowing_combo.currentText()
-            sampling_rate = (
-                self._extract_last_float(
-                    self.sampling_rate_edit.text().strip(),
-                    max(frequency * 100.0, 1e6) / 1000.0,
-                )
-                * 1000.0
-            )
+            sampling_rate = self._config_sampling_rate_hz()
             live_enabled = bool(self.a_live_preview_check.isChecked())
             cutoff_hz = float(self.a_mode_highpass_cutoff.value()) * 1000.0
             cutoff_khz = cutoff_hz / 1000.0
             filter_order = int(self.a_mode_filter_order.value())
             frequency_khz = frequency / 1000.0
-            sampling_rate_khz = sampling_rate / 1000.0
+            sampling_rate_mhz = sampling_rate / 1e6
 
             self.bridge.a_mode_log.emit(
                 f"A-mode settings: mode={params['mode']}, X={params['X']} mm, Y={params['Y']} mm, Z={params['Z']} mm, "
                 f"frequency={frequency_khz} kHz, amplitude={amplitude} V, cycles/pulse={cycles}, pulses={pulses}, "
-                f"PRF={prf_hz} Hz, window={window_fn}, sampling_rate={sampling_rate_khz} kHz, "
+                f"PRF={prf_hz} Hz, window={window_fn}, sampling_rate={sampling_rate_mhz:g} MHz, "
                 f"highpass_cutoff={cutoff_khz} kHz, filter_order={filter_order}, live_preview={live_enabled}, "
                 f"signal_source={'dummy' if use_dummy else 'hardware'}"
             )
@@ -5920,7 +6430,7 @@ class ScannerMainWindow(QMainWindow):
             a_scan_metadata = {
                 "run_timestamp": run_timestamp,
                 "run_id": next_run_id if next_run_id is not None else "not stored",
-                "mode": params["mode"],
+                "rig_move_mode": params["mode"],
                 "x_mm": params["X"],
                 "y_mm": params["Y"],
                 "z_mm": params["Z"],
@@ -5930,7 +6440,6 @@ class ScannerMainWindow(QMainWindow):
                 "pulse_count": pulses,
                 "prf_hz": prf_hz,
                 "window": window_fn,
-                "sampling_rate_hz": sampling_rate,
                 "highpass_cutoff_hz": cutoff_hz,
                 "filter_order": filter_order,
                 "live_preview": live_enabled,
@@ -5982,6 +6491,9 @@ class ScannerMainWindow(QMainWindow):
 
             traces = []
             scope_sampling_rates = []
+            pulse_actuals = []
+            running_sum = None
+            running_count = 0
             self.bridge.a_mode_log.emit(f"A-mode running for {pulses} pulse(s).")
             for pulse_idx in range(1, pulses + 1):
                 scope_fs_hz = None
@@ -6014,29 +6526,46 @@ class ScannerMainWindow(QMainWindow):
                     if scope_fs_hz is not None and scope_fs_hz > 0.0:
                         scope_sampling_rates.append(float(scope_fs_hz))
                 traces.append((t, y))
+                pulse_actual = self._actual_sampling_rate(t, scope_fs_hz)
+                pulse_actuals.append(pulse_actual)
                 if store_automatically and a_scan_folder is not None:
                     pulse_csv = a_scan_folder / f"a_scan_pulse_{pulse_idx:03d}.csv"
                     _write_wave_csv(
                         pulse_csv,
                         t,
                         y,
-                        {
-                            "pulse_index": pulse_idx,
-                            "pulse_total": pulses,
-                            "scope_sampling_rate_hz": (
-                                float(scope_fs_hz) if scope_fs_hz is not None else "n/a"
-                            ),
-                        },
+                        self._waveform_metadata(
+                            scan_mode="A-mode",
+                            data_kind="single pulse (raw, as acquired)",
+                            pulse_index=pulse_idx,
+                            pulse_total=pulses,
+                            config_hz=sampling_rate,
+                            actual=pulse_actual,
+                            extra={
+                                "scope_sampling_rate_hz": (
+                                    float(scope_fs_hz) if scope_fs_hz is not None else "n/a"
+                                ),
+                            },
+                        ),
                     )
                 self.bridge.a_mode_log.emit(
                     f"Captured A-mode echo {pulse_idx}/{pulses}"
                 )
 
                 if live_enabled:
+                    echo_detrended = self._detrend_signal(np.asarray(y, dtype=float))
+                    if running_sum is None:
+                        running_sum = echo_detrended.copy()
+                    else:
+                        n_run = min(running_sum.size, echo_detrended.size)
+                        running_sum = running_sum[:n_run] + echo_detrended[:n_run]
+                    running_count += 1
+                    running_avg = running_sum / running_count
                     self._a_mode_last_results = {
                         "mode": "live",
                         "t": np.asarray(t, dtype=float),
                         "y": np.asarray(y, dtype=float),
+                        "y_running_avg": running_avg,
                         "pulse_idx": pulse_idx,
                         "pulse_total": pulses,
                         "live_enabled": live_enabled,
@@ -6047,6 +6576,7 @@ class ScannerMainWindow(QMainWindow):
                             "mode": "live",
                             "t": t,
                             "y": y,
+                            "y_running_avg": running_avg,
                             "pulse_idx": pulse_idx,
                             "pulse_total": pulses,
                         }
@@ -6055,6 +6585,12 @@ class ScannerMainWindow(QMainWindow):
             if not traces:
                 raise RuntimeError("No A-mode echoes captured.")
 
+            self._check_echo_alignment(
+                [item[0] for item in traces],
+                [item[1] for item in traces],
+                "A-mode",
+                self.bridge.a_mode_log.emit,
+            )
             min_len = min(len(item[1]) for item in traces)
             t_ref = traces[0][0][:min_len]
             stack = np.vstack(
@@ -6067,20 +6603,12 @@ class ScannerMainWindow(QMainWindow):
             first = stack[0]
             last = stack[-1]
             config_sampling_rate_hz = float(sampling_rate)
-            if scope_sampling_rates:
-                filter_sampling_rate_hz = float(np.median(np.asarray(scope_sampling_rates, dtype=float)))
-                pct = abs(filter_sampling_rate_hz - config_sampling_rate_hz) / max(config_sampling_rate_hz, 1e-12) * 100.0
-                self.bridge.a_mode_log.emit(
-                    f"A-mode filtering: Config sampling rate={config_sampling_rate_hz/1e6:.6f} MS/s, scope measured sampling rate={filter_sampling_rate_hz/1e6:.6f} MS/s (delta={pct:.2f}%)."
-                )
-                self.bridge.a_mode_log.emit(
-                    f"A-mode filtering: fs={filter_sampling_rate_hz/1e6:.6f} MS/s (scope actual) is used for Nyquist/cutoff calculations."
-                )
-            else:
-                filter_sampling_rate_hz = config_sampling_rate_hz
-                self.bridge.a_mode_log.emit(
-                    f"A-mode filtering: scope sampling rate unavailable; fs={filter_sampling_rate_hz/1e6:.6f} MS/s (Config) is used for Nyquist/cutoff calculations."
-                )
+            filter_sampling_rate_hz = self._resolve_filter_sampling_rate(
+                "A-mode",
+                config_sampling_rate_hz,
+                scope_sampling_rates,
+                self.bridge.a_mode_log.emit,
+            )
             effective_cutoff_hz = cutoff_hz
             if filter_sampling_rate_hz > 0.0:
                 nyquist_hz = 0.5 * filter_sampling_rate_hz
@@ -6110,6 +6638,9 @@ class ScannerMainWindow(QMainWindow):
                 "avg": avg,
                 "a_mode": a_mode_signal,
                 "filter_sampling_rate_hz": float(filter_sampling_rate_hz),
+                "config_sampling_rate_hz": float(config_sampling_rate_hz),
+                "actual_sampling_rate_hz": self._summarize_actual_rates(pulse_actuals)[0],
+                "pulses": pulses,
                 "live_enabled": live_enabled,
                 "use_dummy": use_dummy,
             }
@@ -6130,6 +6661,16 @@ class ScannerMainWindow(QMainWindow):
                 avg_csv = a_scan_folder / "a_scan_average.csv"
                 with open(avg_csv, "w", encoding="utf-8", newline="") as csv_file:
                     final_meta = dict(a_scan_metadata)
+                    final_meta.update(
+                        self._waveform_metadata(
+                            scan_mode="A-mode",
+                            data_kind=f"average of {pulses} pulse(s) (detrended)",
+                            pulse_index="average",
+                            pulse_total=pulses,
+                            config_hz=config_sampling_rate_hz,
+                            actual=self._summarize_actual_rates(pulse_actuals),
+                        )
+                    )
                     final_meta["effective_filter_sampling_rate_hz"] = float(
                         filter_sampling_rate_hz
                     )
@@ -6203,6 +6744,10 @@ class ScannerMainWindow(QMainWindow):
         osc = None
         dry_run = self.dry_run_check.isChecked()
         store_automatically = self.store_automatically_check.isChecked()
+        a_mode_signals: list = []
+        acquisition_count = 0
+        manifest_writer = None
+        finish_pulses = None
         import importlib
 
         try:
@@ -6217,13 +6762,7 @@ class ScannerMainWindow(QMainWindow):
             a_scan_module = importlib.util.module_from_spec(a_scan_spec)
             a_scan_spec.loader.exec_module(a_scan_module)
             window_fn = self.tx_windowing_combo.currentText()
-            sampling_rate = (
-                self._extract_last_float(
-                    self.sampling_rate_edit.text().strip(),
-                    max(float(pg["frequency"]) * 100.0, 1e6) / 1000.0,
-                )
-                * 1000.0
-            )
+            sampling_rate = self._config_sampling_rate_hz()
 
             # Align 3D dry-run excitation with A-mode/Excitation tab values.
             dry_frequency_hz = float(self.tx_freq.value()) * 1000.0
@@ -6370,9 +6909,9 @@ class ScannerMainWindow(QMainWindow):
                 int(axis2_pulses[1] - axis2_pulses[0]) if cross_steps > 1 else 0
             )
             self.bridge.bc_log.emit(
-                f"B-Mode settings: dry_run={dry_run}, live_preview={self.live_update_check.isChecked()}, "
-                f"shape={pg['shape']}, frequency={pg['frequency']} Hz, amplitude={pg['amplitude']} V, "
-                f"cycles/pulse={pg['no_of_cycles_per_pulse']}, pulses={pg['no_of_pulses']}, "
+                f"3D-Mode settings: dry_run={dry_run}, live_preview={self.live_update_check.isChecked()}, "
+                f"shape=SIN, frequency={dry_frequency_hz} Hz, amplitude={dry_amplitude_v} Vpp, "
+                f"cycles/pulse={dry_cycles}, pulses={pulses_per_point}, "
                 f"scan_axis={scan['scan_axis']}, cross_axis={scan['cross_axis']}, depth_axis={scan['depth_axis']}, "
                 f"scan_points={scan_steps}, cross_points={cross_steps}, "
                 f"scan_algorithm={scan_algorithm_label}, "
@@ -6409,9 +6948,76 @@ class ScannerMainWindow(QMainWindow):
                 else "a_mode_measurements"
             )
             measurements_dir = None
+            pulses_dir = None
+            pulse_writer = None
+            all_point_actuals: list = []
+            save_pulse_csv = bool(self.save_pulse_csv_check.isChecked())
             if store_automatically and scan_folder is not None:
                 measurements_dir = Path(scan_folder) / measurements_subdir
                 measurements_dir.mkdir(parents=True, exist_ok=True)
+                if save_pulse_csv:
+                    pulses_dir = measurements_dir / "pulses"
+                    pulses_dir.mkdir(parents=True, exist_ok=True)
+                pulse_writer = _PulseArrayWriter(
+                    Path(scan_folder) / "pulses.npy",
+                    (cross_steps, scan_steps),
+                    pulses_per_point,
+                )
+                manifest_writer = _ManifestWriter(
+                    Path(scan_folder) / "point_manifest.csv",
+                    [
+                        "point_order",
+                        "row_index",
+                        "col_index",
+                        "row_axis_role",
+                        "row_axis_name",
+                        "col_axis_role",
+                        "col_axis_name",
+                        "direction",
+                        "algorithm",
+                        "scan_axis",
+                        "cross_axis",
+                        "scan_mm",
+                        "cross_mm",
+                        "scan_pulse",
+                        "cross_pulse",
+                        "scan_mode",
+                        "scan_type",
+                        "pulses_averaged",
+                        "sampling_rate_config_hz",
+                        "sampling_rate_actual_hz",
+                        "sampling_rate_actual_source",
+                        "signal_source",
+                        "measurement_csv",
+                        "pulse_array_index",
+                        "pulse_csvs",
+                    ],
+                )
+
+                def _finish_3d_pulses(close: bool = True) -> None:
+                    self._finish_pulse_array(
+                        pulse_writer,
+                        Path(scan_folder) / "pulses_metadata.txt",
+                        scan_mode=f"3D-mode (scan type: {str(scan_type).strip().lower() or 'standard'})",
+                        axes_desc="(rows = Axis 2 points, columns = Axis 1 points, pulses, samples)",
+                        entries=[
+                            ("Axis 1 (columns)", scan["scan_axis"]),
+                            ("Axis 2 (rows)", scan["cross_axis"]),
+                            ("Point positions", "see point_manifest.csv (row_index, col_index, scan_mm, cross_mm)"),
+                            ("Sampling rate (Config)", f"{float(sampling_rate)} Hz"),
+                            (
+                                "Sampling rate (actual, median over all pulses)",
+                                "{} Hz".format(
+                                    self._summarize_actual_rates(all_point_actuals)[0] or "n/a"
+                                ),
+                            ),
+                            ("Dry Run", dry_run),
+                        ],
+                        log_fn=self.bridge.bc_log.emit,
+                        close=close,
+                    )
+
+                finish_pulses = _finish_3d_pulses
                 self.bridge.bc_log.emit(
                     f"3D-Mode measurement folder: {measurements_dir}"
                 )
@@ -6426,7 +7032,6 @@ class ScannerMainWindow(QMainWindow):
             a_mode_filter_order = int(self.a_mode_filter_order.value())
             current_axis1_pulse = 0
             current_axis2_pulse = 0
-            point_records: list[dict] = []
 
             current_cross_idx = None
             for point in point_plan:
@@ -6509,7 +7114,29 @@ class ScannerMainWindow(QMainWindow):
                 t_echoes = []
                 y_echoes = []
                 scope_sampling_rates = []
+                pulse_actuals = []
+                pulse_csv_rels = []
+                point_meta_extra = {
+                    "scan_type": str(scan_type).strip().lower() or "standard",
+                    "algorithm": scan_algorithm_label,
+                    "point_order": point_order,
+                    "point_total": total_scans,
+                    "row_axis (Axis 2)": scan["cross_axis"],
+                    "column_axis (Axis 1)": scan["scan_axis"],
+                    "cross_point": axis2_idx,
+                    "scan_point": axis1_idx,
+                    "cross_mm": f"{point['cross_mm']:.6f}",
+                    "scan_mm": f"{point['scan_mm']:.6f}",
+                    "cross_pulse": target_axis2_pulse,
+                    "scan_pulse": target_axis1_pulse,
+                    "frequency_hz": dry_frequency_hz,
+                    "amplitude_vpp": dry_amplitude_v,
+                    "cycles_per_pulse": dry_cycles,
+                    "window": dry_window_fn,
+                    "signal_source": "dummy" if dry_run else "hardware",
+                }
                 for pulse_idx in range(1, pulses_per_point + 1):
+                    _scope_fs_hz = None
                     if oscmod and osc and sg and not dry_run:
                         Burst_generate(
                             sg,
@@ -6540,11 +7167,46 @@ class ScannerMainWindow(QMainWindow):
                         )
                     t_echoes.append(np.asarray(t_one, dtype=float))
                     y_echoes.append(np.asarray(y_one, dtype=float))
+                    pulse_actual = self._actual_sampling_rate(t_one, _scope_fs_hz)
+                    pulse_actuals.append(pulse_actual)
+                    if pulse_writer is not None:
+                        pulse_writer.write(
+                            (axis2_idx - 1, axis1_idx - 1), pulse_idx, t_one, y_one
+                        )
+                    if pulses_dir is not None:
+                        pulse_path = pulses_dir / (
+                            f"point_{point_order:04d}_r{axis2_idx:03d}_c{axis1_idx:03d}_pulse_{pulse_idx:03d}.csv"
+                        )
+                        self._write_waveform_csv(
+                            pulse_path,
+                            self._waveform_metadata(
+                                scan_mode="3D-mode",
+                                data_kind="single pulse (raw, as acquired)",
+                                pulse_index=pulse_idx,
+                                pulse_total=pulses_per_point,
+                                config_hz=sampling_rate,
+                                actual=pulse_actual,
+                                extra=point_meta_extra,
+                            ),
+                            ["Time (s)", "Amplitude (V)"],
+                            zip(np.asarray(t_one, dtype=float), np.asarray(y_one, dtype=float)),
+                        )
+                        pulse_csv_rels.append(
+                            pulse_path.relative_to(Path(scan_folder)).as_posix()
+                        )
                     self.bridge.bc_log.emit(
                         f"Captured echo {pulse_idx}/{pulses_per_point} at row {axis2_idx}, col {axis1_idx}"
                     )
 
+                if pulse_writer is not None:
+                    pulse_writer.flush()
+                    if point_order == 1 and finish_pulses is not None:
+                        finish_pulses(close=False)
+
                 if y_echoes:
+                    self._check_echo_alignment(
+                        t_echoes, y_echoes, "3D-mode", self.bridge.bc_log.emit
+                    )
                     min_len = min(e.size for e in y_echoes)
                     t_acq = t_echoes[0][:min_len]
                     stack = np.vstack(
@@ -6556,21 +7218,13 @@ class ScannerMainWindow(QMainWindow):
                         echo_acq = stack[0].copy()
 
                     config_sampling_rate_hz = float(sampling_rate)
-                    if scope_sampling_rates:
-                        filter_sampling_rate_hz = float(
-                            np.median(np.asarray(scope_sampling_rates, dtype=float))
-                        )
-                        pct = (
-                            abs(filter_sampling_rate_hz - config_sampling_rate_hz)
-                            / max(config_sampling_rate_hz, 1e-12)
-                            * 100.0
-                        )
-                        self.bridge.bc_log.emit(
-                            f"3D-mode filtering: Config fs={config_sampling_rate_hz/1e6:.6f} MS/s, "
-                            f"scope measured fs={filter_sampling_rate_hz/1e6:.6f} MS/s (delta={pct:.2f}%)."
-                        )
-                    else:
-                        filter_sampling_rate_hz = config_sampling_rate_hz
+                    filter_sampling_rate_hz = self._resolve_filter_sampling_rate(
+                        "3D-mode",
+                        config_sampling_rate_hz,
+                        scope_sampling_rates,
+                        self.bridge.bc_log.emit,
+                        info=False,
+                    )
                     effective_cutoff_hz = a_mode_cutoff_hz
                     if filter_sampling_rate_hz > 0.0:
                         nyquist_hz = 0.5 * filter_sampling_rate_hz
@@ -6587,29 +7241,31 @@ class ScannerMainWindow(QMainWindow):
                                 f"3D-mode filtering WARNING: cutoff={a_mode_cutoff_hz/1000.0:.3f} kHz is close to Nyquist={nyquist_hz/1000.0:.3f} kHz; filtering is meaningful when cutoff is much smaller than Nyquist."
                             )
 
+                    all_point_actuals.extend(pulse_actuals)
                     if store_automatically and measurements_dir is not None and scan_folder is not None:
                         csv_path = measurements_dir / (
                             f"point_{point_order:04d}_r{axis2_idx:03d}_c{axis1_idx:03d}.csv"
                         )
-                        with open(csv_path, "w", encoding="utf-8") as _f:
-                            _f.write(f"# algorithm: {scan_algorithm_label}\n")
-                            _f.write(f"# point_order: {point_order}\n")
-                            _f.write(f"# row_axis (Axis 2): {scan['cross_axis']}\n")
-                            _f.write(f"# column_axis (Axis 1): {scan['scan_axis']}\n")
-                            _f.write(f"# cross_point: {axis2_idx}\n")
-                            _f.write(f"# scan_point: {axis1_idx}\n")
-                            _f.write(f"# cross_mm: {point['cross_mm']:.6f}\n")
-                            _f.write(f"# scan_mm: {point['scan_mm']:.6f}\n")
-                            _f.write(f"# cross_pulse: {target_axis2_pulse}\n")
-                            _f.write(f"# scan_pulse: {target_axis1_pulse}\n")
-                            _f.write("Time (s),Amplitude (V)\n")
-                            for _t, _v in zip(t_acq, echo_acq):
-                                _f.write(f"{_t:.10e},{_v:.10e}\n")
+                        point_actual = self._summarize_actual_rates(pulse_actuals)
+                        self._write_waveform_csv(
+                            csv_path,
+                            self._waveform_metadata(
+                                scan_mode="3D-mode",
+                                data_kind=f"average of {pulses_per_point} pulse(s) (detrended)",
+                                pulse_index="average",
+                                pulse_total=pulses_per_point,
+                                config_hz=config_sampling_rate_hz,
+                                actual=point_actual,
+                                extra=point_meta_extra,
+                            ),
+                            ["Time (s)", "Amplitude (V)"],
+                            zip(t_acq, echo_acq),
+                        )
                         self.bridge.bc_plot_csv.emit(str(csv_path))
                         self.bridge.bc_log.emit(
                             f"Saved averaged echo: point {point_order}/{total_scans} (row {axis2_idx}, col {axis1_idx}, {scan_algorithm_label})"
                         )
-                        point_records.append(
+                        manifest_writer.append(
                             {
                             "point_order": point_order,
                             "row_index": axis2_idx,
@@ -6626,9 +7282,24 @@ class ScannerMainWindow(QMainWindow):
                             "cross_mm": f"{point['cross_mm']:.9f}",
                             "scan_pulse": target_axis1_pulse,
                             "cross_pulse": target_axis2_pulse,
+                            "scan_mode": "3D-mode",
+                            "scan_type": point_meta_extra["scan_type"],
+                            "pulses_averaged": pulses_per_point,
+                            "sampling_rate_config_hz": config_sampling_rate_hz,
+                            "sampling_rate_actual_hz": (
+                                point_actual[0] if point_actual[0] is not None else "n/a"
+                            ),
+                            "sampling_rate_actual_source": point_actual[1],
+                            "signal_source": point_meta_extra["signal_source"],
                             "measurement_csv": str(
                                 Path(csv_path).relative_to(Path(scan_folder)).as_posix()
                             ),
+                            "pulse_array_index": (
+                                f"pulses.npy[{axis2_idx - 1},{axis1_idx - 1}]"
+                                if pulse_writer is not None
+                                else ""
+                            ),
+                            "pulse_csvs": ";".join(pulse_csv_rels),
                             }
                         )
 
@@ -6693,33 +7364,11 @@ class ScannerMainWindow(QMainWindow):
                     time.sleep(pulse_width_sec)
             self.bridge.bc_log.emit("B Scan finished.")
 
-            if store_automatically and scan_folder is not None and point_records:
-                manifest_path = os.path.join(scan_folder, "point_manifest.csv")
-                with open(manifest_path, "w", newline="", encoding="utf-8") as mf:
-                    fieldnames = [
-                        "point_order",
-                        "row_index",
-                        "col_index",
-                        "row_axis_role",
-                        "row_axis_name",
-                        "col_axis_role",
-                        "col_axis_name",
-                        "direction",
-                        "algorithm",
-                        "scan_axis",
-                        "cross_axis",
-                        "scan_mm",
-                        "cross_mm",
-                        "scan_pulse",
-                        "cross_pulse",
-                        "measurement_csv",
-                    ]
-                    writer = csv.DictWriter(mf, fieldnames=fieldnames)
-                    writer.writeheader()
-                    writer.writerows(point_records)
-                self.bridge.bc_log.emit(
-                    f"Point manifest saved: {os.path.basename(manifest_path)}"
-                )
+            if finish_pulses is not None:
+                finish_pulses()
+            if manifest_writer is not None:
+                manifest_writer.close()
+                self.bridge.bc_log.emit("Point manifest saved: point_manifest.csv")
 
             if pressure_field_mode and store_automatically and not self.stop_event.is_set():
                 try:
@@ -6787,6 +7436,28 @@ class ScannerMainWindow(QMainWindow):
                         f"C-Mode map render failed: {c_map_exc}"
                     )
 
+        except Exception as exc:
+            self.bridge.bc_log.emit(f"Error during scan: {exc}")
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+            # Everything below runs on every exit path (finished, stopped, or crashed),
+            # so data from completed points is always finalized and saved.
+            for _store_hook in (
+                finish_pulses,
+                getattr(manifest_writer, "close", None),
+            ):
+                if _store_hook is not None:
+                    try:
+                        _store_hook()
+                    except Exception as store_exc:
+                        self.bridge.bc_log.emit(
+                            f"Warning: could not finalize stored 3D data: {store_exc}"
+                        )
+
             # Save A-mode matrix with auto-incrementing ID
             if store_automatically and a_mode_signals and acquisition_count > 0:
                 try:
@@ -6829,17 +7500,38 @@ class ScannerMainWindow(QMainWindow):
                     metadata_path = (
                         data_dir / f"a_mode_matrix_{next_matrix_id:03d}_metadata.txt"
                     )
-                    with open(str(metadata_path), "w", encoding="utf-8") as mf:
-                        mf.write(f"A-Mode Matrix Data\n")
-                        mf.write(
-                            f"Shape: {a_mode_matrix.shape} (acquisitions × samples)\n"
-                        )
-                        mf.write(f"Total Acquisitions: {acquisition_count}\n")
-                        mf.write(f"Scan Points (Axis 1): {scan_steps}\n")
-                        mf.write(f"Cross Points (Axis 2): {cross_steps}\n")
-                        mf.write(f"Frequency: {pg.get('frequency')} Hz\n")
-                        mf.write(f"Amplitude: {pg.get('amplitude')} V\n")
-                        mf.write(f"Dry Run: {dry_run}\n")
+                    _actual_hz, _actual_src = self._summarize_actual_rates(all_point_actuals)
+                    self._write_metadata_txt(
+                        metadata_path,
+                        "A-Mode Matrix Data",
+                        [
+                            ("Shape", f"{a_mode_matrix.shape} (acquisitions × samples)"),
+                            ("Row order", "acquisition order (point_order in the scan folder's point_manifest.csv)"),
+                            ("Total Acquisitions", acquisition_count),
+                            ("Scan Points (Axis 1)", scan_steps),
+                            ("Cross Points (Axis 2)", cross_steps),
+                            ("Frequency", f"{dry_frequency_hz} Hz"),
+                            ("Amplitude", f"{dry_amplitude_v} Vpp"),
+                            ("Cycles per pulse", dry_cycles),
+                            ("Echoes averaged per point", pulses_per_point),
+                            (
+                                "Scan mode",
+                                f"3D-mode (scan type: {str(scan_type).strip().lower() or 'standard'})",
+                            ),
+                            (
+                                "Pulse numbers",
+                                f"each row is the detrended average of pulses 1..{pulses_per_point}; "
+                                "the raw single-pulse echoes are in pulses.npy in the scan folder",
+                            ),
+                            ("Scan folder", scan_folder if scan_folder else "n/a"),
+                            ("Sampling rate (Config)", f"{float(sampling_rate)} Hz"),
+                            (
+                                "Sampling rate (actual, median over all pulses)",
+                                f"{_actual_hz if _actual_hz is not None else 'n/a'} Hz (source: {_actual_src})",
+                            ),
+                            ("Dry Run", dry_run),
+                        ],
+                    )
 
                     self.bridge.bc_log.emit(
                         f"A-mode matrix saved: {matrix_path.name} "
@@ -6849,14 +7541,6 @@ class ScannerMainWindow(QMainWindow):
                     self.bridge.bc_log.emit(
                         f"Warning: Failed to save A-mode matrix: {e}"
                     )
-        except Exception as exc:
-            self.bridge.bc_log.emit(f"Error during scan: {exc}")
-        finally:
-            if sock is not None:
-                try:
-                    sock.close()
-                except Exception:
-                    pass
             self.bridge.scan_busy.emit(False)
 
     def closeEvent(self, event) -> None:  # noqa: N802
