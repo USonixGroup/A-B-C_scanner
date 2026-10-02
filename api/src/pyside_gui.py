@@ -1,6 +1,6 @@
 """PySide6 implementation of the A/B scanner GUI.
 
-This module replaces the old T& "C:\Miniforge3\Scripts\conda.exe" init powershellkinter surface with a Qt-based desktop UI while
+This module replaces the old Tkinter surface with a Qt-based desktop UI while
 reusing the existing scan, motion, and acquisition backends from this project.
 """
 
