@@ -11,6 +11,7 @@ import csv
 import importlib.util
 import io
 import json
+import math
 import os
 import shutil
 import socket
@@ -127,6 +128,27 @@ def _sampling_rate_from_time_axis(t) -> float | None:
 
 # Relative Config-vs-actual sampling-rate deviation that triggers a user warning.
 SAMPLING_RATE_WARN_PCT = 2.0
+
+# Discrete sampling rates accepted by LeCroy oscilloscopes (max 2.5 GS/s)
+LECROY_SAMPLING_RATES = [
+    ("2.5 GS/s", 2.5e9),
+    ("2.0 GS/s", 2.0e9),
+    ("1.0 GS/s", 1.0e9),
+    ("500 MS/s", 500e6),
+    ("250 MS/s", 250e6),
+    ("200 MS/s", 200e6),
+    ("100 MS/s", 100e6),
+    ("50 MS/s", 50e6),
+    ("25 MS/s", 25e6),
+    ("20 MS/s", 20e6),
+    ("10 MS/s", 10e6),
+    ("5 MS/s", 5e6),
+    ("2.5 MS/s", 2.5e6),
+    ("1 MS/s", 1.0e6),
+    ("500 kS/s", 500e3),
+    ("250 kS/s", 250e3),
+    ("100 kS/s", 100e3),
+]
 
 
 def _pulse_echo_depth_mm(t, sound_speed_mps: float):
@@ -465,15 +487,40 @@ class ScannerMainWindow(QMainWindow):
         self.osc_name_edit = QLineEdit("Lecroy")
         self.osc_address_edit = QLineEdit()
         self.osc_address_edit.setPlaceholderText("USB0::...::INSTR")
-        self.sampling_rate_edit = QLineEdit("1")
+
+        self.sampling_rate_combo = QComboBox()
+        for label, rate_hz in LECROY_SAMPLING_RATES:
+            self.sampling_rate_combo.addItem(label, rate_hz)
+        default_rate_idx = self.sampling_rate_combo.findData(100e6)
+        if default_rate_idx >= 0:
+            self.sampling_rate_combo.setCurrentIndex(default_rate_idx)
+
+        self.acq_mode_combo = QComboBox()
+        self.acq_mode_combo.addItems(["Software paced mode", "LeCroy sequence mode"])
+
+        self.acq_window_edit = QLineEdit("1.0")
+        self.acq_window_edit.setPlaceholderText("e.g. 1.0")
+
+        self.delay_edit = QLineEdit("0.0")
+        self.delay_edit.setPlaceholderText("e.g. 0.0")
+
         self.save_pulse_csv_check = QCheckBox(
             "Also save per-pulse CSV files (B-mode, 3D; creates many files)"
         )
         self.save_pulse_csv_check.setChecked(False)
+
         osc_form.addRow("Name", self.osc_name_edit)
         osc_form.addRow("VISA Address", self.osc_address_edit)
-        osc_form.addRow("Sampling Rate (MHz)", self.sampling_rate_edit)
+        osc_form.addRow("Sampling Rate", self.sampling_rate_combo)
+        osc_form.addRow("Acquisition Mode", self.acq_mode_combo)
+        osc_form.addRow("Acquisition Window (ms)", self.acq_window_edit)
+        osc_form.addRow("Delay (µs)", self.delay_edit)
         osc_form.addRow("Storage", self.save_pulse_csv_check)
+
+        self.acq_mode_combo.currentTextChanged.connect(self._on_acq_mode_changed)
+        self.acq_window_edit.textChanged.connect(self._on_acq_window_changed)
+        self.delay_edit.textChanged.connect(self._on_delay_changed)
+        self.sampling_rate_combo.currentIndexChanged.connect(self._schedule_settings_save)
         top.addWidget(osc_box, 1, 0, 1, 2)
 
         connection_box = QGroupBox("Connection Test")
@@ -1908,7 +1955,10 @@ class ScannerMainWindow(QMainWindow):
 
         lines = str(text).splitlines() or [str(text)]
         for line in lines:
-            widget.appendPlainText(f"[{timestamp}] {line}")
+            if "<span" in line or "<font" in line or "<p" in line or "<div" in line:
+                widget.appendHtml(f"[{timestamp}] {line}")
+            else:
+                widget.appendPlainText(f"[{timestamp}] {line}")
         widget.verticalScrollBar().setValue(widget.verticalScrollBar().maximum())
 
     def _on_bc_plot_csv(self, csv_path: str) -> None:
@@ -2447,10 +2497,27 @@ class ScannerMainWindow(QMainWindow):
             self.host_edit.setText(str(cfg.get("host", self.host_edit.text())))
             self.port_edit.setText(str(cfg.get("port", self.port_edit.text())))
             sampling_rate_hz = self._extract_last_float(
-                str(cfg.get("sampling_rate", "")),
-                self._extract_last_float(self.sampling_rate_edit.text(), 1.0) * 1e6,
+                str(cfg.get("sampling_rate", "")), 100e6
             )
-            self.sampling_rate_edit.setText(f"{sampling_rate_hz / 1e6:g}")
+            self._set_sampling_rate_combo_hz(sampling_rate_hz)
+
+            acq_mode = str(cfg.get("acquisition_mode", "Software paced mode"))
+            if acq_mode in ["Software paced mode", "LeCroy sequence mode"]:
+                self.acq_mode_combo.setCurrentText(acq_mode)
+
+            acq_win = str(cfg.get("acquisition_window_ms", "1.0"))
+            self.acq_window_edit.setText(acq_win)
+            self.acq_window_edit.setEnabled(
+                self.acq_mode_combo.currentText() == "Software paced mode"
+            )
+
+            delay_val = str(cfg.get("delay_us", "0.0"))
+            if hasattr(self, "delay_edit"):
+                self.delay_edit.setText(delay_val)
+                self.delay_edit.setEnabled(
+                    self.acq_mode_combo.currentText() == "Software paced mode"
+                )
+
             self.save_pulse_csv_check.setChecked(
                 bool(cfg.get("save_per_pulse_csv", self.save_pulse_csv_check.isChecked()))
             )
@@ -2671,10 +2738,10 @@ class ScannerMainWindow(QMainWindow):
                 "osc_address": self.osc_address_edit.text().strip(),
                 "host": self.host_edit.text().strip(),
                 "port": self.port_edit.text().strip(),
-                "sampling_rate": self._extract_last_float(
-                    self.sampling_rate_edit.text().strip(), 1.0
-                )
-                * 1e6,
+                "sampling_rate": self._config_sampling_rate_hz(),
+                "acquisition_mode": self.acq_mode_combo.currentText(),
+                "acquisition_window_ms": self._config_acq_window_ms(),
+                "delay_us": self._config_delay_us(),
                 "save_per_pulse_csv": bool(self.save_pulse_csv_check.isChecked()),
             },
             "excitation": {
@@ -2768,7 +2835,8 @@ class ScannerMainWindow(QMainWindow):
             self.osc_address_edit,
             self.host_edit,
             self.port_edit,
-            self.sampling_rate_edit,
+            self.acq_window_edit,
+            self.delay_edit,
             self.shape_edit,
         ]
         for widget in line_edits:
@@ -2812,6 +2880,8 @@ class ScannerMainWindow(QMainWindow):
 
         combos = [
             self.sg_name_edit,
+            self.sampling_rate_combo,
+            self.acq_mode_combo,
             self.tx_windowing_combo,
             self.b_depth_axis,
             self.b_scan_axis,
@@ -2853,18 +2923,117 @@ class ScannerMainWindow(QMainWindow):
                 continue
         return fallback
 
+    def _config_acq_window_ms(self) -> float:
+        if hasattr(self, "acq_window_edit"):
+            try:
+                val = float(self.acq_window_edit.text().strip())
+                if val > 0 and math.isfinite(val):
+                    return val
+            except Exception:
+                pass
+        return 1.0
+
+    def _config_delay_us(self) -> float:
+        if hasattr(self, "delay_edit"):
+            try:
+                val = float(self.delay_edit.text().strip())
+                if val >= 0 and math.isfinite(val):
+                    return val
+            except Exception:
+                pass
+        return 0.0
+
+    def _set_sampling_rate_combo_hz(self, target_hz: float) -> None:
+        if not hasattr(self, "sampling_rate_combo"):
+            return
+        best_idx = 0
+        best_diff = float("inf")
+        for i in range(self.sampling_rate_combo.count()):
+            rate = float(self.sampling_rate_combo.itemData(i) or 0)
+            diff = abs(rate - target_hz)
+            if diff < best_diff:
+                best_diff = diff
+                best_idx = i
+        self.sampling_rate_combo.setCurrentIndex(best_idx)
+
     def _config_sampling_rate_hz(self) -> float:
-        """Config-tab Sampling Rate field (MHz) in Hz; raises instead of silently substituting a default."""
-        text = self.sampling_rate_edit.text().strip()
-        try:
-            rate_hz = float(text) * 1e6
-        except ValueError:
-            rate_hz = float("nan")
-        if not (0.0 < rate_hz < float("inf")):
-            raise ValueError(
-                f"Config tab Sampling Rate (MHz) must be a positive number, got {text!r}."
+        """Config-tab Sampling Rate in Hz from the discrete LeCroy dropdown."""
+        if hasattr(self, "sampling_rate_combo"):
+            data = self.sampling_rate_combo.currentData()
+            if data is not None:
+                try:
+                    val = float(data)
+                    if val > 0 and math.isfinite(val):
+                        return val
+                except (ValueError, TypeError):
+                    pass
+            text = self.sampling_rate_combo.currentText().strip()
+            for label, hz in LECROY_SAMPLING_RATES:
+                if label.lower() == text.lower():
+                    return hz
+            val = self._extract_last_float(text, 100.0)
+            return val * 1e6 if val < 1e5 else val
+        return 100e6
+
+    def _log_acq_mode_info(self, mode: str | None = None) -> None:
+        if mode is None:
+            mode = (
+                self.acq_mode_combo.currentText()
+                if hasattr(self, "acq_mode_combo")
+                else "Software paced mode"
             )
-        return rate_hz
+        if mode == "Software paced mode":
+            win_val = self._config_acq_window_ms()
+            delay_val = self._config_delay_us()
+            pulses_cnt = int(self.tx_pulses.value()) if hasattr(self, "tx_pulses") else 1
+            delay_note = f", delay = {delay_val:g} µs" if delay_val > 0 else ""
+            msg = (
+                f"<span style='color: red; font-weight: bold;'>"
+                f"WARNING: Software paced mode overrides PRF timing due to per-pulse transfer. "
+                f"Signals are captured during the user-defined acquisition window ({win_val:g} ms{delay_note}, "
+                f"10 segments of LeCroy time window) and transmitted to the PC immediately after each pulse, "
+                f"repeated by the configured number of pulses ({pulses_cnt} pulses). "
+                f"This mode is useful for PRF &lt; 10 Hz due to ~100 ms data transfer time from LeCroy to PC."
+                f"</span>"
+            )
+            self.bridge.cfg_log.emit(msg)
+        else:
+            prf_hz = float(self.tx_prf.value()) if hasattr(self, "tx_prf") else 1000.0
+            prf_win_ms = (1.0 / max(prf_hz, 1e-6)) * 1000.0
+            msg = (
+                f"<span style='color: #1976d2; font-weight: bold;'>"
+                f"LeCroy sequence mode: Acquisition window is set to 1/PRF ({prf_win_ms:.3f} ms at PRF={prf_hz:g} Hz). "
+                f"The signal generator fires bursts via hardware timer while LeCroy records each segment "
+                f"into high-speed on-board memory before a single bulk transfer to the PC. "
+                f"This mode works efficiently and accurately at high PRFs (up to 2 kHz)."
+                f"</span>"
+            )
+            self.bridge.cfg_log.emit(msg)
+
+    def _on_acq_mode_changed(self, mode_text: str) -> None:
+        is_software_paced = mode_text == "Software paced mode"
+        if hasattr(self, "acq_window_edit"):
+            self.acq_window_edit.setEnabled(is_software_paced)
+        if hasattr(self, "delay_edit"):
+            self.delay_edit.setEnabled(is_software_paced)
+        self._log_acq_mode_info(mode_text)
+        self._schedule_settings_save()
+
+    def _on_acq_window_changed(self, text: str) -> None:
+        if (
+            hasattr(self, "acq_mode_combo")
+            and self.acq_mode_combo.currentText() == "Software paced mode"
+        ):
+            self._log_acq_mode_info("Software paced mode")
+        self._schedule_settings_save()
+
+    def _on_delay_changed(self, text: str) -> None:
+        if (
+            hasattr(self, "acq_mode_combo")
+            and self.acq_mode_combo.currentText() == "Software paced mode"
+        ):
+            self._log_acq_mode_info("Software paced mode")
+        self._schedule_settings_save()
 
     def _resolve_filter_sampling_rate(
         self, label: str, config_hz: float, actual_rates_hz, log_fn, info: bool = True
@@ -4038,6 +4207,124 @@ class ScannerMainWindow(QMainWindow):
                 0, lambda: self._animate_bc_scan_type_indicator(animate=False)
             )
 
+    def _read_scope_word_block(self, osc, command: str = "C1:WF? DAT1", log_fn=None):
+        import numpy as np
+
+        last_raw_resp = b""
+        last_error = None
+
+        for attempt in range(3):
+            if attempt > 0:
+                with contextlib.suppress(Exception):
+                    osc.write("*CLS")
+                with contextlib.suppress(Exception):
+                    osc.write("COMM_HEADER OFF")
+                with contextlib.suppress(Exception):
+                    osc.write("COMM_FORMAT DEF9,WORD,BIN")
+                time.sleep(0.15)
+
+            osc.write(command)
+            raw_resp = b""
+            for _ in range(12):
+                try:
+                    chunk = osc.read_raw()
+                except Exception:
+                    break
+                if not chunk:
+                    break
+                raw_resp += chunk
+                if b"#" in raw_resp:
+                    break
+
+            last_raw_resp = raw_resp
+            hash_idx = raw_resp.find(b"#")
+            if hash_idx < 0:
+                upper_msg = raw_resp.upper()
+                if (
+                    b"CURRENT REMOTE CONTROL INTERFACE" in upper_msg
+                    and attempt < 2
+                ):
+                    if callable(log_fn):
+                        warning_text = raw_resp.decode("ascii", errors="ignore").strip()
+                        log_fn(
+                            "Scope returned remote-interface warning; retrying waveform fetch."
+                            + (f" Message: {warning_text}" if warning_text else "")
+                        )
+                    continue
+                preview = raw_resp[:120]
+                last_error = RuntimeError(
+                    f"Scope binary block header not found in response to {command}; "
+                    f"response begins with {preview!r}"
+                )
+                break
+
+            if hash_idx > 0 and callable(log_fn):
+                prefix = raw_resp[:hash_idx].decode("ascii", errors="ignore").strip()
+                if prefix:
+                    log_fn(f"Scope preamble before binary block: {prefix}")
+
+            if hash_idx + 2 > len(raw_resp):
+                raise RuntimeError("Incomplete scope binary header (#N) received.")
+            n_digits_byte = raw_resp[hash_idx + 1 : hash_idx + 2]
+            if not n_digits_byte.isdigit():
+                raise RuntimeError(
+                    f"Invalid scope binary header after '#': {n_digits_byte!r}"
+                )
+            n_digits = int(n_digits_byte.decode("ascii"))
+
+            len_start = hash_idx + 2
+            len_end = len_start + n_digits
+            while len(raw_resp) < len_end:
+                try:
+                    chunk = osc.read_raw()
+                except Exception:
+                    chunk = b""
+                if not chunk:
+                    break
+                raw_resp += chunk
+
+            if len(raw_resp) < len_end:
+                raise RuntimeError("Incomplete scope binary length field received.")
+
+            payload_len_token = raw_resp[len_start:len_end]
+            if not payload_len_token.isdigit():
+                raise RuntimeError(
+                    f"Invalid scope payload length token: {payload_len_token!r}"
+                )
+            payload_len = int(payload_len_token.decode("ascii"))
+
+            payload_start = len_end
+            payload_end = payload_start + payload_len
+            while len(raw_resp) < payload_end:
+                try:
+                    chunk = osc.read_raw()
+                except Exception:
+                    chunk = b""
+                if not chunk:
+                    break
+                raw_resp += chunk
+
+            if len(raw_resp) < payload_end:
+                raise RuntimeError(
+                    f"Incomplete scope payload: expected {payload_len} bytes, got {max(len(raw_resp) - payload_start, 0)}"
+                )
+
+            payload = raw_resp[payload_start:payload_end]
+            if len(payload) % 2 == 1:
+                payload = payload[:-1]
+            if not payload:
+                raise RuntimeError("Scope payload is empty after parsing binary block.")
+
+            return np.frombuffer(payload, dtype="<i2")
+
+        if last_error is not None:
+            raise last_error
+        preview = last_raw_resp[:120]
+        raise RuntimeError(
+            f"Scope binary block header not found in response to {command}; "
+            f"response begins with {preview!r}"
+        )
+
     def _capture_a_mode_waveform(
         self,
         osc,
@@ -4048,10 +4335,22 @@ class ScannerMainWindow(QMainWindow):
     ):
         import numpy as np
 
-        
-
-        burst_duration = max(float(cycles) / max(float(frequency), 1e-12), 1e-9)
         sampling_rate = self._config_sampling_rate_hz()
+        acq_mode = (
+            self.acq_mode_combo.currentText()
+            if hasattr(self, "acq_mode_combo")
+            else "Software paced mode"
+        )
+        if acq_mode == "Software paced mode":
+            window_s = max(self._config_acq_window_ms() / 1000.0, 1e-9)
+            desired_delay_s = max(self._config_delay_us() / 1e6, 0.0)
+        else:
+            prf_hz = float(self.tx_prf.value()) if hasattr(self, "tx_prf") else 1000.0
+            window_s = max(1.0 / max(prf_hz, 1e-6), 1e-9)
+            desired_delay_s = 0.0
+
+        hor_scale = max(window_s / 10.0, 1e-9)
+        scope_delay = desired_delay_s + (5.0 * hor_scale)
         capture_signature = (
             id(osc),
             str(self.osc_address_edit.text().strip()),
@@ -4059,6 +4358,9 @@ class ScannerMainWindow(QMainWindow):
             round(float(amplitude), 6),
             round(float(cycles), 6),
             round(float(sampling_rate), 3),
+            acq_mode,
+            round(float(hor_scale), 9),
+            round(float(scope_delay), 9),
         )
         if (
             self._scope_capture_config_handle_id != id(osc)
@@ -4066,13 +4368,20 @@ class ScannerMainWindow(QMainWindow):
         ):
             def vbs(cmd: str) -> None:
                 osc.write(f"VBS '{cmd}'")
-                time.sleep(0.1)
+                time.sleep(0.05)
 
-            hor_scale = max(burst_duration, 1e-9)
             ver_scale = max(float(amplitude), 0.01)
             osc.write("COMM_HEADER OFF")
             osc.write("COMM_FORMAT DEF9,WORD,BIN")
+            vbs("app.Acquisition.Horizontal.SampleMode = 'RealTime'")
+            with contextlib.suppress(Exception):
+                osc.write("SEQUENCE OFF")
             vbs(f"app.Acquisition.Horizontal.HorScale = {hor_scale}")
+            vbs(f"app.Acquisition.Horizontal.HorOffset = -{scope_delay}")
+            with contextlib.suppress(Exception):
+                osc.write(f"TIME_DIV {hor_scale}")
+            with contextlib.suppress(Exception):
+                osc.write(f"TRIG_DELAY -{scope_delay}")
             vbs(f"app.Acquisition.C1.VerScale = {ver_scale}")
             vbs(f"app.Acquisition.Horizontal.SampleRate = {sampling_rate}")
             vbs("app.Acquisition.C1.View = true")
@@ -4082,7 +4391,8 @@ class ScannerMainWindow(QMainWindow):
             self._scope_capture_config_signature = capture_signature
             if callable(log_fn):
                 log_fn(
-                    "A-mode: Applied scope capture configuration for current cached hardware/config signature."
+                    f"A-mode: Applied scope capture configuration (mode={acq_mode}, HorScale={hor_scale*1e3:.4f} ms/div, "
+                    f"delay={desired_delay_s*1e6:g} µs, center_delay={scope_delay*1e6:.4f} µs, fs={sampling_rate/1e6:g} MS/s)."
                 )
 
         import struct
@@ -4125,124 +4435,8 @@ class ScannerMainWindow(QMainWindow):
                 "A-mode: LeCroy WAVEDESC not found in response; falling back to SCPI timebase queries."
             )
 
-        def _read_word_block_with_prefix_tolerance(command: str):
-            last_raw_resp = b""
-            last_error = None
 
-            for attempt in range(3):
-                if attempt > 0:
-                    # Re-assert comm format after warning-only replies before retrying.
-                    with contextlib.suppress(Exception):
-                        osc.write("*CLS")
-                    with contextlib.suppress(Exception):
-                        osc.write("COMM_HEADER OFF")
-                    with contextlib.suppress(Exception):
-                        osc.write("COMM_FORMAT DEF9,WORD,BIN")
-                    time.sleep(0.15)
-
-                osc.write(command)
-                raw_resp = b""
-                for _ in range(12):
-                    try:
-                        chunk = osc.read_raw()
-                    except Exception:
-                        break
-                    if not chunk:
-                        break
-                    raw_resp += chunk
-                    if b"#" in raw_resp:
-                        break
-
-                last_raw_resp = raw_resp
-                hash_idx = raw_resp.find(b"#")
-                if hash_idx < 0:
-                    upper_msg = raw_resp.upper()
-                    if (
-                        b"CURRENT REMOTE CONTROL INTERFACE" in upper_msg
-                        and attempt < 2
-                    ):
-                        if callable(log_fn):
-                            warning_text = raw_resp.decode("ascii", errors="ignore").strip()
-                            log_fn(
-                                "A-mode: Scope returned remote-interface warning; retrying waveform fetch."
-                                + (f" Message: {warning_text}" if warning_text else "")
-                            )
-                        continue
-                    preview = raw_resp[:120]
-                    last_error = RuntimeError(
-                        "Scope binary block header not found in response to C1:WF? DAT1; "
-                        f"response begins with {preview!r}"
-                    )
-                    break
-
-                if hash_idx > 0 and callable(log_fn):
-                    prefix = raw_resp[:hash_idx].decode("ascii", errors="ignore").strip()
-                    if prefix:
-                        log_fn(f"A-mode: Scope preamble before binary block: {prefix}")
-
-                if hash_idx + 2 > len(raw_resp):
-                    raise RuntimeError("Incomplete scope binary header (#N) received.")
-                n_digits_byte = raw_resp[hash_idx + 1 : hash_idx + 2]
-                if not n_digits_byte.isdigit():
-                    raise RuntimeError(
-                        f"Invalid scope binary header after '#': {n_digits_byte!r}"
-                    )
-                n_digits = int(n_digits_byte.decode("ascii"))
-
-                len_start = hash_idx + 2
-                len_end = len_start + n_digits
-                while len(raw_resp) < len_end:
-                    try:
-                        chunk = osc.read_raw()
-                    except Exception:
-                        chunk = b""
-                    if not chunk:
-                        break
-                    raw_resp += chunk
-
-                if len(raw_resp) < len_end:
-                    raise RuntimeError("Incomplete scope binary length field received.")
-
-                payload_len_token = raw_resp[len_start:len_end]
-                if not payload_len_token.isdigit():
-                    raise RuntimeError(
-                        f"Invalid scope payload length token: {payload_len_token!r}"
-                    )
-                payload_len = int(payload_len_token.decode("ascii"))
-
-                payload_start = len_end
-                payload_end = payload_start + payload_len
-                while len(raw_resp) < payload_end:
-                    try:
-                        chunk = osc.read_raw()
-                    except Exception:
-                        chunk = b""
-                    if not chunk:
-                        break
-                    raw_resp += chunk
-
-                if len(raw_resp) < payload_end:
-                    raise RuntimeError(
-                        f"Incomplete scope payload: expected {payload_len} bytes, got {max(len(raw_resp) - payload_start, 0)}"
-                    )
-
-                payload = raw_resp[payload_start:payload_end]
-                if len(payload) % 2 == 1:
-                    payload = payload[:-1]
-                if not payload:
-                    raise RuntimeError("Scope payload is empty after parsing binary block.")
-
-                return np.frombuffer(payload, dtype="<i2")
-
-            if last_error is not None:
-                raise last_error
-            preview = last_raw_resp[:120]
-            raise RuntimeError(
-                "Scope binary block header not found in response to C1:WF? DAT1; "
-                f"response begins with {preview!r}"
-            )
-
-        raw_data = _read_word_block_with_prefix_tolerance("C1:WF? DAT1")
+        raw_data = self._read_scope_word_block(osc, "C1:WF? DAT1", log_fn=log_fn)
         num_points = len(raw_data)
         if num_points <= 0:
             raise RuntimeError("Oscilloscope returned zero waveform points.")
@@ -4262,14 +4456,12 @@ class ScannerMainWindow(QMainWindow):
             t = np.arange(num_points, dtype=float) * h_int + h_off
         else:
             t_div = self._extract_last_float(
-                str(osc.query("TDIV?")).strip(), max(burst_duration / 10.0, 1e-9)
-            )
-            h_off = self._extract_last_float(
-                str(osc.query("TRDL?")).strip(), 0.0
+                str(osc.query("TDIV?")).strip(), max(hor_scale, 1e-9)
             )
             time_span = max(t_div * 10.0, 1e-12)
             h_int = time_span / float(num_points)
-            t = np.arange(num_points, dtype=float) * h_int + h_off
+            t = np.arange(num_points, dtype=float) * h_int + desired_delay_s
+            h_off = desired_delay_s
 
         actual_sampling_rate = 1.0 / h_int if h_int > 0.0 else float("nan")
 
@@ -4299,6 +4491,188 @@ class ScannerMainWindow(QMainWindow):
                 )
 
         return t, volts, actual_sampling_rate
+
+    def _capture_sequence_waveforms(
+        self,
+        osc,
+        sg,
+        frequency: float,
+        amplitude: float,
+        cycles: float,
+        pulses: int,
+        prf_hz: float,
+        window_fn: str = "Hanning",
+        log_fn=None,
+    ):
+        """Capture all pulses in a single sequence acquisition using LeCroy Sequence Mode.
+
+        1. Configures LeCroy in Sequence mode: NumSegments = pulses, HorScale = (1/PRF)/10,
+           SampleRate = config sampling rate.
+        2. Arms LeCroy in SINGLE trigger mode.
+        3. Fires signal generator bursts via Option A (Hardware Timer) for pulses > 1.
+        4. Waits for acquisition completion and reads all segments in a single bulk transfer.
+        5. Unpacks data into individual pulse waveforms of shape (pulses, samples_per_segment).
+
+        Returns: (t, segments, actual_sampling_rate)
+            t: 1D array of time points for each segment (length S)
+            segments: 2D numpy array of shape (pulses, S) containing voltage for each pulse
+            actual_sampling_rate: float
+        """
+        import numpy as np
+        import struct
+        from api.src.Signal_function import Burst_generate
+
+        pulses = max(1, int(pulses))
+        prf_hz = max(float(prf_hz), 1e-6)
+        sampling_rate = self._config_sampling_rate_hz()
+        window_s = 1.0 / prf_hz
+        hor_scale = max(window_s / 10.0, 1e-9)
+        ver_scale = max(float(amplitude), 0.01)
+
+        def vbs(cmd: str) -> None:
+            osc.write(f"VBS '{cmd}'")
+            time.sleep(0.04)
+
+        # Invalidate cached single-capture configuration signature
+        self._scope_capture_config_signature = None
+
+        osc.write("COMM_HEADER OFF")
+        osc.write("COMM_FORMAT DEF9,WORD,BIN")
+        vbs("app.Acquisition.Horizontal.SampleMode = 'Sequence'")
+        vbs(f"app.Acquisition.Horizontal.NumSegments = {pulses}")
+        vbs(f"app.Acquisition.Horizontal.HorScale = {hor_scale}")
+        vbs(f"app.Acquisition.Horizontal.SampleRate = {sampling_rate}")
+        vbs(f"app.Acquisition.C1.VerScale = {ver_scale}")
+        vbs("app.Acquisition.C1.View = true")
+        vbs('app.Acquisition.Trigger.Source = "EXT"')
+
+        if callable(log_fn):
+            log_fn(
+                f"LeCroy sequence mode armed: {pulses} segment(s), window={window_s*1e3:.4f} ms (HorScale={hor_scale*1e3:.4f} ms/div), "
+                f"requested fs={sampling_rate/1e6:g} MS/s, PRF={prf_hz:g} Hz."
+            )
+
+        # Arm scope for sequence acquisition
+        osc.write("TRIG_MODE SINGLE")
+        time.sleep(0.05)
+
+        # Fire signal generator bursts (Option A hardware timer automatically used when pulses > 1)
+        Burst_generate(
+            sg,
+            shape="SIN",
+            frequency=frequency,
+            amplitude=amplitude,
+            no_of_cycles_per_pulse=cycles,
+            no_of_pulses=pulses,
+            prf=prf_hz,
+            window_type=window_fn,
+        )
+
+        # Wait for the pulse train to finish
+        train_duration = (pulses / prf_hz) + 0.1
+        time.sleep(min(train_duration, 5.0))
+
+        # Query WAVEDESC for exact scaling and time increment
+        osc.write("C1:WF? ALL")
+        raw = b""
+        while True:
+            try:
+                chunk = osc.read_raw()
+            except Exception:
+                chunk = b""
+            if not chunk and raw:
+                break
+            raw += chunk
+            if len(raw) > 2048 and b"#" in raw:
+                break
+
+        wd_start = raw.find(b"WAVEDESC")
+        use_descriptor_axis = False
+        v_gain = None
+        v_off = None
+        h_int = None
+        h_off = 0.0
+        if wd_start >= 0 and len(raw) >= wd_start + 188:
+            try:
+                v_gain = float(struct.unpack("<f", raw[wd_start + 156 : wd_start + 160])[0])
+                v_off = float(struct.unpack("<f", raw[wd_start + 160 : wd_start + 164])[0])
+                h_int = float(struct.unpack("<f", raw[wd_start + 176 : wd_start + 180])[0])
+                h_off = float(struct.unpack("<d", raw[wd_start + 180 : wd_start + 188])[0])
+                use_descriptor_axis = bool(h_int and h_int > 0.0)
+            except Exception as desc_exc:
+                if callable(log_fn):
+                    log_fn(f"Sequence: WAVEDESC parse warning: {desc_exc}")
+
+        # Bulk read binary data for all segments
+        raw_data = self._read_scope_word_block(osc, "C1:WF? DAT1", log_fn=log_fn)
+        num_points = len(raw_data)
+        if num_points <= 0:
+            raise RuntimeError("Oscilloscope returned zero waveform points in sequence mode.")
+
+        pts_per_segment = max(1, num_points // pulses)
+        trimmed_len = pts_per_segment * pulses
+        raw_segments = raw_data[:trimmed_len].reshape((pulses, pts_per_segment))
+
+        if v_gain is not None and v_off is not None:
+            segments_volts = (raw_segments.astype(float) * v_gain) - v_off
+        else:
+            v_div = self._extract_last_float(
+                str(osc.query("C1:VDIV?")).strip(), max(float(amplitude), 0.01)
+            )
+            v_offset = self._extract_last_float(
+                str(osc.query("C1:OFST?")).strip(), 0.0
+            )
+            segments_volts = (raw_segments.astype(float) * (v_div * 8.0 / 65536.0)) - v_offset
+
+        if use_descriptor_axis and h_int:
+            t = np.arange(pts_per_segment, dtype=float) * h_int + h_off
+        else:
+            time_span = max(hor_scale * 10.0, 1e-12)
+            h_int = time_span / float(pts_per_segment)
+            t = np.arange(pts_per_segment, dtype=float) * h_int + h_off
+
+        actual_sampling_rate = 1.0 / h_int if h_int > 0.0 else float("nan")
+
+        if callable(log_fn):
+            log_fn(
+                f"Sequence captured: {pulses} segment(s), {pts_per_segment} pts/segment, "
+                f"actual fs={actual_sampling_rate/1e6:.6f} MS/s, window={t[-1]-t[0]:.6e} s."
+            )
+
+        return t, segments_volts, actual_sampling_rate
+
+    def _generate_dummy_sequence(
+        self,
+        module,
+        frequency_hz: float,
+        amplitude_v: float,
+        no_of_cycles_per_pulse: float,
+        window_type: str,
+        sampling_rate_hz: float,
+        pulses: int,
+    ):
+        """Generate simulated sequence waveforms for test / dry-run mode."""
+        import numpy as np
+
+        pulses = max(1, int(pulses))
+        t = None
+        segments = []
+        for _ in range(pulses):
+            t_one, y_one = module.generate_test_echo(
+                frequency_hz=frequency_hz,
+                amplitude_v=amplitude_v,
+                no_of_cycles_per_pulse=no_of_cycles_per_pulse,
+                window_type=window_type,
+                sampling_rate_hz=sampling_rate_hz,
+            )
+            if t is None:
+                t = np.asarray(t_one, dtype=float)
+            segments.append(np.asarray(y_one, dtype=float))
+
+        min_len = min(len(s) for s in segments)
+        t = t[:min_len]
+        segments_arr = np.array([s[:min_len] for s in segments], dtype=float)
+        return t, segments_arr, float(sampling_rate_hz)
 
     def _flush_scope_before_scan(self, osc, log_fn=None) -> None:
         """Force a fresh trigger state before a new scan run.
@@ -5278,64 +5652,130 @@ class ScannerMainWindow(QMainWindow):
                     "window": window_fn,
                     "signal_source": "dummy" if dry_run else "hardware",
                 }
-                for pulse_idx in range(1, pulses_per_point + 1):
-                    _scope_fs_hz = None
+                acq_mode = (
+                    self.acq_mode_combo.currentText()
+                    if hasattr(self, "acq_mode_combo")
+                    else "Software paced mode"
+                )
+                if acq_mode == "LeCroy sequence mode":
                     if dry_run:
-                        t_one, y_one = module.generate_test_echo(
+                        t_seq, segments, _scope_fs_hz = self._generate_dummy_sequence(
+                            module,
                             frequency_hz=frequency,
                             amplitude_v=amplitude_vpp,
                             no_of_cycles_per_pulse=cycles,
                             window_type=window_fn,
                             sampling_rate_hz=sampling_rate,
+                            pulses=pulses_per_point,
                         )
                     else:
-                        Burst_generate(
-                            sg,
-                            shape="SIN",
-                            frequency=frequency,
-                            amplitude=amplitude_vpp,
-                            no_of_cycles_per_pulse=cycles,
-                            no_of_pulses=1,
-                            prf=prf_hz,
-                            window_type=window_fn,
-                        )
-                        t_one, y_one, _scope_fs_hz = self._capture_a_mode_waveform(
+                        t_seq, segments, _scope_fs_hz = self._capture_sequence_waveforms(
                             osc,
+                            sg,
                             frequency,
                             amplitude_vpp,
                             cycles,
+                            pulses_per_point,
+                            prf_hz,
+                            window_fn=window_fn,
                             log_fn=self.bridge.b_mode_log.emit,
                         )
-                        if _scope_fs_hz is not None and np.isfinite(_scope_fs_hz) and _scope_fs_hz > 0.0:
-                            scope_sampling_rates.append(float(_scope_fs_hz))
-                    t_echoes.append(np.asarray(t_one, dtype=float))
-                    y_echoes.append(np.asarray(y_one, dtype=float))
-                    pulse_actual = self._actual_sampling_rate(t_one, _scope_fs_hz)
-                    pulse_actuals.append(pulse_actual)
-                    if b_pulse_writer is not None:
-                        b_pulse_writer.write((idx - 1,), pulse_idx, t_one, y_one)
-                    if b_pulses_dir is not None:
-                        pulse_path = b_pulses_dir / f"point_{idx:04d}_pulse_{pulse_idx:03d}.csv"
-                        self._write_waveform_csv(
-                            pulse_path,
-                            self._waveform_metadata(
-                                scan_mode="B-mode",
-                                data_kind="single pulse (raw, as acquired)",
-                                pulse_index=pulse_idx,
-                                pulse_total=pulses_per_point,
-                                config_hz=sampling_rate,
-                                actual=pulse_actual,
-                                extra=point_meta_extra,
-                            ),
-                            ["Time (s)", "Amplitude (V)"],
-                            zip(np.asarray(t_one, dtype=float), np.asarray(y_one, dtype=float)),
+                    if _scope_fs_hz is not None and np.isfinite(_scope_fs_hz) and _scope_fs_hz > 0.0:
+                        scope_sampling_rates.append(float(_scope_fs_hz))
+
+                    for pulse_idx in range(1, pulses_per_point + 1):
+                        t_one = t_seq
+                        y_one = segments[pulse_idx - 1]
+                        t_echoes.append(np.asarray(t_one, dtype=float))
+                        y_echoes.append(np.asarray(y_one, dtype=float))
+                        pulse_actual = self._actual_sampling_rate(t_one, _scope_fs_hz)
+                        pulse_actuals.append(pulse_actual)
+                        if b_pulse_writer is not None:
+                            b_pulse_writer.write((idx - 1,), pulse_idx, t_one, y_one)
+                        if b_pulses_dir is not None:
+                            pulse_path = b_pulses_dir / f"point_{idx:04d}_pulse_{pulse_idx:03d}.csv"
+                            self._write_waveform_csv(
+                                pulse_path,
+                                self._waveform_metadata(
+                                    scan_mode="B-mode",
+                                    data_kind="single pulse (sequence segment)",
+                                    pulse_index=pulse_idx,
+                                    pulse_total=pulses_per_point,
+                                    config_hz=sampling_rate,
+                                    actual=pulse_actual,
+                                    extra=point_meta_extra,
+                                ),
+                                ["Time (s)", "Amplitude (V)"],
+                                zip(np.asarray(t_one, dtype=float), np.asarray(y_one, dtype=float)),
+                            )
+                            pulse_csv_rels.append(
+                                pulse_path.relative_to(b_scan_folder).as_posix()
+                            )
+                        self.bridge.b_mode_log.emit(
+                            f"Unpacked sequence segment {pulse_idx}/{pulses_per_point} at point {idx}/{points}"
                         )
-                        pulse_csv_rels.append(
-                            pulse_path.relative_to(b_scan_folder).as_posix()
+                else:
+                    for pulse_idx in range(1, pulses_per_point + 1):
+                        _scope_fs_hz = None
+                        if dry_run:
+                            t_one, y_one = module.generate_test_echo(
+                                frequency_hz=frequency,
+                                amplitude_v=amplitude_vpp,
+                                no_of_cycles_per_pulse=cycles,
+                                window_type=window_fn,
+                                sampling_rate_hz=sampling_rate,
+                            )
+                            delay_s = self._config_delay_us() / 1e6
+                            if delay_s > 0.0:
+                                t_one = np.asarray(t_one, dtype=float) + delay_s
+                        else:
+                            Burst_generate(
+                                sg,
+                                shape="SIN",
+                                frequency=frequency,
+                                amplitude=amplitude_vpp,
+                                no_of_cycles_per_pulse=cycles,
+                                no_of_pulses=1,
+                                prf=prf_hz,
+                                window_type=window_fn,
+                            )
+                            t_one, y_one, _scope_fs_hz = self._capture_a_mode_waveform(
+                                osc,
+                                frequency,
+                                amplitude_vpp,
+                                cycles,
+                                log_fn=self.bridge.b_mode_log.emit,
+                            )
+                            if _scope_fs_hz is not None and np.isfinite(_scope_fs_hz) and _scope_fs_hz > 0.0:
+                                scope_sampling_rates.append(float(_scope_fs_hz))
+                        t_echoes.append(np.asarray(t_one, dtype=float))
+                        y_echoes.append(np.asarray(y_one, dtype=float))
+                        pulse_actual = self._actual_sampling_rate(t_one, _scope_fs_hz)
+                        pulse_actuals.append(pulse_actual)
+                        if b_pulse_writer is not None:
+                            b_pulse_writer.write((idx - 1,), pulse_idx, t_one, y_one)
+                        if b_pulses_dir is not None:
+                            pulse_path = b_pulses_dir / f"point_{idx:04d}_pulse_{pulse_idx:03d}.csv"
+                            self._write_waveform_csv(
+                                pulse_path,
+                                self._waveform_metadata(
+                                    scan_mode="B-mode",
+                                    data_kind="single pulse (raw, as acquired)",
+                                    pulse_index=pulse_idx,
+                                    pulse_total=pulses_per_point,
+                                    config_hz=sampling_rate,
+                                    actual=pulse_actual,
+                                    extra=point_meta_extra,
+                                ),
+                                ["Time (s)", "Amplitude (V)"],
+                                zip(np.asarray(t_one, dtype=float), np.asarray(y_one, dtype=float)),
+                            )
+                            pulse_csv_rels.append(
+                                pulse_path.relative_to(b_scan_folder).as_posix()
+                            )
+                        self.bridge.b_mode_log.emit(
+                            f"Captured echo {pulse_idx}/{pulses_per_point} at point {idx}/{points}"
                         )
-                    self.bridge.b_mode_log.emit(
-                        f"Captured echo {pulse_idx}/{pulses_per_point} at point {idx}/{points}"
-                    )
 
                 if b_pulse_writer is not None:
                     b_pulse_writer.flush()
@@ -6494,93 +6934,196 @@ class ScannerMainWindow(QMainWindow):
             pulse_actuals = []
             running_sum = None
             running_count = 0
-            self.bridge.a_mode_log.emit(f"A-mode running for {pulses} pulse(s).")
-            for pulse_idx in range(1, pulses + 1):
-                scope_fs_hz = None
+            acq_mode = (
+                self.acq_mode_combo.currentText()
+                if hasattr(self, "acq_mode_combo")
+                else "Software paced mode"
+            )
+            if acq_mode == "LeCroy sequence mode":
+                self.bridge.a_mode_log.emit(
+                    f"A-mode: Running in LeCroy sequence mode for {pulses} pulse(s) (window = 1/PRF = {(1.0/max(prf_hz, 1e-6))*1e3:.3f} ms)."
+                )
                 if use_dummy:
-                    t, y = module.generate_test_echo(
+                    t_seq, segments, scope_fs_hz = self._generate_dummy_sequence(
+                        module,
                         frequency_hz=frequency,
                         amplitude_v=amplitude,
                         no_of_cycles_per_pulse=cycles,
                         window_type=window_fn,
                         sampling_rate_hz=sampling_rate,
+                        pulses=pulses,
                     )
                 else:
-                    Burst_generate(
-                        sg,
-                        shape="SIN",
-                        frequency=frequency,
-                        amplitude=amplitude,
-                        no_of_cycles_per_pulse=cycles,
-                        no_of_pulses=1,
-                        prf=prf_hz,
-                        window_type=window_fn,
-                    )
-                    t, y, scope_fs_hz = self._capture_a_mode_waveform(
+                    t_seq, segments, scope_fs_hz = self._capture_sequence_waveforms(
                         osc,
+                        sg,
                         frequency,
                         amplitude,
                         cycles,
+                        pulses,
+                        prf_hz,
+                        window_fn=window_fn,
                         log_fn=self.bridge.a_mode_log.emit,
                     )
-                    if scope_fs_hz is not None and scope_fs_hz > 0.0:
-                        scope_sampling_rates.append(float(scope_fs_hz))
-                traces.append((t, y))
-                pulse_actual = self._actual_sampling_rate(t, scope_fs_hz)
-                pulse_actuals.append(pulse_actual)
-                if store_automatically and a_scan_folder is not None:
-                    pulse_csv = a_scan_folder / f"a_scan_pulse_{pulse_idx:03d}.csv"
-                    _write_wave_csv(
-                        pulse_csv,
-                        t,
-                        y,
-                        self._waveform_metadata(
-                            scan_mode="A-mode",
-                            data_kind="single pulse (raw, as acquired)",
-                            pulse_index=pulse_idx,
-                            pulse_total=pulses,
-                            config_hz=sampling_rate,
-                            actual=pulse_actual,
-                            extra={
-                                "scope_sampling_rate_hz": (
-                                    float(scope_fs_hz) if scope_fs_hz is not None else "n/a"
-                                ),
-                            },
-                        ),
-                    )
-                self.bridge.a_mode_log.emit(
-                    f"Captured A-mode echo {pulse_idx}/{pulses}"
-                )
+                if scope_fs_hz is not None and scope_fs_hz > 0.0:
+                    scope_sampling_rates.append(float(scope_fs_hz))
 
-                if live_enabled:
-                    echo_detrended = self._detrend_signal(np.asarray(y, dtype=float))
-                    if running_sum is None:
-                        running_sum = echo_detrended.copy()
-                    else:
-                        n_run = min(running_sum.size, echo_detrended.size)
-                        running_sum = running_sum[:n_run] + echo_detrended[:n_run]
-                    running_count += 1
-                    running_avg = running_sum / running_count
-                    self._a_mode_last_results = {
-                        "mode": "live",
-                        "t": np.asarray(t, dtype=float),
-                        "y": np.asarray(y, dtype=float),
-                        "y_running_avg": running_avg,
-                        "pulse_idx": pulse_idx,
-                        "pulse_total": pulses,
-                        "live_enabled": live_enabled,
-                        "use_dummy": use_dummy,
-                    }
-                    self.bridge.a_preview.emit(
-                        {
+                for pulse_idx in range(1, pulses + 1):
+                    t = t_seq
+                    y = segments[pulse_idx - 1]
+                    traces.append((t, y))
+                    pulse_actual = self._actual_sampling_rate(t, scope_fs_hz)
+                    pulse_actuals.append(pulse_actual)
+                    if store_automatically and a_scan_folder is not None:
+                        pulse_csv = a_scan_folder / f"a_scan_pulse_{pulse_idx:03d}.csv"
+                        _write_wave_csv(
+                            pulse_csv,
+                            t,
+                            y,
+                            self._waveform_metadata(
+                                scan_mode="A-mode",
+                                data_kind="single pulse (sequence segment)",
+                                pulse_index=pulse_idx,
+                                pulse_total=pulses,
+                                config_hz=sampling_rate,
+                                actual=pulse_actual,
+                                extra={
+                                    "scope_sampling_rate_hz": (
+                                        float(scope_fs_hz) if scope_fs_hz is not None else "n/a"
+                                    ),
+                                    "acquisition_mode": "LeCroy sequence mode",
+                                },
+                            ),
+                        )
+                    self.bridge.a_mode_log.emit(
+                        f"Unpacked A-mode sequence segment {pulse_idx}/{pulses}"
+                    )
+
+                    if live_enabled:
+                        echo_detrended = self._detrend_signal(np.asarray(y, dtype=float))
+                        if running_sum is None:
+                            running_sum = echo_detrended.copy()
+                        else:
+                            n_run = min(running_sum.size, echo_detrended.size)
+                            running_sum = running_sum[:n_run] + echo_detrended[:n_run]
+                        running_count += 1
+                        running_avg = running_sum / running_count
+                        self._a_mode_last_results = {
                             "mode": "live",
-                            "t": t,
-                            "y": y,
+                            "t": np.asarray(t, dtype=float),
+                            "y": np.asarray(y, dtype=float),
                             "y_running_avg": running_avg,
                             "pulse_idx": pulse_idx,
                             "pulse_total": pulses,
+                            "live_enabled": live_enabled,
+                            "use_dummy": use_dummy,
                         }
+                        self.bridge.a_preview.emit(
+                            {
+                                "mode": "live",
+                                "t": t,
+                                "y": y,
+                                "y_running_avg": running_avg,
+                                "pulse_idx": pulse_idx,
+                                "pulse_total": pulses,
+                            }
+                        )
+            else:
+                delay_us = self._config_delay_us()
+                delay_s = delay_us / 1e6
+                delay_msg = f", delay = {delay_us:g} µs" if delay_us > 0 else ""
+                self.bridge.a_mode_log.emit(
+                    f"A-mode: Running in Software paced mode for {pulses} pulse(s) (window = {self._config_acq_window_ms():g} ms{delay_msg})."
+                )
+                for pulse_idx in range(1, pulses + 1):
+                    scope_fs_hz = None
+                    if use_dummy:
+                        t, y = module.generate_test_echo(
+                            frequency_hz=frequency,
+                            amplitude_v=amplitude,
+                            no_of_cycles_per_pulse=cycles,
+                            window_type=window_fn,
+                            sampling_rate_hz=sampling_rate,
+                        )
+                        if delay_s > 0.0:
+                            t = np.asarray(t, dtype=float) + delay_s
+                    else:
+                        Burst_generate(
+                            sg,
+                            shape="SIN",
+                            frequency=frequency,
+                            amplitude=amplitude,
+                            no_of_cycles_per_pulse=cycles,
+                            no_of_pulses=1,
+                            prf=prf_hz,
+                            window_type=window_fn,
+                        )
+                        t, y, scope_fs_hz = self._capture_a_mode_waveform(
+                            osc,
+                            frequency,
+                            amplitude,
+                            cycles,
+                            log_fn=self.bridge.a_mode_log.emit,
+                        )
+                        if scope_fs_hz is not None and scope_fs_hz > 0.0:
+                            scope_sampling_rates.append(float(scope_fs_hz))
+                    traces.append((t, y))
+                    pulse_actual = self._actual_sampling_rate(t, scope_fs_hz)
+                    pulse_actuals.append(pulse_actual)
+                    if store_automatically and a_scan_folder is not None:
+                        pulse_csv = a_scan_folder / f"a_scan_pulse_{pulse_idx:03d}.csv"
+                        _write_wave_csv(
+                            pulse_csv,
+                            t,
+                            y,
+                            self._waveform_metadata(
+                                scan_mode="A-mode",
+                                data_kind="single pulse (raw, as acquired)",
+                                pulse_index=pulse_idx,
+                                pulse_total=pulses,
+                                config_hz=sampling_rate,
+                                actual=pulse_actual,
+                                extra={
+                                    "scope_sampling_rate_hz": (
+                                        float(scope_fs_hz) if scope_fs_hz is not None else "n/a"
+                                    ),
+                                    "acquisition_mode": "Software paced mode",
+                                },
+                            ),
+                        )
+                    self.bridge.a_mode_log.emit(
+                        f"Captured A-mode echo {pulse_idx}/{pulses}"
                     )
+
+                    if live_enabled:
+                        echo_detrended = self._detrend_signal(np.asarray(y, dtype=float))
+                        if running_sum is None:
+                            running_sum = echo_detrended.copy()
+                        else:
+                            n_run = min(running_sum.size, echo_detrended.size)
+                            running_sum = running_sum[:n_run] + echo_detrended[:n_run]
+                        running_count += 1
+                        running_avg = running_sum / running_count
+                        self._a_mode_last_results = {
+                            "mode": "live",
+                            "t": np.asarray(t, dtype=float),
+                            "y": np.asarray(y, dtype=float),
+                            "y_running_avg": running_avg,
+                            "pulse_idx": pulse_idx,
+                            "pulse_total": pulses,
+                            "live_enabled": live_enabled,
+                            "use_dummy": use_dummy,
+                        }
+                        self.bridge.a_preview.emit(
+                            {
+                                "mode": "live",
+                                "t": t,
+                                "y": y,
+                                "y_running_avg": running_avg,
+                                "pulse_idx": pulse_idx,
+                                "pulse_total": pulses,
+                            }
+                        )
 
             if not traces:
                 raise RuntimeError("No A-mode echoes captured.")
@@ -7135,68 +7678,138 @@ class ScannerMainWindow(QMainWindow):
                     "window": dry_window_fn,
                     "signal_source": "dummy" if dry_run else "hardware",
                 }
-                for pulse_idx in range(1, pulses_per_point + 1):
-                    _scope_fs_hz = None
+                acq_mode = (
+                    self.acq_mode_combo.currentText()
+                    if hasattr(self, "acq_mode_combo")
+                    else "Software paced mode"
+                )
+                if acq_mode == "LeCroy sequence mode":
                     if oscmod and osc and sg and not dry_run:
-                        Burst_generate(
-                            sg,
-                            shape="SIN",
-                            frequency=dry_frequency_hz,
-                            amplitude=dry_amplitude_v,
-                            no_of_cycles_per_pulse=dry_cycles,
-                            no_of_pulses=1,
-                            prf=dry_prf_hz,
-                            window_type=dry_window_fn,
-                        )
-                        t_one, y_one, _scope_fs_hz = self._capture_a_mode_waveform(
+                        t_seq, segments, _scope_fs_hz = self._capture_sequence_waveforms(
                             osc,
+                            sg,
                             dry_frequency_hz,
                             dry_amplitude_v,
                             dry_cycles,
+                            pulses_per_point,
+                            dry_prf_hz,
+                            window_fn=dry_window_fn,
                             log_fn=self.bridge.bc_log.emit,
                         )
-                        if _scope_fs_hz is not None and np.isfinite(_scope_fs_hz) and _scope_fs_hz > 0.0:
-                            scope_sampling_rates.append(float(_scope_fs_hz))
                     else:
-                        t_one, y_one = a_scan_module.generate_test_echo(
+                        t_seq, segments, _scope_fs_hz = self._generate_dummy_sequence(
+                            a_scan_module,
                             frequency_hz=dry_frequency_hz,
                             amplitude_v=dry_amplitude_v,
                             no_of_cycles_per_pulse=dry_cycles,
                             window_type=dry_window_fn,
                             sampling_rate_hz=sampling_rate,
+                            pulses=pulses_per_point,
                         )
-                    t_echoes.append(np.asarray(t_one, dtype=float))
-                    y_echoes.append(np.asarray(y_one, dtype=float))
-                    pulse_actual = self._actual_sampling_rate(t_one, _scope_fs_hz)
-                    pulse_actuals.append(pulse_actual)
-                    if pulse_writer is not None:
-                        pulse_writer.write(
-                            (axis2_idx - 1, axis1_idx - 1), pulse_idx, t_one, y_one
+                    if _scope_fs_hz is not None and np.isfinite(_scope_fs_hz) and _scope_fs_hz > 0.0:
+                        scope_sampling_rates.append(float(_scope_fs_hz))
+
+                    for pulse_idx in range(1, pulses_per_point + 1):
+                        t_one = t_seq
+                        y_one = segments[pulse_idx - 1]
+                        t_echoes.append(np.asarray(t_one, dtype=float))
+                        y_echoes.append(np.asarray(y_one, dtype=float))
+                        pulse_actual = self._actual_sampling_rate(t_one, _scope_fs_hz)
+                        pulse_actuals.append(pulse_actual)
+                        if pulse_writer is not None:
+                            pulse_writer.write(
+                                (axis2_idx - 1, axis1_idx - 1), pulse_idx, t_one, y_one
+                            )
+                        if pulses_dir is not None:
+                            pulse_path = pulses_dir / (
+                                f"point_{point_order:04d}_r{axis2_idx:03d}_c{axis1_idx:03d}_pulse_{pulse_idx:03d}.csv"
+                            )
+                            self._write_waveform_csv(
+                                pulse_path,
+                                self._waveform_metadata(
+                                    scan_mode="3D-mode",
+                                    data_kind="single pulse (sequence segment)",
+                                    pulse_index=pulse_idx,
+                                    pulse_total=pulses_per_point,
+                                    config_hz=sampling_rate,
+                                    actual=pulse_actual,
+                                    extra=point_meta_extra,
+                                ),
+                                ["Time (s)", "Amplitude (V)"],
+                                zip(np.asarray(t_one, dtype=float), np.asarray(y_one, dtype=float)),
+                            )
+                            pulse_csv_rels.append(
+                                pulse_path.relative_to(Path(scan_folder)).as_posix()
+                            )
+                        self.bridge.bc_log.emit(
+                            f"Unpacked sequence segment {pulse_idx}/{pulses_per_point} at row {axis2_idx}, col {axis1_idx}"
                         )
-                    if pulses_dir is not None:
-                        pulse_path = pulses_dir / (
-                            f"point_{point_order:04d}_r{axis2_idx:03d}_c{axis1_idx:03d}_pulse_{pulse_idx:03d}.csv"
+                else:
+                    for pulse_idx in range(1, pulses_per_point + 1):
+                        _scope_fs_hz = None
+                        if oscmod and osc and sg and not dry_run:
+                            Burst_generate(
+                                sg,
+                                shape="SIN",
+                                frequency=dry_frequency_hz,
+                                amplitude=dry_amplitude_v,
+                                no_of_cycles_per_pulse=dry_cycles,
+                                no_of_pulses=1,
+                                prf=dry_prf_hz,
+                                window_type=dry_window_fn,
+                            )
+                            t_one, y_one, _scope_fs_hz = self._capture_a_mode_waveform(
+                                osc,
+                                dry_frequency_hz,
+                                dry_amplitude_v,
+                                dry_cycles,
+                                log_fn=self.bridge.bc_log.emit,
+                            )
+                            if _scope_fs_hz is not None and np.isfinite(_scope_fs_hz) and _scope_fs_hz > 0.0:
+                                scope_sampling_rates.append(float(_scope_fs_hz))
+                        else:
+                            t_one, y_one = a_scan_module.generate_test_echo(
+                                frequency_hz=dry_frequency_hz,
+                                amplitude_v=dry_amplitude_v,
+                                no_of_cycles_per_pulse=dry_cycles,
+                                window_type=dry_window_fn,
+                                sampling_rate_hz=sampling_rate,
+                            )
+                            delay_s = self._config_delay_us() / 1e6
+                            if delay_s > 0.0:
+                                t_one = np.asarray(t_one, dtype=float) + delay_s
+                        t_echoes.append(np.asarray(t_one, dtype=float))
+                        y_echoes.append(np.asarray(y_one, dtype=float))
+                        pulse_actual = self._actual_sampling_rate(t_one, _scope_fs_hz)
+                        pulse_actuals.append(pulse_actual)
+                        if pulse_writer is not None:
+                            pulse_writer.write(
+                                (axis2_idx - 1, axis1_idx - 1), pulse_idx, t_one, y_one
+                            )
+                        if pulses_dir is not None:
+                            pulse_path = pulses_dir / (
+                                f"point_{point_order:04d}_r{axis2_idx:03d}_c{axis1_idx:03d}_pulse_{pulse_idx:03d}.csv"
+                            )
+                            self._write_waveform_csv(
+                                pulse_path,
+                                self._waveform_metadata(
+                                    scan_mode="3D-mode",
+                                    data_kind="single pulse (raw, as acquired)",
+                                    pulse_index=pulse_idx,
+                                    pulse_total=pulses_per_point,
+                                    config_hz=sampling_rate,
+                                    actual=pulse_actual,
+                                    extra=point_meta_extra,
+                                ),
+                                ["Time (s)", "Amplitude (V)"],
+                                zip(np.asarray(t_one, dtype=float), np.asarray(y_one, dtype=float)),
+                            )
+                            pulse_csv_rels.append(
+                                pulse_path.relative_to(Path(scan_folder)).as_posix()
+                            )
+                        self.bridge.bc_log.emit(
+                            f"Captured echo {pulse_idx}/{pulses_per_point} at row {axis2_idx}, col {axis1_idx}"
                         )
-                        self._write_waveform_csv(
-                            pulse_path,
-                            self._waveform_metadata(
-                                scan_mode="3D-mode",
-                                data_kind="single pulse (raw, as acquired)",
-                                pulse_index=pulse_idx,
-                                pulse_total=pulses_per_point,
-                                config_hz=sampling_rate,
-                                actual=pulse_actual,
-                                extra=point_meta_extra,
-                            ),
-                            ["Time (s)", "Amplitude (V)"],
-                            zip(np.asarray(t_one, dtype=float), np.asarray(y_one, dtype=float)),
-                        )
-                        pulse_csv_rels.append(
-                            pulse_path.relative_to(Path(scan_folder)).as_posix()
-                        )
-                    self.bridge.bc_log.emit(
-                        f"Captured echo {pulse_idx}/{pulses_per_point} at row {axis2_idx}, col {axis1_idx}"
-                    )
 
                 if pulse_writer is not None:
                     pulse_writer.flush()

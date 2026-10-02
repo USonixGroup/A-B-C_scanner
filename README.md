@@ -115,17 +115,108 @@ Scan lengths are specified in millimetres. For B-mode, a negative scan length mo
 
 The Move Rig and A-mode X/Y/Z fields, B-mode scan length, and 3D scan-axis lengths accept three decimal places with `0.001 mm` increments. The configured conversion is 5000 pulses/mm, so one controller pulse is $0.0002\,\mathrm{mm} = 0.2\,\mathrm{\mu m} = 200\,\mathrm{nm}$. A distance of $0.0001\,\mathrm{mm}$ is $100\,\mathrm{nm}$, not $0.1\,\mathrm{nm}$, and rounds to zero pulses. The backend rounds movement requests to whole pulses because fractional controller pulses are not supported.
 
-### Sampling rate
+### Oscilloscope Configuration and Acquisition Modes
 
-The **Sampling Rate** field on the Config tab is entered in **MHz** (for example `100` for 100 MS/s). It is stored in `api/settings/gui_settings.json` in Hz, and all internal calculations use Hz. A blank, non-numeric, zero, or negative value is rejected with a message in the log.
+The Oscilloscope panel on the **Config** tab configures waveform digitization, horizontal scaling, trigger timing, and acquisition architecture:
 
-- **Dry Run:** synthetic echoes are generated at exactly this rate, and the same value is used for filtering.
-- **Hardware scans:** the field is the rate *requested* from the oscilloscope. The rate the scope actually used is read from each captured waveform and is used for all A-mode, B-mode, and 3D-mode filtering, envelope, gating, and Nyquist calculations. If it differs from the field by more than 2%, the log shows a `WARNING`.
-- **Saved scans:** C-mode and pressure-field **Apply**, and the 3D live preview, use the rate recorded in the time axis of each stored waveform rather than the field. A `WARNING` is logged when it differs from the field by more than 2%. The field is only a fallback when no rate can be derived from the data.
+#### 1. Discrete Sampling Rates
+The **Sampling Rate** is selected from a dropdown menu providing discrete sample rates accepted by Teledyne LeCroy oscilloscopes:
+- **Available Rates:** `1 MS/s`, `2.5 MS/s`, `5 MS/s`, `10 MS/s`, `25 MS/s`, `50 MS/s`, `100 MS/s`, `250 MS/s`, `500 MS/s`, `1 GS/s`, and `2.5 GS/s` (maximum).
+- **Selection rule:** In ultrasound pulse-echo inspection, choose a rate of at least 10 times the carrier frequency (e.g. for a 2.5 MHz transducer, select $\ge 25\text{ MS/s}$; for 10 MHz, select $\ge 100\text{ MS/s}$ or $250\text{ MS/s}$).
+- The configured rate is stored in `gui_settings.json` in Hz. In hardware scans, the scope's actual sampling rate is parsed from the binary descriptor (`WAVEDESC`) and used for filtering, envelope detection, gating, and Nyquist validation.
 
-Choose a rate of at least 10 times the excitation frequency. If the high-pass cut-off is at or above the Nyquist frequency ($f_s/2$), the filter is disabled and an error is logged.
+#### 2. Acquisition Modes
 
-Dry-run echoes consist of two inverted copies of the excitation burst (the second at half the amplitude of the first) with additive Gaussian noise of 0.1 V standard deviation. The burst lasts `cycles / frequency` and uses the selected window. They are intended for checking the workflow, not for validating hardware.
+The GUI provides two distinct acquisition strategies:
+
+##### A. Software Paced Mode (Default)
+- **Principle:** Pulse-by-pulse acquisition. For each requested pulse, the signal generator fires an excitation burst, the oscilloscope triggers and captures the echo, and the waveform is immediately transferred to the PC before triggering the subsequent pulse.
+- **Acquisition Window ($W$):** The **Acquisition window (ms)** textbox is active in this mode, allowing the user to specify the full display duration across the 10 horizontal divisions of the oscilloscope ($W = 10 \times \text{Time/div}$).
+- **Delay ($\mu\text{s}$):** The **Delay** textbox is active in this mode, allowing the user to view echoes arriving after a known propagation delay $\Delta t_{\text{desired}}$ (see [Delay compensation equations](#delay-equations-and-horizontal-timebase)).
+- **Transfer latency:** Each LeCroy-to-PC waveform transfer takes $\sim 100\text{ ms}$ over LAN/USB. Consequently, software paced mode **overruns the excitation PRF** when PRF $\ge 10\text{ Hz}$.
+- **Recommended use:** Single-pulse testing, verification scans, or low PRFs ($\text{PRF} < 10\text{ Hz}$). A red warning in the Config log clarifies that software paced mode prioritises immediate per-pulse visualization over hardware PRF spacing.
+
+##### B. LeCroy Sequence Mode (Hardware Segmented Acquisition)
+- **Principle:** True hardware-speed segmented acquisition. The oscilloscope partitions its acquisition memory into $N$ segments (`SampleMode = 'Sequence'`, `NumSegments = N`).
+- **Segment Window Length:** Automatically governed by the excitation PRF:
+  $$W = \frac{1}{\text{PRF}}, \qquad \text{Time/div} = \frac{1}{10 \times \text{PRF}}$$
+- **Execution:** The oscilloscope is armed in single sequence mode (`TRIG_MODE SINGLE`). The signal generator then executes a burst of $N$ pulses using the **Option A Hardware Timer** at the exact PRF, emitting a TTL Sync pulse for each excitation. The oscilloscope hardware triggers and digitizes each echo in real time with microsecond-level inter-segment dead time ($\sim 1\text{–}2\,\mu\text{s}$).
+- **Data Transfer:** After all $N$ pulses complete, the entire segmented block is downloaded in a single high-speed transfer, demultiplexed into individual pulse arrays, and averaged.
+- **UI Behaviour:** In Sequence mode, the Acquisition window and Delay textboxes are disabled (greyed out) because segment duration is strictly $1/\text{PRF}$ and delay is fixed to 0.
+- **Recommended use:** High PRFs ($\text{PRF} = 10\text{ Hz} \text{ to } 2\text{ kHz}$) and multi-pulse averaging where true hardware timing is required.
+
+---
+
+### Delay Equations and Horizontal Timebase
+
+Teledyne LeCroy oscilloscopes divide the display into **10 horizontal divisions**. The horizontal Delay setting specifies the timestamp at the **center of the grid** (Division 5), whereas the trigger event ($t = 0$) sits at the center when Delay = 0:
+
+$$\begin{aligned}
+\text{Left edge (Div 0):} & \quad -5 \times \text{Time/div} \quad \text{(pre-trigger)} \\
+\text{Center (Div 5):} & \quad 0\,\text{s} \quad \text{(trigger event)} \\
+\text{Right edge (Div 10):} & \quad +5 \times \text{Time/div} \quad \text{(post-trigger)} \\
+\text{Total window length } W: & \quad 10 \times \text{Time/div}
+\end{aligned}$$
+
+#### Center Compensation Equation
+To make the visible acquisition window start at the left edge with your desired post-trigger delay $\Delta t_{\text{desired}}$ and display $[\Delta t_{\text{desired}},\, \Delta t_{\text{desired}} + W]$, the center of the grid must be shifted forward by half the window ($5 \times \text{Time/div}$):
+
+$$\Delta t_{\text{center}} = \Delta t_{\text{desired}} + \frac{W}{2} = \Delta t_{\text{desired}} + (5 \times \text{Time/div})$$
+
+where:
+- $\Delta t_{\text{desired}}$ is the user-entered Delay in seconds ($\text{Delay}_{(\mu\text{s})} \times 10^{-6}$).
+- $W$ is the total acquisition window duration in seconds ($W = 10 \times \text{Time/div}$).
+- $\text{Time/div} = W / 10$ is the horizontal scale (`HorScale`).
+
+#### Instrument SCPI and VBS Sign Convention
+On Teledyne LeCroy oscilloscopes, the `TRIG_DELAY` / `HorOffset` parameter specifies the location of the trigger point ($t = 0$) **relative to the center of the grid**. Since a post-trigger window places the trigger point to the *left* of the center screen, the parameter requires a **negative sign**:
+
+$$\text{Scope Offset} = -\Delta t_{\text{center}} = -[\Delta t_{\text{desired}} + (5 \times \text{Time/div})]$$
+
+The driver programs the oscilloscope accordingly:
+```python
+hor_scale = window_s / 10.0
+scope_delay = desired_delay_s + (5.0 * hor_scale)
+
+# ActiveDSO / Automation VBScript:
+osc.write(f"VBS 'app.Acquisition.Horizontal.HorScale = {hor_scale}'")
+osc.write(f"VBS 'app.Acquisition.Horizontal.HorOffset = -{scope_delay}'")
+
+# SCPI fallback:
+osc.write(f"TIME_DIV {hor_scale}")
+osc.write(f"TRIG_DELAY -{scope_delay}")
+```
+
+In dry-run mode, the synthetic echo time axis is shifted by $\Delta t_{\text{desired}}$ so simulated waveforms faithfully reflect the programmed delay.
+
+---
+
+### Signal Generator Hardware Timer & ARB Windowing
+
+When configuring burst excitations with multiple pulses ($N_{\text{pulses}} > 1$) and a specified PRF:
+
+1. **Option A (Hardware Timer):**
+   The signal generator's internal trigger subsystem is configured to pace the pulse train autonomously:
+   $$\text{Trigger Period} = \frac{1}{\text{PRF}}$$
+   SCPI commands:
+   ```scpi
+   BURS:STAT ON
+   BURS:MODE TRIG
+   BURS:INT:PER <1/PRF>
+   TRIG1:SOUR TIM
+   TRIG1:TIM <1/PRF>
+   TRIG1:COUN <N_pulses>
+   OUTP:SYNC ON
+   INIT1
+   ```
+2. **Native Sine vs Arbitrary (Windowed) Bursts:**
+   - **Native Sine (`Rectangular / None` window):** Carrier is continuous sine; `BURS:NCYC` is set to $N_{\text{cycles}}$.
+   - **Windowed Sine (`Hanning`, `Hamming`, `Blackman`, `Flat-Top`):** Uploaded as an Arbitrary (ARB) waveform containing the entire windowed pulse ($N_{\text{cycles}}$ wrapped in the window envelope). From the generator's perspective, 1 iteration of the ARB waveform equals 1 complete pulse, so `BURS:NCYC` is set to **`1`**. The ARB repetition rate is set to $f_{\text{carrier}} / N_{\text{cycles}}$.
+3. **Hardware Model Compatibility:**
+   - **Agilent/Keysight 33500 Series (e.g. 33500B, 33521A):** Fully supports the hardware timer (`TRIG1:SOUR TIM`, `TRIG1:TIM`, `TRIG1:COUN`) for both native and ARB waveforms with zero software jitter.
+   - **Agilent 33220A:** Supports ARB burst with internal timer (`TRIG:SOUR IMM`, `BURS:INT:PER`), but lacks the $N$-pulse hardware counter (`TRIG:COUN`). If hardware timer commands are rejected, the software cleanly falls back to a deterministic high-precision software trigger loop (`time.perf_counter()` + `sg.trigger()`).
+
+---
 
 ## Scan modes
 

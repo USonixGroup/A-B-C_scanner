@@ -7891,12 +7891,35 @@ a.anchor-link {
 <tr>
 <td>Oscilloscope</td>
 <td>Sampling Rate</td>
-<td>Requested scope rate, entered in MHz (stored in Hz in the settings file); the scope's actual rate is used for calculations, with a warning if it differs by more than 2%</td>
-<td>Hardware-dependent - default is 1 MHz; use at least 10 times the excitation frequency</td>
+<td>Discrete rates accepted by LeCroy oscilloscope</td>
+<td>Dropdown: <code>100 MS/s</code> (range: 1 MS/s to 2.5 GS/s)</td>
+</tr>
+<tr>
+<td>Oscilloscope</td>
+<td>Acquisition Mode</td>
+<td>Hardware capture architecture</td>
+<td><code>Software paced mode</code> or <code>LeCroy sequence mode</code></td>
+</tr>
+<tr>
+<td>Oscilloscope</td>
+<td>Acquisition Window</td>
+<td>Full horizontal window length across 10 divisions in ms ($W = 10 \times \text{Time/div}$)</td>
+<td><code>1.0 ms</code> (active only in Software paced mode)</td>
+</tr>
+<tr>
+<td>Oscilloscope</td>
+<td>Delay</td>
+<td>Desired post-trigger delay before left edge of window in $\mu\text{s}$</td>
+<td><code>0.0 \mu\text{s}</code> (active only in Software paced mode)</td>
 </tr>
 </tbody>
 </table>
 <p>The connection test attempts to reach the rig and open/query the instruments. It does not intentionally command an axis move. A successful network connection does not confirm that the rig workspace is clear or that scan directions are safe.</p>
+<h3 id="Acquisition-modes">Acquisition modes<a class="anchor-link" href="#Acquisition-modes">¶</a></h3>
+<ul>
+<li><strong>Software paced mode:</strong> Each pulse triggers an excitation, captures the echo on the scope, and transmits it immediately to the PC (~100 ms transfer latency). This mode overruns PRF when PRF $\ge 10\text{ Hz}$ and is recommended for single-pulse tests or low PRF ($&lt; 10\text{ Hz}$). The user specifies the acquisition window length in ms and optional post-trigger delay in $\mu\text{s}$.</li>
+<li><strong>LeCroy sequence mode:</strong> The oscilloscope partitions acquisition memory into $N$ segments (<code>SampleMode = 'Sequence'</code>, <code>NumSegments = N</code>). Window length per segment is automatically set to $1/\text{PRF}$. Bursts are fired using the signal generator's hardware timer at the exact PRF, clocked via hardware EXT trigger with microsecond dead time. All segments are transferred to the PC in one block upon completion.</li>
+</ul>
 </div>
 </div>
 </div>
@@ -8178,9 +8201,19 @@ a.anchor-link {
 <ol start="3">
 <li><p>Filtering is implemented with Butterworth second-order sections. For a valid digital high-pass filter, $0 &lt; f_h &lt; f_s/2$; for a band-pass filter, $0 &lt; f_l &lt; f_h &lt; f_s/2$. The GUI reports and disables invalid cut-offs rather than applying an undefined filter.</p>
 </li>
-<li><p>Dry-run echoes are synthetic test signals: two inverted copies of the excitation burst (the second at half the amplitude of the first) plus Gaussian noise of 0.1 V standard deviation. The burst lasts cycles/frequency, uses the selected window, and is generated at exactly the Config-tab sampling rate. They are useful for checking acquisition flow, plotting, filtering, and export, but they do not validate hardware timing, acoustic calibration, sensitivity, or absolute pressure.</p>
+<li><p>Dry-run echoes are synthetic test signals: two inverted copies of the excitation burst (the second at half the amplitude of the first) plus Gaussian noise of 0.1 V standard deviation. The burst lasts cycles/frequency, uses the selected window, and is generated at exactly the Config-tab sampling rate. When delay is configured, the simulated echo time axis is shifted accordingly ($t = t + \Delta t_{\text{desired}}$).</p>
 </li>
-<li><p>The Config-tab <strong>Sampling Rate</strong> is entered in MHz and stored in Hz in the settings file; all calculations use Hz. In hardware scans it is the rate requested from the oscilloscope, while the rate the scope actually used is read from each waveform and is used for all A-, B-, and 3D-mode filtering, envelope, gating, and Nyquist calculations. A warning is logged when it differs from the field by more than 2%. C-mode and pressure-field <strong>Apply</strong> and the 3D live preview use the rate recorded in the time axis of the stored waveforms, with the field only as a fallback.</p>
+<li><p>The Config-tab <strong>Sampling Rate</strong> is selected from discrete rates supported by the oscilloscope (1 MS/s to 2.5 GS/s) and stored in Hz in the settings file; all calculations use Hz. In hardware scans it is the rate requested from the oscilloscope, while the rate the scope actually used is read from each waveform descriptor (<code>WAVEDESC</code>) and is used for all A-, B-, and 3D-mode filtering, envelope, gating, and Nyquist calculations. A warning is logged when it differs from the field by more than 2%.</p>
+</li>
+<li><p><strong>Oscilloscope Horizontal Window and Delay Compensation:</strong><br />
+On Teledyne LeCroy oscilloscopes, the display consists of 10 horizontal divisions with the trigger point ($t = 0$) located at the screen center (Division 5) when Delay = 0 s. To start the displayed acquisition window at the left edge with user-specified delay $\Delta t_{\text{desired}}$ across window $W = 10 \times \text{Time/div}$, the 5-division center offset is compensated:</p>
+<p>$$\Delta t_{\text{center}} = \Delta t_{\text{desired}} + \frac{W}{2} = \Delta t_{\text{desired}} + (5 \times \text{Time/div})$$</p>
+<p>In LeCroy SCPI (<code>TRIG_DELAY</code> / <code>TRDL</code>) and ActiveDSO VBS (<code>app.Acquisition.Horizontal.HorOffset</code>), post-trigger delays are negative offsets relative to the center:</p>
+<p>$$\text{HorOffset} = -\Delta t_{\text{center}} = -[\Delta t_{\text{desired}} + (5 \times \text{Time/div})]$$</p>
+<p>$$\text{TRIG\_DELAY} = -\Delta t_{\text{center}}$$</p>
+</li>
+<li><p><strong>Multi-Pulse PRF Generation &amp; Hardware Timer (Option A):</strong><br />
+For multiple pulses ($N_{\text{pulses}} &gt; 1$) at a pulse repetition frequency $PRF$, inter-pulse spacing is $T_{\text{inter-pulse}} = 1/PRF$. When supported (e.g. Agilent/Keysight 33500 series), the generator's internal hardware timer (<code>TRIG1:SOUR TIM</code>, <code>TRIG1:TIM 1/PRF</code>, <code>TRIG1:COUN N</code>) fires the train autonomously with zero software latency. For windowed sine bursts (Hanning, Hamming, etc.), the uploaded arbitrary waveform encompasses the complete windowed pulse ($N_{\text{cycles}}$), so hardware burst cycles is set to <code>BURS:NCYC 1</code> and arbitrary playback repetition frequency is $f_{\text{carrier}} / N_{\text{cycles}}$. On models without hardware burst counters (e.g. 33220A), deterministic high-precision software loop timing is automatically used.</p>
 </li>
 </ol>
 </div>

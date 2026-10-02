@@ -507,30 +507,66 @@ def Burst_generate(
 
     total_burst_length = float(no_of_pulses) * inter_pulse_period
 
-    # 5. Program inter-pulse period on hardware when available.
-    # Pulse count itself is enforced in software below for deterministic behavior
-    # across different SG drivers/models.
-    programmed_count_attr = None
-    programmed_period_attr = _set_first_supported_attr(
-        sg,
-        ["burst_internal_period", "burst_period", "burst_trigger_period"],
-        float(inter_pulse_period),
-    )
+    # 5. Option A (Hardware Timer) for cases where no_of_pulses > 1
+    hw_timer_applied = False
+    if int(no_of_pulses) > 1 and prf and float(prf) > 0 and not hasattr(sg, "trigger_times"):
+        writer = _get_writer(sg)
+        if writer is not None:
+            hw_commands = [
+                "BURS:STAT ON",
+                "BURS:MODE TRIG",
+                f"BURS:NCYC {burst_cycles_for_hw}",
+                f"BURS:INT:PER {inter_pulse_period:.9f}",
+                "TRIG1:SOUR TIM",
+                f"TRIG1:TIM {inter_pulse_period:.9f}",
+                f"TRIG1:COUN {int(no_of_pulses)}",
+                "OUTP:SYNC ON",
+            ]
+            if _run_scpi_command_group(sg, hw_commands):
+                try:
+                    writer("OUTP:SYNC:MODE NORM")
+                except Exception:
+                    pass
+                sg.output = True
+                try:
+                    writer("INIT1")
+                    time.sleep(total_burst_length + 0.02)
+                    hw_timer_applied = True
+                except Exception:
+                    hw_timer_applied = False
+            else:
+                hw_timer_applied = False
 
-    sg.output = True
+    programmed_count_attr = "TRIG1:COUN (Hardware Timer)" if hw_timer_applied else None
+    programmed_period_attr = "TRIG1:TIM (Hardware Timer)" if hw_timer_applied else None
+    if not hw_timer_applied:
+        # Program inter-pulse period on hardware when available (software-triggered fallback).
+        programmed_count_attr = None
+        programmed_period_attr = _set_first_supported_attr(
+            sg,
+            ["burst_internal_period", "burst_period", "burst_trigger_period"],
+            float(inter_pulse_period),
+        )
+        writer = _get_writer(sg)
+        if writer is not None:
+            try:
+                writer("OUTP:SYNC ON")
+                writer("OUTP:SYNC:MODE NORM")
+            except Exception:
+                pass
 
-    # Deterministic path: one trigger per requested pulse on an absolute PRF timeline.
-    # Avoid using wait_for_trigger for pacing because backend/device latency can vary and
-    # introduce random-looking spacing.
-    next_trigger_at = time.perf_counter()
-    for _ in range(int(no_of_pulses)):
-        now = time.perf_counter()
-        wait_s = next_trigger_at - now
-        if wait_s > 0:
-            time.sleep(wait_s)
+        sg.output = True
 
-        sg.trigger()
-        next_trigger_at += inter_pulse_period
+        # Deterministic path: one trigger per requested pulse on an absolute PRF timeline.
+        next_trigger_at = time.perf_counter()
+        for _ in range(int(no_of_pulses)):
+            now = time.perf_counter()
+            wait_s = next_trigger_at - now
+            if wait_s > 0:
+                time.sleep(wait_s)
+
+            sg.trigger()
+            next_trigger_at += inter_pulse_period
 
     print("Signal generator set to burst mode.")
     print(
@@ -545,8 +581,8 @@ PRF: {prf if prf else 'auto'} Hz,
 Total Burst Length: {total_burst_length} s,
 Pulse Count Attr: {programmed_count_attr if programmed_count_attr else 'software-loop'},
 PRF Attr: {programmed_period_attr if programmed_period_attr else 'software-loop'},
-Offset: {sg.offset} V, 
-Phase: {sg.phase} degrees"""
+Offset: {getattr(sg, 'offset', 'n/a')} V, 
+Phase: {getattr(sg, 'phase', 'n/a')} degrees"""
     )
 
 
