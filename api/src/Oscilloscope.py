@@ -139,20 +139,19 @@ def configure_oscilloscope_for_burst(osc, params):
         time.sleep(0.1)
 
     freq = params["frequency"]
-    amp = params["amplitude"]
     n_cycles = params.get("no_of_cycles_per_pulse", 1)
+    trig_source = params.get("trigger_source", "EXT10")
 
     burst_duration = n_cycles / freq
     hor_scale = burst_duration / 5
-    ver_scale = amp
     sampling_rate = freq * 100
 
     vbs(f"app.Acquisition.Horizontal.HorScale = {hor_scale}")
-    vbs(f"app.Acquisition.C1.VerScale = {ver_scale}")
     vbs(f"app.Acquisition.Horizontal.SampleRate = {sampling_rate}")
-    vbs("app.Acquisition.C1.Offset = 0")
     vbs("app.Acquisition.C1.View = true")
-    vbs('app.Acquisition.Trigger.Source = "EXT"')
+    if trig_source and trig_source != "Do not change (Scope setting)":
+        vbs_src = "ExtDivide10" if trig_source == "EXT10" else ("Ext" if trig_source == "EXT" else trig_source)
+        vbs(f'app.Acquisition.Trigger.Source = "{vbs_src}"')
     osc.write("TRIG_MODE NORM")
 
 

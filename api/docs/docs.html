@@ -8209,9 +8209,10 @@ On Teledyne LeCroy oscilloscopes, the display consists of 10 horizontal division
 </li>
 </ol>
 <p>$$\Delta t_{\text{center}} = \Delta t_{\text{desired}} + \frac{W}{2} = \Delta t_{\text{desired}} + (5 \times \text{Time/div})$$</p>
-<p>In LeCroy SCPI (<code>TRIG_DELAY</code> / <code>TRDL</code>) and ActiveDSO VBS (<code>app.Acquisition.Horizontal.HorOffset</code>), post-trigger delays are negative offsets relative to the center:</p>
-<p>$$\text{HorOffset} = -\Delta t_{\text{center}} = -[\Delta t_{\text{desired}} + (5 \times \text{Time/div})]$$</p>
-<p>$$\text{TRIG\_DELAY} = -\Delta t_{\text{center}}$$</p>
+<p>In LeCroy SCPI (<code>TRIG_DELAY</code> / <code>TRDL</code>) and ActiveDSO VBS (<code>app.Acquisition.Horizontal.HorOffset</code>), positive offsets shift the acquisition window to post-trigger time:</p>
+<p>$$\text{HorOffset} = \Delta t_{\text{center}} = \Delta t_{\text{desired}} + (5 \times \text{Time/div})$$</p>
+<p>$$\text{TRIG\_DELAY} = \Delta t_{\text{center}}$$</p>
+<p>The software controls only horizontal timebase settings. The vertical scale (V/div) and vertical offset are adjusted manually by the user using the physical knobs on the oscilloscope, and the actual hardware scale is queried via <code>WAVEDESC</code> or <code>C1:VDIV?</code> to preserve low-amplitude signal sensitivity. The Trigger Source is user-selectable via the Config tab dropdown (<code>EXT10</code>, <code>EXT</code>, <code>C1</code>, <code>C2</code>, or <code>Do not change (Scope setting)</code>).</p>
 <ol start="7">
 <li><strong>Multi-Pulse PRF Generation &amp; Hardware Timer (Option A):</strong>
 For multiple pulses ($N_{\text{pulses}} &gt; 1$) at a pulse repetition frequency $PRF$, inter-pulse spacing is $T_{\text{inter-pulse}} = 1/PRF$. When supported (e.g. Agilent/Keysight 33500 series), the generator's internal hardware timer (<code>TRIG1:SOUR TIM</code>, <code>TRIG1:TIM 1/PRF</code>, <code>TRIG1:COUN N</code>) fires the train autonomously with zero software latency. For windowed sine bursts (Hanning, Hamming, etc.), the uploaded arbitrary waveform encompasses the complete windowed pulse ($N_{\text{cycles}}$), so hardware burst cycles is set to <code>BURS:NCYC 1</code> and arbitrary playback repetition frequency is $f_{\text{carrier}} / N_{\text{cycles}}$. On models without hardware burst counters (e.g. 33220A), deterministic high-precision software loop timing is automatically used.</li>

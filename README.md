@@ -168,10 +168,13 @@ where:
 - $W$ is the total acquisition window duration in seconds ($W = 10 \times \text{Time/div}$).
 - $\text{Time/div} = W / 10$ is the horizontal scale (`HorScale`).
 
-#### Instrument SCPI and VBS Sign Convention
-On Teledyne LeCroy oscilloscopes, the `TRIG_DELAY` / `HorOffset` parameter specifies the location of the trigger point ($t = 0$) **relative to the center of the grid**. Since a post-trigger window places the trigger point to the *left* of the center screen, the parameter requires a **negative sign**:
+#### Instrument SCPI and VBS Delay Parameter
+On Teledyne LeCroy oscilloscopes, the `TRIG_DELAY` / `HorOffset` parameter defines the time position at the **horizontal center of the display grid** relative to the trigger event ($t = 0$). To display the window starting at the left edge with your desired delay $\Delta t_{\text{desired}}$, a positive offset $\Delta t_{\text{center}}$ is programmed:
 
-$$\text{Scope Offset} = -\Delta t_{\text{center}} = -[\Delta t_{\text{desired}} + (5 \times \text{Time/div})]$$
+$$\text{Scope Delay} = \Delta t_{\text{center}} = \Delta t_{\text{desired}} + (5 \times \text{Time/div})$$
+
+- **Post-trigger delay ($\Delta t_{\text{desired}} \ge 0$):** Used when triggering on External (`EXT` from SG SYNC) to compensate for acoustic time-of-flight through water. The left edge starts at $\Delta t_{\text{desired}}$ and displays $[\Delta t_{\text{desired}},\, \Delta t_{\text{desired}} + W]$.
+- **Pre-trigger lead-in ($\Delta t_{\text{desired}} < 0$):** When triggering on Channel 1 (`C1`), the trigger event occurs at threshold crossing. A negative delay (e.g. $-2\,\mu\text{s}$) shifts the trigger point into the screen (e.g. Division 1), capturing the pre-trigger leading edge and preventing pulse truncation.
 
 The driver programs the oscilloscope accordingly:
 ```python
@@ -180,14 +183,29 @@ scope_delay = desired_delay_s + (5.0 * hor_scale)
 
 # ActiveDSO / Automation VBScript:
 osc.write(f"VBS 'app.Acquisition.Horizontal.HorScale = {hor_scale}'")
-osc.write(f"VBS 'app.Acquisition.Horizontal.HorOffset = -{scope_delay}'")
+osc.write(f"VBS 'app.Acquisition.Horizontal.HorOffset = {scope_delay}'")
 
 # SCPI fallback:
 osc.write(f"TIME_DIV {hor_scale}")
-osc.write(f"TRIG_DELAY -{scope_delay}")
+osc.write(f"TRIG_DELAY {scope_delay}")
 ```
 
 In dry-run mode, the synthetic echo time axis is shifted by $\Delta t_{\text{desired}}$ so simulated waveforms faithfully reflect the programmed delay.
+
+---
+
+### Oscilloscope Vertical Scale & Trigger Source Control
+
+1. **Hardware Knobs for Vertical Amplitude:**
+   The software controls **only the horizontal timebase and delay window**. The vertical voltage scale (V/div) and vertical offset are **not modified** by the acquisition software, allowing users to freely adjust the oscilloscope's front-panel physical knobs to frame low-amplitude acoustic signals with optimal analog gain. The software dynamically queries `WAVEDESC` (`VERTICAL_GAIN` / `VERTICAL_OFFSET`) or queries `C1:VDIV?` and `C1:OFST?` to accurately convert digitized binary words to Volts at whatever V/div setting is chosen on the scope.
+
+2. **Trigger Source Selection:**
+   The Config tab includes a dedicated **Trigger Source** dropdown with options (in order):
+   - `EXT10`: External / 10 (default; recommended when connecting a $0\text{--}5\,\text{V}$ TTL Sync pulse from the signal generator to the scope EXT BNC).
+   - `EXT`: External trigger input ($1:1$ direct input, sensitive up to $\pm 0.5\,\text{V}$).
+   - `C1`: Channel 1 (triggers on the acoustic echo or transmit waveform directly).
+   - `C2`: Channel 2.
+   - `Do not change (Scope setting)`: Does not send remote trigger source commands, preserving whatever trigger source, level, and coupling the user configured on the physical instrument.
 
 ---
 

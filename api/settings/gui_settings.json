@@ -10,6 +10,7 @@
     "acquisition_mode": "Software paced mode",
     "acquisition_window_ms": 0.02,
     "delay_us": 30.0,
+    "trigger_source": "EXT10",
     "save_per_pulse_csv": false
   },
   "excitation": {
@@ -18,7 +19,7 @@
     "frequency": 1000000.0,
     "amplitude": 10.0,
     "no_of_cycles_per_pulse": 10,
-    "no_of_pulses": 4,
+    "no_of_pulses": 2,
     "prf": 2000.0,
     "start_delay_s": 0.0,
     "timing_tolerance_pct": 10.0,
@@ -34,13 +35,13 @@
     "mode": "INC",
     "dry_run": true,
     "live_preview": true,
-    "average_echoes": 4
+    "average_echoes": 2
   },
   "line_b_mode": {
     "depth_axis": "Z",
     "scan_axis": "Y",
     "scan_length": 20.0,
-    "scan_points": 10,
+    "scan_points": 29,
     "sound_speed_mps": 0.0,
     "dry_run": true,
     "live_preview": true
@@ -61,7 +62,7 @@
     "scan_algorithm": "Zigzag",
     "dry_run": true,
     "live_update": true,
-    "scan_type": "pressure_field",
+    "scan_type": "standard",
     "c_mode_gate_start_us": 15.0,
     "c_mode_gate_width_us": 0.5,
     "c_mode_metric": "Max",

@@ -498,6 +498,9 @@ class ScannerMainWindow(QMainWindow):
         self.acq_mode_combo = QComboBox()
         self.acq_mode_combo.addItems(["Software paced mode", "LeCroy sequence mode"])
 
+        self.trigger_source_combo = QComboBox()
+        self.trigger_source_combo.addItems(["EXT10", "EXT", "C1", "C2", "Do not change (Scope setting)"])
+
         self.acq_window_edit = QLineEdit("1.0")
         self.acq_window_edit.setPlaceholderText("e.g. 1.0")
 
@@ -513,11 +516,13 @@ class ScannerMainWindow(QMainWindow):
         osc_form.addRow("VISA Address", self.osc_address_edit)
         osc_form.addRow("Sampling Rate", self.sampling_rate_combo)
         osc_form.addRow("Acquisition Mode", self.acq_mode_combo)
+        osc_form.addRow("Trigger Source", self.trigger_source_combo)
         osc_form.addRow("Acquisition Window (ms)", self.acq_window_edit)
         osc_form.addRow("Delay (µs)", self.delay_edit)
         osc_form.addRow("Storage", self.save_pulse_csv_check)
 
         self.acq_mode_combo.currentTextChanged.connect(self._on_acq_mode_changed)
+        self.trigger_source_combo.currentIndexChanged.connect(self._schedule_settings_save)
         self.acq_window_edit.textChanged.connect(self._on_acq_window_changed)
         self.delay_edit.textChanged.connect(self._on_delay_changed)
         self.sampling_rate_combo.currentIndexChanged.connect(self._schedule_settings_save)
@@ -2505,6 +2510,12 @@ class ScannerMainWindow(QMainWindow):
             if acq_mode in ["Software paced mode", "LeCroy sequence mode"]:
                 self.acq_mode_combo.setCurrentText(acq_mode)
 
+            trig_src = str(cfg.get("trigger_source", "EXT10"))
+            if hasattr(self, "trigger_source_combo"):
+                idx = self.trigger_source_combo.findText(trig_src)
+                if idx >= 0:
+                    self.trigger_source_combo.setCurrentIndex(idx)
+
             acq_win = str(cfg.get("acquisition_window_ms", "1.0"))
             self.acq_window_edit.setText(acq_win)
             self.acq_window_edit.setEnabled(
@@ -2742,6 +2753,11 @@ class ScannerMainWindow(QMainWindow):
                 "acquisition_mode": self.acq_mode_combo.currentText(),
                 "acquisition_window_ms": self._config_acq_window_ms(),
                 "delay_us": self._config_delay_us(),
+                "trigger_source": (
+                    self.trigger_source_combo.currentText()
+                    if hasattr(self, "trigger_source_combo")
+                    else "EXT10"
+                ),
                 "save_per_pulse_csv": bool(self.save_pulse_csv_check.isChecked()),
             },
             "excitation": {
@@ -2937,7 +2953,7 @@ class ScannerMainWindow(QMainWindow):
         if hasattr(self, "delay_edit"):
             try:
                 val = float(self.delay_edit.text().strip())
-                if val >= 0 and math.isfinite(val):
+                if math.isfinite(val):
                     return val
             except Exception:
                 pass
@@ -4332,6 +4348,7 @@ class ScannerMainWindow(QMainWindow):
         amplitude: float,
         cycles: float,
         log_fn=None,
+        configure_only: bool = False,
     ):
         import numpy as np
 
@@ -4341,9 +4358,14 @@ class ScannerMainWindow(QMainWindow):
             if hasattr(self, "acq_mode_combo")
             else "Software paced mode"
         )
+        trig_source = (
+            self.trigger_source_combo.currentText()
+            if hasattr(self, "trigger_source_combo")
+            else "EXT10"
+        )
         if acq_mode == "Software paced mode":
             window_s = max(self._config_acq_window_ms() / 1000.0, 1e-9)
-            desired_delay_s = max(self._config_delay_us() / 1e6, 0.0)
+            desired_delay_s = self._config_delay_us() / 1e6
         else:
             prf_hz = float(self.tx_prf.value()) if hasattr(self, "tx_prf") else 1000.0
             window_s = max(1.0 / max(prf_hz, 1e-6), 1e-9)
@@ -4354,11 +4376,9 @@ class ScannerMainWindow(QMainWindow):
         capture_signature = (
             id(osc),
             str(self.osc_address_edit.text().strip()),
-            round(float(frequency), 6),
-            round(float(amplitude), 6),
-            round(float(cycles), 6),
             round(float(sampling_rate), 3),
             acq_mode,
+            trig_source,
             round(float(hor_scale), 9),
             round(float(scope_delay), 9),
         )
@@ -4370,30 +4390,37 @@ class ScannerMainWindow(QMainWindow):
                 osc.write(f"VBS '{cmd}'")
                 time.sleep(0.05)
 
-            ver_scale = max(float(amplitude), 0.01)
             osc.write("COMM_HEADER OFF")
             osc.write("COMM_FORMAT DEF9,WORD,BIN")
             vbs("app.Acquisition.Horizontal.SampleMode = 'RealTime'")
             with contextlib.suppress(Exception):
                 osc.write("SEQUENCE OFF")
             vbs(f"app.Acquisition.Horizontal.HorScale = {hor_scale}")
-            vbs(f"app.Acquisition.Horizontal.HorOffset = -{scope_delay}")
+            vbs(f"app.Acquisition.Horizontal.HorOffset = {scope_delay}")
             with contextlib.suppress(Exception):
                 osc.write(f"TIME_DIV {hor_scale}")
             with contextlib.suppress(Exception):
-                osc.write(f"TRIG_DELAY -{scope_delay}")
-            vbs(f"app.Acquisition.C1.VerScale = {ver_scale}")
+                osc.write(f"TRIG_DELAY {scope_delay}")
             vbs(f"app.Acquisition.Horizontal.SampleRate = {sampling_rate}")
             vbs("app.Acquisition.C1.View = true")
-            vbs('app.Acquisition.Trigger.Source = "EXT"')
+            if trig_source != "Do not change (Scope setting)":
+                vbs_src = "ExtDivide10" if trig_source == "EXT10" else ("Ext" if trig_source == "EXT" else trig_source)
+                scpi_src = "EX10" if trig_source == "EXT10" else ("EX" if trig_source == "EXT" else trig_source)
+                vbs(f'app.Acquisition.Trigger.Source = "{vbs_src}"')
+                with contextlib.suppress(Exception):
+                    osc.write(f"TRIG_SELECT EDGE,SR,{scpi_src}")
             osc.write("TRIG_MODE NORM")
             self._scope_capture_config_handle_id = id(osc)
             self._scope_capture_config_signature = capture_signature
             if callable(log_fn):
+                trig_note = f", Trigger={trig_source}" if trig_source != "Do not change (Scope setting)" else ", Trigger=scope manual"
                 log_fn(
-                    f"A-mode: Applied scope capture configuration (mode={acq_mode}, HorScale={hor_scale*1e3:.4f} ms/div, "
+                    f"A-mode: Applied scope capture configuration (mode={acq_mode}{trig_note}, HorScale={hor_scale*1e3:.4f} ms/div, "
                     f"delay={desired_delay_s*1e6:g} µs, center_delay={scope_delay*1e6:.4f} µs, fs={sampling_rate/1e6:g} MS/s)."
                 )
+
+        if configure_only:
+            return None, None, None
 
         import struct
 
@@ -4527,7 +4554,12 @@ class ScannerMainWindow(QMainWindow):
         sampling_rate = self._config_sampling_rate_hz()
         window_s = 1.0 / prf_hz
         hor_scale = max(window_s / 10.0, 1e-9)
-        ver_scale = max(float(amplitude), 0.01)
+        seq_delay = 5.0 * hor_scale
+        trig_source = (
+            self.trigger_source_combo.currentText()
+            if hasattr(self, "trigger_source_combo")
+            else "EXT10"
+        )
 
         def vbs(cmd: str) -> None:
             osc.write(f"VBS '{cmd}'")
@@ -4541,10 +4573,19 @@ class ScannerMainWindow(QMainWindow):
         vbs("app.Acquisition.Horizontal.SampleMode = 'Sequence'")
         vbs(f"app.Acquisition.Horizontal.NumSegments = {pulses}")
         vbs(f"app.Acquisition.Horizontal.HorScale = {hor_scale}")
+        vbs(f"app.Acquisition.Horizontal.HorOffset = {seq_delay}")
+        with contextlib.suppress(Exception):
+            osc.write(f"TIME_DIV {hor_scale}")
+        with contextlib.suppress(Exception):
+            osc.write(f"TRIG_DELAY {seq_delay}")
         vbs(f"app.Acquisition.Horizontal.SampleRate = {sampling_rate}")
-        vbs(f"app.Acquisition.C1.VerScale = {ver_scale}")
         vbs("app.Acquisition.C1.View = true")
-        vbs('app.Acquisition.Trigger.Source = "EXT"')
+        if trig_source != "Do not change (Scope setting)":
+            vbs_src = "ExtDivide10" if trig_source == "EXT10" else ("Ext" if trig_source == "EXT" else trig_source)
+            scpi_src = "EX10" if trig_source == "EXT10" else ("EX" if trig_source == "EXT" else trig_source)
+            vbs(f'app.Acquisition.Trigger.Source = "{vbs_src}"')
+            with contextlib.suppress(Exception):
+                osc.write(f"TRIG_SELECT EDGE,SR,{scpi_src}")
 
         if callable(log_fn):
             log_fn(
@@ -4638,6 +4679,9 @@ class ScannerMainWindow(QMainWindow):
                 f"Sequence captured: {pulses} segment(s), {pts_per_segment} pts/segment, "
                 f"actual fs={actual_sampling_rate/1e6:.6f} MS/s, window={t[-1]-t[0]:.6e} s."
             )
+
+        with contextlib.suppress(Exception):
+            osc.write("TRIG_MODE NORM")
 
         return t, segments_volts, actual_sampling_rate
 
@@ -5726,9 +5770,12 @@ class ScannerMainWindow(QMainWindow):
                                 sampling_rate_hz=sampling_rate,
                             )
                             delay_s = self._config_delay_us() / 1e6
-                            if delay_s > 0.0:
+                            if delay_s != 0.0:
                                 t_one = np.asarray(t_one, dtype=float) + delay_s
                         else:
+                            with contextlib.suppress(Exception):
+                                osc.write("TRIG_MODE SINGLE")
+                                time.sleep(0.01)
                             Burst_generate(
                                 sg,
                                 shape="SIN",
@@ -7031,10 +7078,20 @@ class ScannerMainWindow(QMainWindow):
             else:
                 delay_us = self._config_delay_us()
                 delay_s = delay_us / 1e6
-                delay_msg = f", delay = {delay_us:g} µs" if delay_us > 0 else ""
+                delay_msg = f", delay = {delay_us:g} µs" if delay_us != 0 else ""
                 self.bridge.a_mode_log.emit(
                     f"A-mode: Running in Software paced mode for {pulses} pulse(s) (window = {self._config_acq_window_ms():g} ms{delay_msg})."
                 )
+                if not use_dummy and osc is not None:
+                    # Pre-configure scope timebase, delay, and trigger settings before the first pulse
+                    self._capture_a_mode_waveform(
+                        osc,
+                        frequency,
+                        amplitude,
+                        cycles,
+                        log_fn=self.bridge.a_mode_log.emit,
+                        configure_only=True,
+                    )
                 for pulse_idx in range(1, pulses + 1):
                     scope_fs_hz = None
                     if use_dummy:
@@ -7045,9 +7102,12 @@ class ScannerMainWindow(QMainWindow):
                             window_type=window_fn,
                             sampling_rate_hz=sampling_rate,
                         )
-                        if delay_s > 0.0:
+                        if delay_s != 0.0:
                             t = np.asarray(t, dtype=float) + delay_s
                     else:
+                        with contextlib.suppress(Exception):
+                            osc.write("TRIG_MODE SINGLE")
+                            time.sleep(0.01)
                         Burst_generate(
                             sg,
                             shape="SIN",
@@ -7124,6 +7184,10 @@ class ScannerMainWindow(QMainWindow):
                                 "pulse_total": pulses,
                             }
                         )
+
+            if not use_dummy and osc is not None:
+                with contextlib.suppress(Exception):
+                    osc.write("TRIG_MODE NORM")
 
             if not traces:
                 raise RuntimeError("No A-mode echoes captured.")
@@ -7748,6 +7812,9 @@ class ScannerMainWindow(QMainWindow):
                     for pulse_idx in range(1, pulses_per_point + 1):
                         _scope_fs_hz = None
                         if oscmod and osc and sg and not dry_run:
+                            with contextlib.suppress(Exception):
+                                osc.write("TRIG_MODE SINGLE")
+                                time.sleep(0.01)
                             Burst_generate(
                                 sg,
                                 shape="SIN",
@@ -7776,7 +7843,7 @@ class ScannerMainWindow(QMainWindow):
                                 sampling_rate_hz=sampling_rate,
                             )
                             delay_s = self._config_delay_us() / 1e6
-                            if delay_s > 0.0:
+                            if delay_s != 0.0:
                                 t_one = np.asarray(t_one, dtype=float) + delay_s
                         t_echoes.append(np.asarray(t_one, dtype=float))
                         y_echoes.append(np.asarray(y_one, dtype=float))
