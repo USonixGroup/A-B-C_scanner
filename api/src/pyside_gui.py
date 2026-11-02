@@ -512,20 +512,34 @@ class ScannerMainWindow(QMainWindow):
         )
         self.save_pulse_csv_check.setChecked(False)
 
+        # Checkbox: let the user defer horizontal timebase to scope knobs
+        self.use_scope_timebase_check = QCheckBox(
+            "Use scope timebase & delay (from knobs)"
+        )
+        self.use_scope_timebase_check.setChecked(False)
+        self.use_scope_timebase_check.setToolTip(
+            "When checked, the three fields below (Sampling Rate, Acquisition Window, Delay) "
+            "are disabled and the scope's physical knob settings are used as-is.  "
+            "No horizontal-scale, delay, or sample-rate commands will be sent to the scope.  "
+            "When unchecked, the values you enter here are programmed to the scope exactly."
+        )
+
         osc_form.addRow("Name", self.osc_name_edit)
         osc_form.addRow("VISA Address", self.osc_address_edit)
-        osc_form.addRow("Sampling Rate", self.sampling_rate_combo)
         osc_form.addRow("Acquisition Mode", self.acq_mode_combo)
         osc_form.addRow("Trigger Source", self.trigger_source_combo)
+        osc_form.addRow("", self.use_scope_timebase_check)
+        osc_form.addRow("Sampling Rate", self.sampling_rate_combo)
         osc_form.addRow("Acquisition Window (ms)", self.acq_window_edit)
         osc_form.addRow("Delay (µs)", self.delay_edit)
         osc_form.addRow("Storage", self.save_pulse_csv_check)
 
         self.acq_mode_combo.currentTextChanged.connect(self._on_acq_mode_changed)
         self.trigger_source_combo.currentIndexChanged.connect(self._schedule_settings_save)
+        self.use_scope_timebase_check.stateChanged.connect(self._on_use_scope_timebase_changed)
         self.acq_window_edit.textChanged.connect(self._on_acq_window_changed)
         self.delay_edit.textChanged.connect(self._on_delay_changed)
-        self.sampling_rate_combo.currentIndexChanged.connect(self._schedule_settings_save)
+        self.sampling_rate_combo.currentIndexChanged.connect(self._on_sampling_rate_changed)
         top.addWidget(osc_box, 1, 0, 1, 2)
 
         connection_box = QGroupBox("Connection Test")
@@ -696,6 +710,16 @@ class ScannerMainWindow(QMainWindow):
         pg_form.addRow("No. Of Pulses", self.tx_pulses)
         pg_form.addRow("Pulse Repetition Frequency (Hz)", self.tx_prf)
         pg_form.addRow("Start Delay (\u03bcs)", self.tx_start_delay_us)
+
+        # Warning label shown when PRF / sequence-mode feasibility check fails
+        self.seq_mode_warn_label = QLabel("")
+        self.seq_mode_warn_label.setWordWrap(True)
+        self.seq_mode_warn_label.setStyleSheet(
+            "color: #b71c1c; font-weight: bold; padding: 4px 0px;"
+        )
+        self.seq_mode_warn_label.setVisible(False)
+        pg_form.addRow("", self.seq_mode_warn_label)
+
         left_layout.addWidget(pg_box)
 
         self.transmit_start_button = QPushButton("Start Transmit")
@@ -817,6 +841,8 @@ class ScannerMainWindow(QMainWindow):
         self.tx_cycles.valueChanged.connect(self._on_transmit_preview_inputs_changed)
         self.tx_pulses.valueChanged.connect(self._on_transmit_preview_inputs_changed)
         self.tx_prf.valueChanged.connect(self._on_transmit_preview_inputs_changed)
+        self.tx_prf.valueChanged.connect(self._on_prf_or_pulses_changed)
+        self.tx_pulses.valueChanged.connect(self._on_prf_or_pulses_changed)
         self.tx_start_delay_us.valueChanged.connect(
             self._on_transmit_preview_inputs_changed
         )
@@ -2516,17 +2542,26 @@ class ScannerMainWindow(QMainWindow):
                 if idx >= 0:
                     self.trigger_source_combo.setCurrentIndex(idx)
 
+            # Restore "use scope timebase" checkbox BEFORE setting window/delay/rate,
+            # so _on_use_scope_timebase_changed() correctly enables/disables them.
+            use_scope_tb = bool(cfg.get("use_scope_timebase", False))
+            if hasattr(self, "use_scope_timebase_check"):
+                self.use_scope_timebase_check.setChecked(use_scope_tb)
+            self._on_use_scope_timebase_changed(use_scope_tb)
+
             acq_win = str(cfg.get("acquisition_window_ms", "1.0"))
             self.acq_window_edit.setText(acq_win)
             self.acq_window_edit.setEnabled(
-                self.acq_mode_combo.currentText() == "Software paced mode"
+                not use_scope_tb
+                and self.acq_mode_combo.currentText() == "Software paced mode"
             )
 
             delay_val = str(cfg.get("delay_us", "0.0"))
             if hasattr(self, "delay_edit"):
                 self.delay_edit.setText(delay_val)
                 self.delay_edit.setEnabled(
-                    self.acq_mode_combo.currentText() == "Software paced mode"
+                    not use_scope_tb
+                    and self.acq_mode_combo.currentText() == "Software paced mode"
                 )
 
             self.save_pulse_csv_check.setChecked(
@@ -2758,6 +2793,7 @@ class ScannerMainWindow(QMainWindow):
                     if hasattr(self, "trigger_source_combo")
                     else "EXT10"
                 ),
+                "use_scope_timebase": self._use_scope_timebase(),
                 "save_per_pulse_csv": bool(self.save_pulse_csv_check.isChecked()),
             },
             "excitation": {
@@ -3027,12 +3063,15 @@ class ScannerMainWindow(QMainWindow):
             self.bridge.cfg_log.emit(msg)
 
     def _on_acq_mode_changed(self, mode_text: str) -> None:
+        # Window and Delay are only enabled when NOT using scope knobs AND in software-paced mode
+        gui_controls_active = not self._use_scope_timebase()
         is_software_paced = mode_text == "Software paced mode"
         if hasattr(self, "acq_window_edit"):
-            self.acq_window_edit.setEnabled(is_software_paced)
+            self.acq_window_edit.setEnabled(gui_controls_active and is_software_paced)
         if hasattr(self, "delay_edit"):
-            self.delay_edit.setEnabled(is_software_paced)
+            self.delay_edit.setEnabled(gui_controls_active and is_software_paced)
         self._log_acq_mode_info(mode_text)
+        self._check_sequence_mode_safety()
         self._schedule_settings_save()
 
     def _on_acq_window_changed(self, text: str) -> None:
@@ -3041,6 +3080,7 @@ class ScannerMainWindow(QMainWindow):
             and self.acq_mode_combo.currentText() == "Software paced mode"
         ):
             self._log_acq_mode_info("Software paced mode")
+        self._check_sequence_mode_safety()
         self._schedule_settings_save()
 
     def _on_delay_changed(self, text: str) -> None:
@@ -3049,7 +3089,154 @@ class ScannerMainWindow(QMainWindow):
             and self.acq_mode_combo.currentText() == "Software paced mode"
         ):
             self._log_acq_mode_info("Software paced mode")
+        self._check_sequence_mode_safety()
         self._schedule_settings_save()
+
+    # ------------------------------------------------------------------
+    # Use-scope-timebase checkbox helpers
+    # ------------------------------------------------------------------
+
+    def _use_scope_timebase(self) -> bool:
+        """Return True when the user wants the scope's physical knobs to set timebase."""
+        return (
+            hasattr(self, "use_scope_timebase_check")
+            and self.use_scope_timebase_check.isChecked()
+        )
+
+    def _on_use_scope_timebase_changed(self, state) -> None:
+        """Enable / disable the three timebase fields depending on the checkbox state.
+
+        When *checked*  → scope knobs are authoritative; fields are disabled.
+        When *unchecked* → GUI fields are authoritative; fields are enabled
+                           (subject to the acquisition-mode constraint for Software paced mode).
+        """
+        use_scope = bool(state)
+        is_software_paced = (
+            hasattr(self, "acq_mode_combo")
+            and self.acq_mode_combo.currentText() == "Software paced mode"
+        )
+        # Sampling Rate: enabled only when not using scope knobs
+        if hasattr(self, "sampling_rate_combo"):
+            self.sampling_rate_combo.setEnabled(not use_scope)
+        # Window and Delay: enabled only when not using scope knobs AND in software-paced mode
+        if hasattr(self, "acq_window_edit"):
+            self.acq_window_edit.setEnabled(not use_scope and is_software_paced)
+        if hasattr(self, "delay_edit"):
+            self.delay_edit.setEnabled(not use_scope and is_software_paced)
+        self._check_sequence_mode_safety()
+        self._schedule_settings_save()
+
+    def _on_sampling_rate_changed(self) -> None:
+        """Fired when the Sampling Rate combo changes; triggers safety check and settings save."""
+        self._check_sequence_mode_safety()
+        self._schedule_settings_save()
+
+    # ------------------------------------------------------------------
+    # Sequence-mode safety check
+    # ------------------------------------------------------------------
+
+    # Typical LeCroy memory per channel.  Override via LECROY_MEMORY_PTS constant if needed.
+    _LECROY_MEMORY_PTS: int = 10_000_000  # 10 Mpts per channel (conservative default)
+
+    def _check_sequence_mode_safety(self) -> tuple[bool, bool]:
+        """Calculate and report LeCroy Sequence Mode feasibility.
+
+        Checks:
+          1. Window collision: W >= 1/PRF − t_dead  (acquisition overruns into next pulse)
+          2. Memory overflow: fs × W × N_pulses > scope memory per channel
+
+        Emits a summary to the Config Log (cfg_log).
+        Updates the Transmit-tab warning label (seq_mode_warn_label) if issues found.
+
+        Returns:
+            (collision, memory_exceeded) — both bool; (False, False) when not in sequence mode.
+        """
+        # Only relevant in sequence mode
+        if not (
+            hasattr(self, "acq_mode_combo")
+            and self.acq_mode_combo.currentText() == "LeCroy sequence mode"
+        ):
+            # Hide the transmit-tab warning
+            if hasattr(self, "seq_mode_warn_label"):
+                self.seq_mode_warn_label.setVisible(False)
+            return False, False
+
+        # --- Gather parameters ---
+        use_scope_tb = self._use_scope_timebase()
+        prf_hz = float(self.tx_prf.value()) if hasattr(self, "tx_prf") else 1000.0
+        prf_hz = max(prf_hz, 1e-6)
+        n_pulses = int(self.tx_pulses.value()) if hasattr(self, "tx_pulses") else 1
+
+        if use_scope_tb:
+            # We cannot know the scope settings without a live connection.
+            # Use 1/PRF as the window estimate and report that we cannot check fully.
+            window_ms = (1.0 / prf_hz) * 1000.0
+            fs_hz = self._config_sampling_rate_hz()  # last known / default
+            source_note = "window estimated as 1/PRF (scope knobs active — connect scope to validate)"
+        else:
+            window_ms = self._config_acq_window_ms()
+            fs_hz = self._config_sampling_rate_hz()
+            source_note = "values from GUI fields"
+
+        W_s = max(window_ms / 1000.0, 1e-12)
+        period_s = 1.0 / prf_hz
+        dead_s = 2e-6  # LeCroy inter-segment dead time ≈ 2 µs
+
+        # --- Perform checks ---
+        collision = W_s >= (period_s - dead_s)
+        pts_per_segment = fs_hz * W_s
+        total_pts = pts_per_segment * n_pulses
+        memory_exceeded = total_pts > self._LECROY_MEMORY_PTS
+
+        # --- Format messages ---
+        period_us = period_s * 1e6
+        margin_us = (period_s - dead_s) * 1e6
+        w_us = W_s * 1e6
+        pts_k = pts_per_segment / 1e3
+        total_k = total_pts / 1e3
+
+        coll_icon = "⚠ COLLISION" if collision else "✓ OK"
+        coll_colour = "#b71c1c" if collision else "#2e7d32"
+        mem_icon = "⚠ EXCEEDS LIMIT" if memory_exceeded else "✓ OK"
+        mem_colour = "#b71c1c" if memory_exceeded else "#2e7d32"
+
+        cfg_html = (
+            f"<span style='color: #1565c0; font-weight: bold;'>Sequence Mode Feasibility ({source_note}):</span><br>"
+            f"&nbsp;&nbsp;PRF = {prf_hz:g} Hz &rarr; T<sub>inter</sub> = {period_us:.2f} µs<br>"
+            f"&nbsp;&nbsp;Dead time ≈ {dead_s*1e6:.0f} µs &rarr; max window = {margin_us:.2f} µs<br>"
+            f"&nbsp;&nbsp;Acquisition window W = {w_us:.2f} µs&nbsp;&nbsp;"
+            f"<span style='color: {coll_colour}; font-weight: bold;'>[{coll_icon}]</span><br>"
+            f"&nbsp;&nbsp;Samples/segment = {fs_hz/1e6:g} MS/s × {w_us:.2f} µs = {pts_k:.1f} kpts<br>"
+            f"&nbsp;&nbsp;Total memory = {pts_k:.1f} × {n_pulses} pulses = {total_k:.1f} kpts "
+            f"(limit {self._LECROY_MEMORY_PTS/1e6:.0f} Mpts)&nbsp;&nbsp;"
+            f"<span style='color: {mem_colour}; font-weight: bold;'>[{mem_icon}]</span>"
+        )
+        self.bridge.cfg_log.emit(cfg_html)
+
+        # --- Transmit-tab warning label ---
+        if hasattr(self, "seq_mode_warn_label"):
+            if collision or memory_exceeded:
+                issues = []
+                if collision:
+                    issues.append(
+                        f"window ({w_us:.1f} µs) ≥ 1/PRF − 2 µs ({margin_us:.1f} µs)"
+                    )
+                if memory_exceeded:
+                    issues.append(
+                        f"memory {total_k:.0f} kpts > {self._LECROY_MEMORY_PTS/1e6:.0f} Mpts limit"
+                    )
+                self.seq_mode_warn_label.setText(
+                    "⚠ Sequence Mode issue — " + "; ".join(issues) + ". Check Config tab log."
+                )
+                self.seq_mode_warn_label.setVisible(True)
+            else:
+                self.seq_mode_warn_label.setVisible(False)
+
+        return collision, memory_exceeded
+
+    def _on_prf_or_pulses_changed(self, _value=None) -> None:
+        """Fired when tx_prf or tx_pulses changes; runs sequence-mode safety check."""
+        self._check_sequence_mode_safety()
 
     def _resolve_filter_sampling_rate(
         self, label: str, config_hz: float, actual_rates_hz, log_fn, info: bool = True
@@ -4363,25 +4550,45 @@ class ScannerMainWindow(QMainWindow):
             if hasattr(self, "trigger_source_combo")
             else "EXT10"
         )
-        if acq_mode == "Software paced mode":
-            window_s = max(self._config_acq_window_ms() / 1000.0, 1e-9)
-            desired_delay_s = self._config_delay_us() / 1e6
-        else:
-            prf_hz = float(self.tx_prf.value()) if hasattr(self, "tx_prf") else 1000.0
-            window_s = max(1.0 / max(prf_hz, 1e-6), 1e-9)
-            desired_delay_s = 0.0
+        use_scope_tb = self._use_scope_timebase()
 
-        hor_scale = max(window_s / 10.0, 1e-9)
-        scope_delay = desired_delay_s + (5.0 * hor_scale)
-        capture_signature = (
-            id(osc),
-            str(self.osc_address_edit.text().strip()),
-            round(float(sampling_rate), 3),
-            acq_mode,
-            trig_source,
-            round(float(hor_scale), 9),
-            round(float(scope_delay), 9),
-        )
+        if not use_scope_tb:
+            # GUI-controlled timebase: compute from user fields
+            if acq_mode == "Software paced mode":
+                window_s = max(self._config_acq_window_ms() / 1000.0, 1e-9)
+                desired_delay_s = self._config_delay_us() / 1e6
+            else:
+                prf_hz = float(self.tx_prf.value()) if hasattr(self, "tx_prf") else 1000.0
+                window_s = max(1.0 / max(prf_hz, 1e-6), 1e-9)
+                desired_delay_s = 0.0
+            hor_scale = max(window_s / 10.0, 1e-9)
+            scope_delay = desired_delay_s + (5.0 * hor_scale)
+            # Include timebase values in the signature so a change re-programs the scope
+            capture_signature = (
+                id(osc),
+                str(self.osc_address_edit.text().strip()),
+                round(float(sampling_rate), 3),
+                acq_mode,
+                trig_source,
+                False,  # use_scope_tb flag
+                round(float(hor_scale), 9),
+                round(float(scope_delay), 9),
+            )
+        else:
+            # Scope-knob mode: do NOT touch HorScale / HorOffset / SampleRate.
+            # Signature only covers the connection + trigger/mode; timebase is opaque.
+            window_s = 0.0
+            desired_delay_s = 0.0
+            hor_scale = 0.0
+            scope_delay = 0.0
+            capture_signature = (
+                id(osc),
+                str(self.osc_address_edit.text().strip()),
+                acq_mode,
+                trig_source,
+                True,  # use_scope_tb flag
+            )
+
         if (
             self._scope_capture_config_handle_id != id(osc)
             or self._scope_capture_config_signature != capture_signature
@@ -4395,13 +4602,18 @@ class ScannerMainWindow(QMainWindow):
             vbs("app.Acquisition.Horizontal.SampleMode = 'RealTime'")
             with contextlib.suppress(Exception):
                 osc.write("SEQUENCE OFF")
-            vbs(f"app.Acquisition.Horizontal.HorScale = {hor_scale}")
-            vbs(f"app.Acquisition.Horizontal.HorOffset = {scope_delay}")
-            with contextlib.suppress(Exception):
-                osc.write(f"TIME_DIV {hor_scale}")
-            with contextlib.suppress(Exception):
-                osc.write(f"TRIG_DELAY {scope_delay}")
-            vbs(f"app.Acquisition.Horizontal.SampleRate = {sampling_rate}")
+
+            if not use_scope_tb:
+                # Program timebase from GUI values
+                vbs(f"app.Acquisition.Horizontal.HorScale = {hor_scale}")
+                vbs(f"app.Acquisition.Horizontal.HorOffset = {scope_delay}")
+                with contextlib.suppress(Exception):
+                    osc.write(f"TIME_DIV {hor_scale}")
+                with contextlib.suppress(Exception):
+                    osc.write(f"TRIG_DELAY {scope_delay}")
+                vbs(f"app.Acquisition.Horizontal.SampleRate = {sampling_rate}")
+            # else: scope knobs — leave HorScale / HorOffset / SampleRate untouched
+
             vbs("app.Acquisition.C1.View = true")
             if trig_source != "Do not change (Scope setting)":
                 vbs_src = "ExtDivide10" if trig_source == "EXT10" else ("Ext" if trig_source == "EXT" else trig_source)
@@ -4414,10 +4626,16 @@ class ScannerMainWindow(QMainWindow):
             self._scope_capture_config_signature = capture_signature
             if callable(log_fn):
                 trig_note = f", Trigger={trig_source}" if trig_source != "Do not change (Scope setting)" else ", Trigger=scope manual"
-                log_fn(
-                    f"A-mode: Applied scope capture configuration (mode={acq_mode}{trig_note}, HorScale={hor_scale*1e3:.4f} ms/div, "
-                    f"delay={desired_delay_s*1e6:g} µs, center_delay={scope_delay*1e6:.4f} µs, fs={sampling_rate/1e6:g} MS/s)."
-                )
+                if use_scope_tb:
+                    log_fn(
+                        f"A-mode: Applied scope capture configuration (mode={acq_mode}{trig_note}, "
+                        f"timebase=scope knobs, fs=scope knobs)."
+                    )
+                else:
+                    log_fn(
+                        f"A-mode: Applied scope capture configuration (mode={acq_mode}{trig_note}, HorScale={hor_scale*1e3:.4f} ms/div, "
+                        f"delay={desired_delay_s*1e6:g} µs, center_delay={scope_delay*1e6:.4f} µs, fs={sampling_rate/1e6:g} MS/s)."
+                    )
 
         if configure_only:
             return None, None, None
@@ -4552,6 +4770,10 @@ class ScannerMainWindow(QMainWindow):
         pulses = max(1, int(pulses))
         prf_hz = max(float(prf_hz), 1e-6)
         sampling_rate = self._config_sampling_rate_hz()
+        use_scope_tb = self._use_scope_timebase()
+
+        # Sequence mode ALWAYS needs SampleMode='Sequence' and NumSegments regardless of knob mode.
+        # When use_scope_tb=False, also program per-segment timebase from GUI values.
         window_s = 1.0 / prf_hz
         hor_scale = max(window_s / 10.0, 1e-9)
         seq_delay = 5.0 * hor_scale
@@ -4572,13 +4794,18 @@ class ScannerMainWindow(QMainWindow):
         osc.write("COMM_FORMAT DEF9,WORD,BIN")
         vbs("app.Acquisition.Horizontal.SampleMode = 'Sequence'")
         vbs(f"app.Acquisition.Horizontal.NumSegments = {pulses}")
-        vbs(f"app.Acquisition.Horizontal.HorScale = {hor_scale}")
-        vbs(f"app.Acquisition.Horizontal.HorOffset = {seq_delay}")
-        with contextlib.suppress(Exception):
-            osc.write(f"TIME_DIV {hor_scale}")
-        with contextlib.suppress(Exception):
-            osc.write(f"TRIG_DELAY {seq_delay}")
-        vbs(f"app.Acquisition.Horizontal.SampleRate = {sampling_rate}")
+
+        if not use_scope_tb:
+            # Program per-segment timebase from GUI / PRF values
+            vbs(f"app.Acquisition.Horizontal.HorScale = {hor_scale}")
+            vbs(f"app.Acquisition.Horizontal.HorOffset = {seq_delay}")
+            with contextlib.suppress(Exception):
+                osc.write(f"TIME_DIV {hor_scale}")
+            with contextlib.suppress(Exception):
+                osc.write(f"TRIG_DELAY {seq_delay}")
+            vbs(f"app.Acquisition.Horizontal.SampleRate = {sampling_rate}")
+        # else: scope knobs control HorScale / HorOffset / SampleRate — leave them untouched.
+
         vbs("app.Acquisition.C1.View = true")
         if trig_source != "Do not change (Scope setting)":
             vbs_src = "ExtDivide10" if trig_source == "EXT10" else ("Ext" if trig_source == "EXT" else trig_source)
@@ -4588,10 +4815,16 @@ class ScannerMainWindow(QMainWindow):
                 osc.write(f"TRIG_SELECT EDGE,SR,{scpi_src}")
 
         if callable(log_fn):
-            log_fn(
-                f"LeCroy sequence mode armed: {pulses} segment(s), window={window_s*1e3:.4f} ms (HorScale={hor_scale*1e3:.4f} ms/div), "
-                f"requested fs={sampling_rate/1e6:g} MS/s, PRF={prf_hz:g} Hz."
-            )
+            if use_scope_tb:
+                log_fn(
+                    f"LeCroy sequence mode armed: {pulses} segment(s), timebase=scope knobs, "
+                    f"PRF={prf_hz:g} Hz."
+                )
+            else:
+                log_fn(
+                    f"LeCroy sequence mode armed: {pulses} segment(s), window={window_s*1e3:.4f} ms (HorScale={hor_scale*1e3:.4f} ms/div), "
+                    f"requested fs={sampling_rate/1e6:g} MS/s, PRF={prf_hz:g} Hz."
+                )
 
         # Arm scope for sequence acquisition
         osc.write("TRIG_MODE SINGLE")

@@ -11,6 +11,7 @@
     "acquisition_window_ms": 0.02,
     "delay_us": 30.0,
     "trigger_source": "EXT10",
+    "use_scope_timebase": false,
     "save_per_pulse_csv": false
   },
   "excitation": {
