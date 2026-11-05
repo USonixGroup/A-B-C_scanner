@@ -537,9 +537,9 @@ class ScannerMainWindow(QMainWindow):
         self.acq_mode_combo.currentTextChanged.connect(self._on_acq_mode_changed)
         self.trigger_source_combo.currentIndexChanged.connect(self._schedule_settings_save)
         self.use_scope_timebase_check.stateChanged.connect(self._on_use_scope_timebase_changed)
-        self.acq_window_edit.textChanged.connect(self._on_acq_window_changed)
-        self.delay_edit.textChanged.connect(self._on_delay_changed)
-        self.sampling_rate_combo.currentIndexChanged.connect(self._on_sampling_rate_changed)
+        self.acq_window_edit.textChanged.connect(self._schedule_settings_save)
+        self.delay_edit.textChanged.connect(self._schedule_settings_save)
+        self.sampling_rate_combo.currentIndexChanged.connect(self._schedule_settings_save)
         top.addWidget(osc_box, 1, 0, 1, 2)
 
         connection_box = QGroupBox("Connection Test")
@@ -841,8 +841,6 @@ class ScannerMainWindow(QMainWindow):
         self.tx_cycles.valueChanged.connect(self._on_transmit_preview_inputs_changed)
         self.tx_pulses.valueChanged.connect(self._on_transmit_preview_inputs_changed)
         self.tx_prf.valueChanged.connect(self._on_transmit_preview_inputs_changed)
-        self.tx_prf.valueChanged.connect(self._on_prf_or_pulses_changed)
-        self.tx_pulses.valueChanged.connect(self._on_prf_or_pulses_changed)
         self.tx_start_delay_us.valueChanged.connect(
             self._on_transmit_preview_inputs_changed
         )
@@ -2551,18 +2549,12 @@ class ScannerMainWindow(QMainWindow):
 
             acq_win = str(cfg.get("acquisition_window_ms", "1.0"))
             self.acq_window_edit.setText(acq_win)
-            self.acq_window_edit.setEnabled(
-                not use_scope_tb
-                and self.acq_mode_combo.currentText() == "Software paced mode"
-            )
+            self.acq_window_edit.setEnabled(not use_scope_tb)
 
             delay_val = str(cfg.get("delay_us", "0.0"))
             if hasattr(self, "delay_edit"):
                 self.delay_edit.setText(delay_val)
-                self.delay_edit.setEnabled(
-                    not use_scope_tb
-                    and self.acq_mode_combo.currentText() == "Software paced mode"
-                )
+                self.delay_edit.setEnabled(not use_scope_tb)
 
             self.save_pulse_csv_check.setChecked(
                 bool(cfg.get("save_per_pulse_csv", self.save_pulse_csv_check.isChecked()))
@@ -3063,33 +3055,14 @@ class ScannerMainWindow(QMainWindow):
             self.bridge.cfg_log.emit(msg)
 
     def _on_acq_mode_changed(self, mode_text: str) -> None:
-        # Window and Delay are only enabled when NOT using scope knobs AND in software-paced mode
         gui_controls_active = not self._use_scope_timebase()
-        is_software_paced = mode_text == "Software paced mode"
+        if hasattr(self, "sampling_rate_combo"):
+            self.sampling_rate_combo.setEnabled(gui_controls_active)
         if hasattr(self, "acq_window_edit"):
-            self.acq_window_edit.setEnabled(gui_controls_active and is_software_paced)
+            self.acq_window_edit.setEnabled(gui_controls_active)
         if hasattr(self, "delay_edit"):
-            self.delay_edit.setEnabled(gui_controls_active and is_software_paced)
+            self.delay_edit.setEnabled(gui_controls_active)
         self._log_acq_mode_info(mode_text)
-        self._check_sequence_mode_safety()
-        self._schedule_settings_save()
-
-    def _on_acq_window_changed(self, text: str) -> None:
-        if (
-            hasattr(self, "acq_mode_combo")
-            and self.acq_mode_combo.currentText() == "Software paced mode"
-        ):
-            self._log_acq_mode_info("Software paced mode")
-        self._check_sequence_mode_safety()
-        self._schedule_settings_save()
-
-    def _on_delay_changed(self, text: str) -> None:
-        if (
-            hasattr(self, "acq_mode_combo")
-            and self.acq_mode_combo.currentText() == "Software paced mode"
-        ):
-            self._log_acq_mode_info("Software paced mode")
-        self._check_sequence_mode_safety()
         self._schedule_settings_save()
 
     # ------------------------------------------------------------------
@@ -3106,29 +3079,17 @@ class ScannerMainWindow(QMainWindow):
     def _on_use_scope_timebase_changed(self, state) -> None:
         """Enable / disable the three timebase fields depending on the checkbox state.
 
-        When *checked*  → scope knobs are authoritative; fields are disabled.
-        When *unchecked* → GUI fields are authoritative; fields are enabled
-                           (subject to the acquisition-mode constraint for Software paced mode).
+        When *checked*  → scope knobs are authoritative; all three fields are disabled.
+        When *unchecked* → GUI fields are authoritative; all three fields are enabled.
         """
         use_scope = bool(state)
-        is_software_paced = (
-            hasattr(self, "acq_mode_combo")
-            and self.acq_mode_combo.currentText() == "Software paced mode"
-        )
-        # Sampling Rate: enabled only when not using scope knobs
+        gui_controls_active = not use_scope
         if hasattr(self, "sampling_rate_combo"):
-            self.sampling_rate_combo.setEnabled(not use_scope)
-        # Window and Delay: enabled only when not using scope knobs AND in software-paced mode
+            self.sampling_rate_combo.setEnabled(gui_controls_active)
         if hasattr(self, "acq_window_edit"):
-            self.acq_window_edit.setEnabled(not use_scope and is_software_paced)
+            self.acq_window_edit.setEnabled(gui_controls_active)
         if hasattr(self, "delay_edit"):
-            self.delay_edit.setEnabled(not use_scope and is_software_paced)
-        self._check_sequence_mode_safety()
-        self._schedule_settings_save()
-
-    def _on_sampling_rate_changed(self) -> None:
-        """Fired when the Sampling Rate combo changes; triggers safety check and settings save."""
-        self._check_sequence_mode_safety()
+            self.delay_edit.setEnabled(gui_controls_active)
         self._schedule_settings_save()
 
     # ------------------------------------------------------------------
@@ -3138,15 +3099,15 @@ class ScannerMainWindow(QMainWindow):
     # Typical LeCroy memory per channel.  Override via LECROY_MEMORY_PTS constant if needed.
     _LECROY_MEMORY_PTS: int = 10_000_000  # 10 Mpts per channel (conservative default)
 
-    def _check_sequence_mode_safety(self) -> tuple[bool, bool]:
+    def _check_sequence_mode_safety(self, log_to_tx: bool = False) -> tuple[bool, bool]:
         """Calculate and report LeCroy Sequence Mode feasibility.
 
         Checks:
           1. Window collision: W >= 1/PRF − t_dead  (acquisition overruns into next pulse)
           2. Memory overflow: fs × W × N_pulses > scope memory per channel
 
-        Emits a summary to the Config Log (cfg_log).
-        Updates the Transmit-tab warning label (seq_mode_warn_label) if issues found.
+        Emits a summary to the Config Log (cfg_log), and to Transmit Log (tx_log) if log_to_tx=True.
+        Updates the Transmit-tab warning label (seq_mode_warn_label).
 
         Returns:
             (collision, memory_exceeded) — both bool; (False, False) when not in sequence mode.
@@ -3212,6 +3173,8 @@ class ScannerMainWindow(QMainWindow):
             f"<span style='color: {mem_colour}; font-weight: bold;'>[{mem_icon}]</span>"
         )
         self.bridge.cfg_log.emit(cfg_html)
+        if log_to_tx:
+            self.bridge.tx_log.emit(cfg_html)
 
         # --- Transmit-tab warning label ---
         if hasattr(self, "seq_mode_warn_label"):
@@ -3225,18 +3188,23 @@ class ScannerMainWindow(QMainWindow):
                     issues.append(
                         f"memory {total_k:.0f} kpts > {self._LECROY_MEMORY_PTS/1e6:.0f} Mpts limit"
                     )
+                self.seq_mode_warn_label.setStyleSheet(
+                    "color: #b71c1c; font-weight: bold; padding: 4px 0px;"
+                )
                 self.seq_mode_warn_label.setText(
-                    "⚠ Sequence Mode issue — " + "; ".join(issues) + ". Check Config tab log."
+                    "⚠ Sequence Mode issue — " + "; ".join(issues) + ". Check logs for details."
                 )
                 self.seq_mode_warn_label.setVisible(True)
             else:
-                self.seq_mode_warn_label.setVisible(False)
+                self.seq_mode_warn_label.setStyleSheet(
+                    "color: #2e7d32; font-weight: bold; padding: 4px 0px;"
+                )
+                self.seq_mode_warn_label.setText(
+                    "✓ Sequence Mode timing feasibility check passed."
+                )
+                self.seq_mode_warn_label.setVisible(True)
 
         return collision, memory_exceeded
-
-    def _on_prf_or_pulses_changed(self, _value=None) -> None:
-        """Fired when tx_prf or tx_pulses changes; runs sequence-mode safety check."""
-        self._check_sequence_mode_safety()
 
     def _resolve_filter_sampling_rate(
         self, label: str, config_hz: float, actual_rates_hz, log_fn, info: bool = True
@@ -3337,6 +3305,72 @@ class ScannerMainWindow(QMainWindow):
                 f"({worst / dt:.1f} samples). The first echo's time axis is used, so the average may be smeared; "
                 "check the trigger and scope timebase."
             )
+
+    @staticmethod
+    def _phase_align_echoes(traces_y, max_shift_pts=None):
+        """Phase-align multiple echo waveforms to the first echo using cross-correlation.
+
+        Prevents destructive interference and amplitude reduction caused by trigger jitter
+        between pulses in Sequence Mode or high-PRF acquisitions.
+        """
+        import numpy as np
+
+        if len(traces_y) < 2:
+            return traces_y
+
+        ref = np.asarray(traces_y[0], dtype=float)
+        n = len(ref)
+        if n < 4:
+            return traces_y
+
+        if max_shift_pts is None:
+            # Allow alignment within +/- 15% of waveform window, max 200 samples
+            max_shift_pts = min(max(10, n // 8), 200)
+
+        aligned = [ref]
+        ref_centered = ref - np.mean(ref)
+        ref_norm = np.std(ref)
+        if ref_norm < 1e-12:
+            return traces_y
+
+        for y in traces_y[1:]:
+            yi = np.asarray(y, dtype=float)
+            if len(yi) != n:
+                min_len = min(n, len(yi))
+                yi = yi[:min_len]
+                ref_slice = ref_centered[:min_len]
+            else:
+                ref_slice = ref_centered
+
+            yi_centered = yi - np.mean(yi)
+            yi_norm = np.std(yi)
+            if yi_norm < 1e-12:
+                aligned.append(yi)
+                continue
+
+            # Normalized cross-correlation
+            corr = np.correlate(ref_slice, yi_centered, mode="full")
+            lags = np.arange(-len(yi) + 1, len(ref_slice))
+
+            valid_mask = np.abs(lags) <= max_shift_pts
+            if np.any(valid_mask):
+                valid_lags = lags[valid_mask]
+                valid_corr = corr[valid_mask]
+                best_lag = int(valid_lags[np.argmax(valid_corr)])
+            else:
+                best_lag = 0
+
+            if best_lag != 0:
+                yi_aligned = np.roll(yi, best_lag)
+                if best_lag > 0:
+                    yi_aligned[:best_lag] = yi_aligned[best_lag]
+                else:
+                    yi_aligned[best_lag:] = yi_aligned[best_lag - 1]
+                aligned.append(yi_aligned)
+            else:
+                aligned.append(yi)
+
+        return np.asarray(aligned) if isinstance(traces_y, np.ndarray) else aligned
 
     def _actual_sampling_rate(self, t, scope_fs_hz=None) -> tuple[float | None, str]:
         """Actual sample rate of one waveform: the scope-reported rate if available, else from its time axis."""
@@ -4773,10 +4807,17 @@ class ScannerMainWindow(QMainWindow):
         use_scope_tb = self._use_scope_timebase()
 
         # Sequence mode ALWAYS needs SampleMode='Sequence' and NumSegments regardless of knob mode.
-        # When use_scope_tb=False, also program per-segment timebase from GUI values.
-        window_s = 1.0 / prf_hz
-        hor_scale = max(window_s / 10.0, 1e-9)
-        seq_delay = 5.0 * hor_scale
+        # When use_scope_tb=False, program per-segment timebase from user-configured window and delay.
+        if not use_scope_tb:
+            window_s = max(self._config_acq_window_ms() / 1000.0, 1e-9)
+            desired_delay_s = self._config_delay_us() / 1e6
+            hor_scale = max(window_s / 10.0, 1e-9)
+            seq_delay = desired_delay_s + (5.0 * hor_scale)
+        else:
+            window_s = 1.0 / prf_hz
+            desired_delay_s = 0.0
+            hor_scale = max(window_s / 10.0, 1e-9)
+            seq_delay = 5.0 * hor_scale
         trig_source = (
             self.trigger_source_combo.currentText()
             if hasattr(self, "trigger_source_combo")
@@ -4823,10 +4864,12 @@ class ScannerMainWindow(QMainWindow):
             else:
                 log_fn(
                     f"LeCroy sequence mode armed: {pulses} segment(s), window={window_s*1e3:.4f} ms (HorScale={hor_scale*1e3:.4f} ms/div), "
-                    f"requested fs={sampling_rate/1e6:g} MS/s, PRF={prf_hz:g} Hz."
+                    f"delay={desired_delay_s*1e6:g} µs, center_delay={seq_delay*1e6:.4f} µs, requested fs={sampling_rate/1e6:g} MS/s, PRF={prf_hz:g} Hz."
                 )
 
         # Arm scope for sequence acquisition
+        with contextlib.suppress(Exception):
+            osc.write("WFSU SP,0,NP,0,FP,0,SN,0")
         osc.write("TRIG_MODE SINGLE")
         time.sleep(0.05)
 
@@ -4847,6 +4890,8 @@ class ScannerMainWindow(QMainWindow):
         time.sleep(min(train_duration, 5.0))
 
         # Query WAVEDESC for exact scaling and time increment
+        with contextlib.suppress(Exception):
+            osc.write("WFSU SP,0,NP,0,FP,0,SN,0")
         osc.write("C1:WF? ALL")
         raw = b""
         while True:
@@ -4866,8 +4911,12 @@ class ScannerMainWindow(QMainWindow):
         v_off = None
         h_int = None
         h_off = 0.0
+        subarray_count = 0
+        wave_array_count = 0
         if wd_start >= 0 and len(raw) >= wd_start + 188:
             try:
+                wave_array_count = int(struct.unpack("<i", raw[wd_start + 116 : wd_start + 120])[0])
+                subarray_count = int(struct.unpack("<i", raw[wd_start + 144 : wd_start + 148])[0])
                 v_gain = float(struct.unpack("<f", raw[wd_start + 156 : wd_start + 160])[0])
                 v_off = float(struct.unpack("<f", raw[wd_start + 160 : wd_start + 164])[0])
                 h_int = float(struct.unpack("<f", raw[wd_start + 176 : wd_start + 180])[0])
@@ -4878,14 +4927,48 @@ class ScannerMainWindow(QMainWindow):
                     log_fn(f"Sequence: WAVEDESC parse warning: {desc_exc}")
 
         # Bulk read binary data for all segments
+        with contextlib.suppress(Exception):
+            osc.write("WFSU SP,0,NP,0,FP,0,SN,0")
         raw_data = self._read_scope_word_block(osc, "C1:WF? DAT1", log_fn=log_fn)
         num_points = len(raw_data)
         if num_points <= 0:
             raise RuntimeError("Oscilloscope returned zero waveform points in sequence mode.")
 
-        pts_per_segment = max(1, num_points // pulses)
-        trimmed_len = pts_per_segment * pulses
-        raw_segments = raw_data[:trimmed_len].reshape((pulses, pts_per_segment))
+        # Determine segment partitioning:
+        bulk_segments_ok = False
+        if subarray_count > 1 and num_points >= subarray_count * 10:
+            pts_per_segment = num_points // subarray_count
+            raw_segments = raw_data[:pts_per_segment * subarray_count].reshape((subarray_count, pts_per_segment))
+            bulk_segments_ok = True
+        elif pulses > 1 and num_points >= pulses * 10 and (num_points % pulses == 0):
+            pts_per_segment = num_points // pulses
+            raw_segments = raw_data[:pts_per_segment * pulses].reshape((pulses, pts_per_segment))
+            bulk_segments_ok = True
+
+        if not bulk_segments_ok and pulses > 1:
+            # LeCroy returned only 1 segment for SN=0. Retrieve each segment individually
+            # via WFSU SN,<index> to ensure each segment is a complete, full-window waveform.
+            if callable(log_fn):
+                log_fn(
+                    f"Sequence: Bulk read returned {num_points} points (single segment). "
+                    f"Fetching {pulses} segments individually via WFSU SN..."
+                )
+            seg_list = [raw_data]
+            for s_idx in range(2, pulses + 1):
+                with contextlib.suppress(Exception):
+                    osc.write(f"WFSU SP,0,NP,0,FP,0,SN,{s_idx}")
+                seg_raw = self._read_scope_word_block(osc, "C1:WF? DAT1", log_fn=None)
+                if len(seg_raw) > 0:
+                    seg_list.append(seg_raw)
+                else:
+                    seg_list.append(raw_data)
+            with contextlib.suppress(Exception):
+                osc.write("WFSU SP,0,NP,0,FP,0,SN,0")
+            pts_per_segment = min(len(s) for s in seg_list)
+            raw_segments = np.array([s[:pts_per_segment] for s in seg_list])
+        elif not bulk_segments_ok:
+            pts_per_segment = num_points
+            raw_segments = raw_data.reshape((1, pts_per_segment))
 
         if v_gain is not None and v_off is not None:
             segments_volts = (raw_segments.astype(float) * v_gain) - v_off
@@ -4897,6 +4980,11 @@ class ScannerMainWindow(QMainWindow):
                 str(osc.query("C1:OFST?")).strip(), 0.0
             )
             segments_volts = (raw_segments.astype(float) * (v_div * 8.0 / 65536.0)) - v_offset
+
+        # Phase-align all segments to segment 1 using cross-correlation to eliminate
+        # sub-sample/trigger jitter and guarantee constructive averaging without amplitude loss.
+        if len(segments_volts) > 1:
+            segments_volts = self._phase_align_echoes(segments_volts)
 
         if use_descriptor_axis and h_int:
             t = np.arange(pts_per_segment, dtype=float) * h_int + h_off
@@ -6070,9 +6158,9 @@ class ScannerMainWindow(QMainWindow):
                 )
                 min_len = min(e.size for e in y_echoes)
                 t = t_echoes[0][:min_len]
-                stack = np.vstack(
-                    [self._detrend_signal(e[:min_len]) for e in y_echoes]
-                )
+                detrended = [self._detrend_signal(e[:min_len]) for e in y_echoes]
+                aligned = self._phase_align_echoes(detrended)
+                stack = np.vstack(aligned)
                 if pulses_per_point > 1:
                     y = np.mean(stack, axis=0)
                 else:
@@ -6866,6 +6954,10 @@ class ScannerMainWindow(QMainWindow):
             self.bridge.tx_log.emit(f"Validation failed: {message}")
             self._show_error("Invalid excitation settings", message)
             return
+
+        # Perform Sequence Mode safety/feasibility checks ONLY when Run Timing Test is clicked
+        self._check_sequence_mode_safety(log_to_tx=True)
+
         self.transmit_preview_button.setEnabled(False)
         self.transmit_start_button.setEnabled(False)
         self.transmit_timing_button.setEnabled(False)
@@ -7433,9 +7525,9 @@ class ScannerMainWindow(QMainWindow):
             )
             min_len = min(len(item[1]) for item in traces)
             t_ref = traces[0][0][:min_len]
-            stack = np.vstack(
-                [self._detrend_signal(item[1][:min_len]) for item in traces]
-            )
+            detrended = [self._detrend_signal(item[1][:min_len]) for item in traces]
+            aligned = self._phase_align_echoes(detrended)
+            stack = np.vstack(aligned)
             if pulses > 1:
                 avg = np.mean(stack, axis=0)
             else:
@@ -8122,9 +8214,9 @@ class ScannerMainWindow(QMainWindow):
                     )
                     min_len = min(e.size for e in y_echoes)
                     t_acq = t_echoes[0][:min_len]
-                    stack = np.vstack(
-                        [self._detrend_signal(e[:min_len]) for e in y_echoes]
-                    )
+                    detrended = [self._detrend_signal(e[:min_len]) for e in y_echoes]
+                    aligned = self._phase_align_echoes(detrended)
+                    stack = np.vstack(aligned)
                     if pulses_per_point > 1:
                         echo_acq = np.mean(stack, axis=0)
                     else:

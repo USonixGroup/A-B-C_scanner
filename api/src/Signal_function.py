@@ -509,6 +509,7 @@ def Burst_generate(
 
     # 5. Option A (Hardware Timer) for cases where no_of_pulses > 1
     hw_timer_applied = False
+    burst_phase = float(phase) if phase is not None else 0.0
     if int(no_of_pulses) > 1 and prf and float(prf) > 0 and not hasattr(sg, "trigger_times"):
         writer = _get_writer(sg)
         if writer is not None:
@@ -516,6 +517,7 @@ def Burst_generate(
                 "BURS:STAT ON",
                 "BURS:MODE TRIG",
                 f"BURS:NCYC {burst_cycles_for_hw}",
+                f"BURS:PHAS {burst_phase:.3f}",
                 f"BURS:INT:PER {inter_pulse_period:.9f}",
                 "TRIG1:SOUR TIM",
                 f"TRIG1:TIM {inter_pulse_period:.9f}",
